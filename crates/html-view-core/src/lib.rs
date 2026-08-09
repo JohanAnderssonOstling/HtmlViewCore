@@ -786,15 +786,6 @@ mod highlight;
 #[path = "renderer/render.rs"]
 mod render;
 
-#[path = "renderer/paginate.rs"]
-mod paginate;
-
-#[path = "renderer/vertical_rhythm.rs"]
-mod vertical_rhythm;
-
-#[path = "renderer/semantic_keeps.rs"]
-mod semantic_keeps;
-
 #[path = "renderer/nav.rs"]
 mod nav;
 

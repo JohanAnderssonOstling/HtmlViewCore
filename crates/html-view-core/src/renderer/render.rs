@@ -4,7 +4,7 @@ use kurbo::{Point, Rect};
 use peniko::Color;
 
 use html_view_doc::{DocQuery, scaled_image_size};
-use crate::paginate::{Paginator, initial_render_state};
+use html_view_paginate::{Paginator, initial_render_state};
 use crate::{PagePositions, PaintDirection, Painter, RenderState, RendererCore, VisibleLinePositions};
 
 fn line_paint_origin(point: Point) -> Point {

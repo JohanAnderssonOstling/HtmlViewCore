@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-doc", "crates/html-view-load", "crates/html-view-types"]
+members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-doc", "crates/html-view-load", "crates/html-view-paginate", "crates/html-view-types"]
 
 [workspace.package]
 repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
@@ -9,6 +9,7 @@ repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
 html-view-cfi = { path = "crates/html-view-cfi" }
 html-view-doc = { path = "crates/html-view-doc" }
 html-view-load = { path = "crates/html-view-load" }
+html-view-paginate = { path = "crates/html-view-paginate" }
 html-view-types = { path = "crates/html-view-types" }
 html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine" }
 kurbo = "0.11.3"

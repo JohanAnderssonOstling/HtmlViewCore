@@ -1,5 +1,5 @@
-use crate::PagePositions;
-use crate::paginate::Paginator;
+use crate::Paginator;
+use html_view_types::PagePositions;
 
 const MAX_GAP_STRETCH: f64 = 2.0;
 const MAX_COLUMN_STRETCH: f64 = 12.0;

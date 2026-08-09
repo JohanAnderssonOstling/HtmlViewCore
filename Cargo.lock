@@ -647,6 +647,7 @@ dependencies = [
  "html-view-cfi",
  "html-view-doc",
  "html-view-load",
+ "html-view-paginate",
  "html-view-types",
  "kurbo",
  "peniko",
@@ -670,6 +671,15 @@ name = "html-view-load"
 version = "0.1.0"
 dependencies = [
  "html-engine",
+]
+
+[[package]]
+name = "html-view-paginate"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
+ "html-view-doc",
+ "html-view-types",
 ]
 
 [[package]]

@@ -206,3 +206,53 @@ both were preserved and the divergence documented at the definition. Worth
 deciding deliberately, but not as a side effect of an extraction.
 
 148 tests pass; warning count unchanged at 4.
+
+## Crate split
+
+Six crates, dependencies flowing one way:
+
+```
+html-view-types   shared vocabulary: column geometry, viewport and frame state,
+                  commands, events, RendererHost, palettes, revisions, cache keys
+html-view-cfi     EPUB CFI generation and parsing            -> html
+html-view-load    document loading through the pipeline      -> html
+html-view-doc     32 read-only document queries              -> types, cfi
+html-view-paginate pagination rules and page building        -> types, doc
+html-view-core    RendererCore, session, painting, navigation, interaction
+```
+
+The orphan rule shaped this more than anything else: an inherent impl must live
+in the crate defining the type. Three collisions, each resolved rather than
+worked around:
+
+- **`DocQuery` had impls in eight files.** Consolidating all 32 queries into
+  `html-view-doc` is what made the split possible, and it turns out to be the
+  right grouping anyway.
+- **`ColumnLayout` had impls in three.** Its pure geometry moved into the types
+  crate with the struct; pagination's three `apply_*_event` methods became free
+  functions taking `&ColumnLayout`, since they carry event types that belong to
+  the paginator.
+- **`pagination_boundary_anchors` and `semantic_keep_ranges`** could not follow
+  the other queries into `html-view-doc` because they carry `BoundaryAnchors`.
+  They became free functions taking `DocQuery`.
+
+That is the general rule this split follows: **cross-crate additions to a
+foreign type become free functions**, costing `foo(doc)` instead of `doc.foo()`.
+
+### Consequences worth knowing
+
+Cross-crate access forced some fields and methods from private to public:
+`VisibleFrame`'s shaping handles, `VisibleLinePositions`' buffer operations,
+`RendererRevisions`' invalidation. Encapsulation is weaker than it was inside
+one crate; the compensating gain is that the dependency direction is now
+enforced.
+
+`#[cfg(test)]` does not cross crates. `table_row_group_bounds_containing` was
+test-only in `render.rs` and is exercised by a test that stayed in
+`html-view-core`, so it is now an ordinary public query with a comment saying
+why.
+
+`html-view-core` re-exports `html-view-types` and the `cfi` and `load` modules
+under their old paths, so the public API is unchanged.
+
+148 tests pass across the workspace; warning count unchanged at 4.

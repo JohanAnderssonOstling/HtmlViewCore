@@ -10,7 +10,10 @@
 //! storing the result is the caller's job. [`Paginator`] makes that checkable.
 
 use html_view_doc::DocQuery;
-use crate::{ColumnLayout, LineScreen, PagePositions, RenderState, RepeatedTableHeader, VisibleLinePositions};
+use html_view_types::{ColumnLayout, LineScreen, PagePositions, RenderState, RepeatedTableHeader, VisibleLinePositions};
+
+mod semantic_keeps;
+mod vertical_rhythm;
 
 // These epub/ARIA predicates are pagination's own. `semantic_keeps` carries a
 // similar pair whose `has_token` additionally matches namespace-prefixed tokens
@@ -78,7 +81,7 @@ fn is_semantic_page_start(boxes: html::layout::RenderBoxView<'_>, box_idx: usize
 }
 
 
-pub(crate) fn initial_render_state() -> RenderState {
+pub fn initial_render_state() -> RenderState {
     RenderState { y_offset: 0.0, col_index: 0.0, should_stop: false }
 }
 
@@ -120,7 +123,7 @@ struct KeepRangeEvent {
     bottom: f64,
 }
 
-pub(crate) struct BoundaryAnchors {
+pub struct BoundaryAnchors {
     first_line: Vec<Option<usize>>,
     next_line: Vec<Option<usize>>,
     pub(crate) subtree_end: Vec<usize>,
@@ -269,7 +272,7 @@ fn pagination_boundary_anchors(doc: DocQuery<'_>) -> BoundaryAnchors {
 /// Pagination events for one document, computed once and reused across page
 /// builds. Backward navigation binary-searches for a start offset, so this must
 /// not be recomputed per candidate.
-pub(crate) struct PaginationEvents {
+pub struct PaginationEvents {
     tables: Vec<TablePaginationEvent>,
     forced_breaks: Vec<ForcedBreakEvent>,
     keeps: Vec<KeepRangeEvent>,
@@ -277,7 +280,7 @@ pub(crate) struct PaginationEvents {
 
 /// Paginates a document into reader pages.
 #[derive(Clone, Copy)]
-pub(crate) struct Paginator<'a> {
+pub struct Paginator<'a> {
     pub(crate) doc: DocQuery<'a>,
     pub(crate) layout: &'a ColumnLayout,
     /// Book composition enables the semantic keep and break rules; web
@@ -287,18 +290,18 @@ pub(crate) struct Paginator<'a> {
 }
 
 impl<'a> Paginator<'a> {
-    pub(crate) fn new(doc: DocQuery<'a>, layout: &'a ColumnLayout, book_optimized: bool, vertical_rhythm: bool) -> Self {
+    pub fn new(doc: DocQuery<'a>, layout: &'a ColumnLayout, book_optimized: bool, vertical_rhythm: bool) -> Self {
         Self { doc, layout, book_optimized, vertical_rhythm }
     }
 
-    pub(crate) fn events(&self) -> PaginationEvents {
+    pub fn events(&self) -> PaginationEvents {
         let anchors = pagination_boundary_anchors(self.doc);
         PaginationEvents { tables: self.table_pagination_events(), forced_breaks: self.forced_break_events(&anchors), keeps: self.automatic_keep_events(&anchors) }
     }
 
     /// Lays out one page starting at `start_offset_y`, reusing `positions` as
     /// scratch storage.
-    pub(crate) fn page_at(&self, events: &PaginationEvents, start_offset_y: f64, positions: Vec<LineScreen>) -> PagePositions {
+    pub fn page_at(&self, events: &PaginationEvents, start_offset_y: f64, positions: Vec<LineScreen>) -> PagePositions {
         self.build_forward_positions(start_offset_y, positions, &events.tables, &events.forced_breaks, &events.keeps)
     }
 
@@ -462,7 +465,7 @@ impl<'a> Paginator<'a> {
             }
         }
 
-        events.extend(crate::semantic_keeps::semantic_keep_ranges(self.doc, anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
+        events.extend(semantic_keeps::semantic_keep_ranges(self.doc, anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
 
         for siblings in children {
             for pair in siblings.windows(2) {
@@ -569,8 +572,10 @@ impl<'a> Paginator<'a> {
         merged
     }
 
-    #[cfg(test)]
-    pub(crate) fn table_row_group_bounds_containing(&self, y: f64) -> Option<(f64, f64)> {
+    /// The row-group pagination bounds covering `y`, if any. Exercised by the
+    /// renderer's table-pagination tests, which live in another crate and so
+    /// cannot reach a `#[cfg(test)]` item here.
+    pub fn table_row_group_bounds_containing(&self, y: f64) -> Option<(f64, f64)> {
         self.table_pagination_events().into_iter().find(|event| event.kind == TablePaginationEventKind::RowGroup && event.top <= y + 0.01 && event.bottom > y + 0.01).map(|event| (event.top, event.bottom))
     }
 
