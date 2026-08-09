@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::doc_query::DocQuery;
-use crate::{Painter, RendererCore, TableCellRange};
+use crate::{Painter, RendererCore, TableCellRange, TableSelectionState};
 
 struct SemanticTableSelection {
     table: RenderTable,
@@ -125,6 +125,76 @@ fn table_markdown(table: &RenderTable, selection: Option<TableCellRange>) -> Opt
         lines.extend(grid.iter().map(|row| format_row(row)));
     }
     Some(lines.join("\n"))
+}
+
+impl TableSelectionState {
+    fn is_active(&self) -> bool {
+        self.range.is_some()
+    }
+
+    pub(crate) fn range(&self) -> Option<TableCellRange> {
+        self.range
+    }
+
+    fn covers(&self, hit: TableHit) -> bool {
+        self.range.is_some_and(|range| range.table_box == hit.table_box)
+    }
+
+    fn anchor_to(&mut self, hit: TableHit, dragging: bool) {
+        self.anchor = Some((hit.table_box, hit.row, hit.row_end, hit.column, hit.column_end));
+        self.range = Some(TableCellRange { table_box: hit.table_box, row_start: hit.row, row_end: hit.row_end, column_start: hit.column, column_end: hit.column_end });
+        self.dragging = dragging;
+    }
+
+    fn begin(&mut self, hit: TableHit) {
+        self.anchor_to(hit, false);
+    }
+
+    /// Starts a drag from an existing selection. Returns whether `hit` was in
+    /// the selected table; a drag may not start in a different one.
+    fn begin_drag(&mut self, hit: TableHit) -> bool {
+        if !self.covers(hit) {
+            return false;
+        }
+        self.anchor_to(hit, true);
+        true
+    }
+
+    /// Extends an in-progress drag to `hit`. Returns `None` when no drag is in
+    /// progress, otherwise whether the selected range actually moved. A hit
+    /// outside the table, or no hit at all, holds the range where it is rather
+    /// than cancelling the drag.
+    fn update_drag(&mut self, hit: Option<TableHit>) -> Option<bool> {
+        if !self.dragging {
+            return None;
+        }
+        let (Some(hit), Some((table_box, anchor_row, anchor_row_end, anchor_column, anchor_column_end))) = (hit, self.anchor) else {
+            return Some(false);
+        };
+        if hit.table_box != table_box {
+            return Some(false);
+        }
+        let next = TableCellRange { table_box, row_start: anchor_row.min(hit.row), row_end: anchor_row_end.max(hit.row_end), column_start: anchor_column.min(hit.column), column_end: anchor_column_end.max(hit.column_end) };
+        if self.range == Some(next) {
+            return Some(false);
+        }
+        self.range = Some(next);
+        Some(true)
+    }
+
+    fn finish_drag(&mut self) -> bool {
+        std::mem::replace(&mut self.dragging, false)
+    }
+
+    /// Drops the selection. Returns whether there was one to drop.
+    fn clear(&mut self) -> bool {
+        if self.range.take().is_none() {
+            return false;
+        }
+        self.anchor = None;
+        self.dragging = false;
+        true
+    }
 }
 
 impl RendererCore {
@@ -474,66 +544,48 @@ impl RendererCore {
     }
 
     pub fn table_selection_at(&self, position: Point) -> bool {
-        self.table_hit(position).is_some_and(|hit| self.table_selection.range.is_some_and(|range| range.table_box == hit.table_box))
+        self.table_hit(position).is_some_and(|hit| self.table_selection.covers(hit))
     }
 
     pub(crate) fn table_selection_active(&self) -> bool {
-        self.table_selection.range.is_some()
+        self.table_selection.is_active()
     }
 
     pub fn begin_table_selection_at(&mut self, position: Point) -> bool {
         let Some(hit) = self.table_hit(position) else { return false };
-        self.table_selection.anchor = Some((hit.table_box, hit.row, hit.row_end, hit.column, hit.column_end));
-        self.table_selection.range = Some(TableCellRange { table_box: hit.table_box, row_start: hit.row, row_end: hit.row_end, column_start: hit.column, column_end: hit.column_end });
-        self.table_selection.dragging = false;
+        self.table_selection.begin(hit);
         self.request_overlay_repaint();
         true
     }
 
     pub(crate) fn begin_table_selection_drag(&mut self, position: Point) -> bool {
-        let Some(current) = self.table_selection.range else {
-            return false;
-        };
         let Some(hit) = self.table_hit(position) else { return false };
-        if hit.table_box != current.table_box {
+        if !self.table_selection.begin_drag(hit) {
             return false;
         }
-        self.table_selection.anchor = Some((hit.table_box, hit.row, hit.row_end, hit.column, hit.column_end));
-        self.table_selection.range = Some(TableCellRange { table_box: hit.table_box, row_start: hit.row, row_end: hit.row_end, column_start: hit.column, column_end: hit.column_end });
-        self.table_selection.dragging = true;
         self.request_overlay_repaint();
         true
     }
 
     pub(crate) fn update_table_selection_drag(&mut self, position: Point) -> bool {
-        if !self.table_selection.dragging {
+        let hit = self.table_hit(position);
+        let Some(changed) = self.table_selection.update_drag(hit) else {
             return false;
-        }
-        let Some(hit) = self.table_hit(position) else { return true };
-        let Some((table_box, anchor_row, anchor_row_end, anchor_column, anchor_column_end)) = self.table_selection.anchor else { return true };
-        if hit.table_box != table_box {
-            return true;
-        }
-        let next = TableCellRange { table_box, row_start: anchor_row.min(hit.row), row_end: anchor_row_end.max(hit.row_end), column_start: anchor_column.min(hit.column), column_end: anchor_column_end.max(hit.column_end) };
-        if self.table_selection.range != Some(next) {
-            self.table_selection.range = Some(next);
+        };
+        if changed {
             self.request_overlay_repaint();
         }
         true
     }
 
     pub(crate) fn finish_table_selection_drag(&mut self) -> bool {
-        let was_dragging = self.table_selection.dragging;
-        self.table_selection.dragging = false;
-        was_dragging
+        self.table_selection.finish_drag()
     }
 
     pub fn clear_table_selection(&mut self) -> bool {
-        if self.table_selection.range.take().is_none() {
+        if !self.table_selection.clear() {
             return false;
         }
-        self.table_selection.anchor = None;
-        self.table_selection.dragging = false;
         self.request_overlay_repaint();
         true
     }
@@ -565,7 +617,7 @@ impl RendererCore {
     }
 
     pub fn copy_table_selection(&self) -> Result<bool, String> {
-        let Some(range) = self.table_selection.range else { return Ok(false) };
+        let Some(range) = self.table_selection.range() else { return Ok(false) };
         let Some(table) = self.document.render_view().boxes().table(range.table_box) else { return Ok(false) };
         let Some(markdown) = table_markdown(&table, Some(range)) else { return Ok(false) };
         self.host.set_clipboard(&markdown)?;
@@ -573,7 +625,7 @@ impl RendererCore {
     }
 
     pub(crate) fn paint_table_selection(&self, painter: &mut impl Painter) {
-        if let Some(range) = self.table_selection.range
+        if let Some(range) = self.table_selection.range()
             && let Some(table) = self.document.render_view().boxes().table(range.table_box)
         {
             self.paint_table_cell_range(painter, &table, range, true);
