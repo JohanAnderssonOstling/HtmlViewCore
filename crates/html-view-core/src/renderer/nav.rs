@@ -3,7 +3,44 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::doc_query::DocQuery;
 use crate::{CachedDocument, DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
+
+impl<'a> DocQuery<'a> {
+    pub(crate) fn best_anchor_from_glyphs(self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
+        let mut best: Option<(u16, u32)> = None;
+        for (id_idx, glyph_idx) in self.view().addressing().anchor_glyphs() {
+            if filter.is_some_and(|f| !f.contains(&id_idx)) {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((_, best_glyph)) => glyph_idx > best_glyph,
+            };
+            if glyph_idx <= glyph_limit && is_better {
+                best = Some((id_idx, glyph_idx));
+            }
+        }
+        best.map(|(id_idx, _)| id_idx)
+    }
+
+    pub(crate) fn best_anchor_from_positions(self, current_y: f64, filter: Option<&HashSet<u16>>) -> Option<u16> {
+        let mut best: Option<(u16, f64, u32)> = None;
+        for (id_idx, pos) in self.view().addressing().anchor_positions().iter() {
+            if filter.is_some_and(|f| !f.contains(&id_idx)) {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((_, best_y, best_order)) => pos.y() > best_y || (pos.y() == best_y && pos.order() > best_order),
+            };
+            if pos.y() <= current_y + 0.1 && is_better {
+                best = Some((id_idx, pos.y(), pos.order()));
+            }
+        }
+        best.map(|(id_idx, _, _)| id_idx)
+    }
+}
 
 impl RendererCore {
     pub(crate) fn set_progress_fraction(&mut self, glyph_shaper: &mut impl GlyphShaper, fraction: f32) {
@@ -414,7 +451,7 @@ impl RendererCore {
         if self.document.render_view().text().lines().is_empty() {
             return false;
         }
-        let line_idx = self.find_start_line_at(target_y, 0.1);
+        let line_idx = self.doc().start_line_at(target_y, 0.1);
         let Some(line) = self.document.render_view().text().line(line_idx) else {
             return false;
         };
@@ -425,29 +462,8 @@ impl RendererCore {
         self.nav.nav_anchor_glyph = if line_start < line_end { Some(line_start) } else { None };
         true
     }
-    pub fn find_start_line_at(&self, offset_y: f64, epsilon: f64) -> usize {
-        let lines = self.document.render_view().text().lines();
-        if lines.is_empty() {
-            return 0;
-        }
-
-        let mut lo = 0;
-        let mut hi = lines.len();
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
     pub fn find_start_line(&self) -> usize {
-        self.find_start_line_at(self.viewport.start_offset_y, 0.1)
+        self.doc().start_line_at(self.viewport.start_offset_y, 0.1)
     }
 
     pub fn parse_nav_state(raw: &str) -> Option<(usize, u32)> {
@@ -499,12 +515,12 @@ impl RendererCore {
         let filter = self.nav.toc_anchor_filter.as_ref();
 
         if let Some(current_glyph) = self.current_glyph_position()
-            && let Some(id_idx) = self.best_anchor_from_glyphs(current_glyph, filter)
+            && let Some(id_idx) = self.doc().best_anchor_from_glyphs(current_glyph, filter)
         {
             return Some(self.document.render_view().string(id_idx).to_string());
         }
 
-        if let Some(id_idx) = self.best_anchor_from_positions(current_y, filter) {
+        if let Some(id_idx) = self.doc().best_anchor_from_positions(current_y, filter) {
             return Some(self.document.render_view().string(id_idx).to_string());
         }
 
@@ -513,45 +529,11 @@ impl RendererCore {
         }
 
         let glyph_idx = self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position())?;
-        self.best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| self.document.render_view().string(id_idx).to_string())
-    }
-
-    fn best_anchor_from_glyphs(&self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, u32)> = None;
-        for (id_idx, glyph_idx) in self.document.render_view().addressing().anchor_glyphs() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_glyph)) => glyph_idx > best_glyph,
-            };
-            if glyph_idx <= glyph_limit && is_better {
-                best = Some((id_idx, glyph_idx));
-            }
-        }
-        best.map(|(id_idx, _)| id_idx)
-    }
-
-    fn best_anchor_from_positions(&self, current_y: f64, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, f64, u32)> = None;
-        for (id_idx, pos) in self.document.render_view().addressing().anchor_positions().iter() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_y, best_order)) => pos.y() > best_y || (pos.y() == best_y && pos.order() > best_order),
-            };
-            if pos.y() <= current_y + 0.1 && is_better {
-                best = Some((id_idx, pos.y(), pos.order()));
-            }
-        }
-        best.map(|(id_idx, _, _)| id_idx)
+        self.doc().best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| self.document.render_view().string(id_idx).to_string())
     }
 
     pub fn restore_glyph_position(&mut self, glyph_idx: u32) {
-        let Some(line_idx) = self.find_line_for_glyph(glyph_idx) else {
+        let Some(line_idx) = self.doc().find_line_for_glyph(glyph_idx) else {
             return;
         };
         let Some(line) = self.document.render_view().text().line(line_idx) else {
@@ -604,29 +586,6 @@ impl RendererCore {
         self.nav.nav_anchor_glyph = self.current_glyph_position();
     }
 
-    pub fn find_end_line_at(&self, offset_y: f64, epsilon: f64) -> Option<usize> {
-        let lines = self.document.render_view().text().lines();
-        let Some(first_line) = lines.first() else {
-            return None;
-        };
-        if first_line.point().y + first_line.height() > offset_y + epsilon {
-            return None;
-        }
-
-        let mut lo = 0;
-        let mut hi = lines.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        Some(lo)
-    }
-
     pub fn next_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         if self.viewport.reached_end {
             if self.nav.current_doc_index + 1 < self.nav.document_uris.len() {
@@ -659,7 +618,7 @@ impl RendererCore {
             return;
         };
         let search_y = current_line.point().y + current_line.height() + 0.1;
-        let target_idx = self.find_start_line_at(search_y, 0.0);
+        let target_idx = self.doc().start_line_at(search_y, 0.0);
         if target_idx >= lines.len() {
             return;
         }
@@ -681,7 +640,7 @@ impl RendererCore {
             return;
         }
         let search_y = current_line.point().y.max(0.0);
-        let Some(target_idx) = self.find_end_line_at(search_y, 0.1) else {
+        let Some(target_idx) = self.doc().end_line_at(search_y, 0.1) else {
             return;
         };
         if let Some(target_line) = lines.get(target_idx) {
@@ -2230,7 +2189,7 @@ mod tests {
         let text = view.text();
         let addressing = view.addressing();
         let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
-        let line_idx = core.find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
+        let line_idx = core.doc().find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
         let screen = core.frame.last_line_positions.get(line_idx).expect("linked line should be painted");
         let line = core.document.render_view().text().line(line_idx).expect("linked line should be present");
         let position = Point::new(screen.point.x + core.glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);

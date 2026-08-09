@@ -1,5 +1,6 @@
 use kurbo::{Point, Rect};
 
+use crate::doc_query::DocQuery;
 use crate::{PaintDirection, Painter, RendererCore, RendererEvent};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
@@ -45,43 +46,7 @@ impl RendererCore {
     /// Scan document glyphs for all occurrences of `query` (case-insensitive).
     /// Returns sorted (start_glyph, end_glyph) pairs.
     pub fn find_matches(&self, query: &str) -> Vec<(u32, u32)> {
-        self.find_matches_with_options(query, crate::SearchOptions { scope: crate::SearchScope::CurrentDocument, ..self.highlight.options })
-    }
-
-    pub fn find_matches_with_options(&self, query: &str, options: crate::SearchOptions) -> Vec<(u32, u32)> {
-        if query.is_empty() {
-            return Vec::new();
-        }
-
-        // Generated marker glyphs are not part of the document's searchable text
-        // (matching how browsers exclude ::marker content), so mask them out with
-        // a sentinel that cannot match and also breaks runs across them.
-        let view = self.document.render_view().text();
-        let total = view.glyph_count();
-        let mut is_marker = vec![false; total];
-        for run in view.marker_runs() {
-            let glyphs = run.glyphs();
-            for i in glyphs {
-                if (i as usize) < total {
-                    is_marker[i as usize] = true;
-                }
-            }
-        }
-
-        let glyph_text: String = view
-            .glyph_slice(0..total as u32)
-            .expect("the full glyph range is valid")
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| {
-                if is_marker[i] {
-                    return '\u{0}';
-                }
-
-                view.glyph_metric(idx).expect("layout glyph IDs are registered").ch()
-            })
-            .collect();
-        find_text_matches(&glyph_text, query, options).into_iter().map(|(start, end)| (start as u32, end as u32)).collect()
+        self.doc().find_matches_with_options(query, crate::SearchOptions { scope: crate::SearchScope::CurrentDocument, ..self.highlight.options })
     }
 
     /// Scroll so that the current match is visible at the top of the viewport.
@@ -89,7 +54,7 @@ impl RendererCore {
         let Some(&(start, _)) = self.highlight.matches.get(self.highlight.current_local_match) else {
             return;
         };
-        let Some(line_idx) = self.find_line_for_glyph(start) else {
+        let Some(line_idx) = self.doc().find_line_for_glyph(start) else {
             return;
         };
         // Only scroll if the match is not already on screen
@@ -127,7 +92,7 @@ impl RendererCore {
             let is_current = first + i == self.highlight.current_local_match;
             let color = if is_current { self.interaction_palette.active_search_match } else { self.interaction_palette.search_match };
 
-            for (start, end) in self.line_text_intersections(line.index(), match_start, match_end) {
+            for (start, end) in self.doc().line_text_intersections(line.index(), match_start, match_end) {
                 let (range_x0, range_x1) = self.glyph_x_span_in_line(line, start, end);
                 let x0 = screen_point.x + range_x0;
                 let x1 = screen_point.x + range_x1;
@@ -157,5 +122,43 @@ mod tests {
         assert_eq!(find_text_matches("Café CAFE cafeteria", "cafe", SearchOptions { whole_word: true, ..options() }).len(), 2);
         assert_eq!(find_text_matches("Café CAFE", "cafe", SearchOptions { match_case: true, ..options() }).len(), 0);
         assert_eq!(find_text_matches("Café CAFE", "cafe", SearchOptions { match_diacritics: true, ..options() }).len(), 1);
+    }
+}
+
+impl<'a> DocQuery<'a> {
+    pub(crate) fn find_matches_with_options(self, query: &str, options: crate::SearchOptions) -> Vec<(u32, u32)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        // Generated marker glyphs are not part of the document's searchable text
+        // (matching how browsers exclude ::marker content), so mask them out with
+        // a sentinel that cannot match and also breaks runs across them.
+        let view = self.text();
+        let total = view.glyph_count();
+        let mut is_marker = vec![false; total];
+        for run in view.marker_runs() {
+            let glyphs = run.glyphs();
+            for i in glyphs {
+                if (i as usize) < total {
+                    is_marker[i as usize] = true;
+                }
+            }
+        }
+
+        let glyph_text: String = view
+            .glyph_slice(0..total as u32)
+            .expect("the full glyph range is valid")
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| {
+                if is_marker[i] {
+                    return '\u{0}';
+                }
+
+                view.glyph_metric(idx).expect("layout glyph IDs are registered").ch()
+            })
+            .collect();
+        find_text_matches(&glyph_text, query, options).into_iter().map(|(start, end)| (start as u32, end as u32)).collect()
     }
 }

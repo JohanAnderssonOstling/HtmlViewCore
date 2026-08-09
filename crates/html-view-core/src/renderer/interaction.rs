@@ -262,7 +262,7 @@ impl RendererCore {
         if self.document.render_view().addressing().link_for_glyph(glyph_idx).is_none() {
             return false;
         }
-        let Some(line_idx) = self.find_line_for_glyph(glyph_idx) else {
+        let Some(line_idx) = self.doc().find_line_for_glyph(glyph_idx) else {
             return false;
         };
         let Some(screen) = self.frame.last_line_positions.get(line_idx) else {
@@ -318,8 +318,8 @@ impl RendererCore {
             let prefix_start = start.saturating_sub(48);
             let glyph_count = self.document.render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
-            let prefix = self.build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
-            let suffix = self.build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
+            let prefix = self.doc().build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
+            let suffix = self.doc().build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
             self.host.emit(crate::RendererEvent::SelectionFinished { doc: self.nav.current_doc_index, cfi_range, exact_text, prefix, suffix });
         }
         let click = match (self.selection.selection_anchor, self.selection.selection_active, self.selection.pending_link_glyph) {

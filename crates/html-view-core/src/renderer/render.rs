@@ -3,6 +3,7 @@ use std::time::Duration;
 use kurbo::{Point, Rect};
 use peniko::Color;
 
+use crate::doc_query::DocQuery;
 use crate::{LineScreen, PagePositions, PaintDirection, Painter, RenderState, RendererCore, RepeatedTableHeader, VisibleLinePositions};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -129,17 +130,71 @@ fn project_inline_decoration_rect(rect: Rect, logical_line_point: Point, screen_
     Rect::new(x, y, x + rect.width(), y + rect.height())
 }
 
-impl RendererCore {
-    fn first_line_in_vertical_range(&self, top: f64, bottom: f64) -> Option<usize> {
-        let lines = self.document.render_view().text().lines();
+/// Compute scaled image dimensions to fit column width
+fn scaled_image_size(frag: &html::layout::RenderImageFragment) -> (f64, f64) {
+    let size = frag.size();
+    (size.width, size.height)
+}
+
+impl<'a> DocQuery<'a> {
+    pub(crate) fn effective_line_height(self, line_idx: usize, fallback: f64) -> f64 {
+        if line_idx >= self.text().line_count() {
+            return fallback;
+        }
+        let mut max_height = 0.0;
+        for frag in self.view().fragments().images_for_line(line_idx).iter() {
+            let (_, height) = scaled_image_size(&frag);
+            if height > max_height {
+                max_height = height;
+            }
+        }
+        if max_height > 0.0 { max_height } else { fallback }
+    }
+
+    pub(crate) fn find_line_index_for_decoration(self, y0: f64, y1: f64) -> Option<usize> {
+        // find first line overlapping a decoration rect
+        let lines = self.text().lines();
+        if lines.is_empty() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = lines.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let line = lines.get(mid).expect("binary-search index must be within line count");
+            if line.point().y + line.height() < y0 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for idx in lo..lines.len() {
+            let line = lines.get(idx).expect("line index must be within line count");
+            let ly0 = line.point().y;
+            let ly1 = line.point().y + line.height();
+            if ly0 > y1 {
+                break;
+            }
+            // Inline top and bottom borders sit immediately outside the line
+            // box and therefore only touch its edge. Keep that owning line so
+            // pagination can project the decoration into the correct column.
+            if ly1 >= y0 && ly0 <= y1 {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn first_line_in_vertical_range(self, top: f64, bottom: f64) -> Option<usize> {
+        let lines = self.text().lines();
         // Bottom captions can occur before their rows in source/line order
         // while being below them geometrically, so this cannot be a binary
         // search over line Y coordinates.
         lines.iter().position(|line| line.point().y >= top - 0.01 && line.point().y < bottom - 0.01)
     }
 
-    fn pagination_boundary_anchors(&self) -> BoundaryAnchors {
-        let root = self.document.render_view();
+    pub(crate) fn pagination_boundary_anchors(self) -> BoundaryAnchors {
+        let root = self.view();
         let boxes = root.boxes();
         let text = root.text();
         let mut first_line: Vec<Option<usize>> = vec![None; boxes.len()];
@@ -192,6 +247,47 @@ impl RendererCore {
         BoundaryAnchors { first_line, next_line, subtree_end }
     }
 
+    pub(crate) fn start_line_at(self, offset_y: f64, epsilon: f64) -> usize {
+        let lines = self.text().lines();
+        let mut lo = 0;
+        let mut hi = lines.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let line = lines.get(mid).expect("binary-search index must be within line count");
+            if line.point().y + line.height() <= offset_y + epsilon {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    pub(crate) fn end_line_at(self, offset_y: f64, epsilon: f64) -> Option<usize> {
+        let lines = self.text().lines();
+        let Some(first_line) = lines.first() else {
+            return None;
+        };
+        if first_line.point().y + first_line.height() > offset_y + epsilon {
+            return None;
+        }
+        let mut lo = 0;
+        let mut hi = lines.len() - 1;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let line = lines.get(mid).expect("binary-search index must be within line count");
+            if line.point().y + line.height() <= offset_y + epsilon {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Some(lo)
+    }
+
+}
+
+impl RendererCore {
     fn table_pagination_events(&self) -> Vec<TablePaginationEvent> {
         if !self.pipeline_inputs.layout.text_composition_policy.is_book_optimized() {
             return Vec::new();
@@ -228,7 +324,7 @@ impl RendererCore {
                 continue;
             };
             let table_bottom = table_point.y + table_size.height;
-            if let Some(trigger_line) = self.first_line_in_vertical_range(table_point.y, table_bottom) {
+            if let Some(trigger_line) = self.doc().first_line_in_vertical_range(table_point.y, table_bottom) {
                 events.push(TablePaginationEvent { trigger_line, top: table_point.y, bottom: table_bottom, kind: TablePaginationEventKind::WholeTable, forced: false, repeated_header: None });
             }
 
@@ -273,7 +369,7 @@ impl RendererCore {
                     group_bottom = group_bottom.max(table_bottom);
                 }
                 let forced = boxes.forces_break_before(first_row) || (group_start > 0 && boxes.forces_break_after(rows[group_start - 1]));
-                if let Some(trigger_line) = self.first_line_in_vertical_range(group_top, group_bottom) {
+                if let Some(trigger_line) = self.doc().first_line_in_vertical_range(group_top, group_bottom) {
                     events.push(TablePaginationEvent {
                         trigger_line,
                         top: group_top,
@@ -352,7 +448,7 @@ impl RendererCore {
             }
         }
 
-        events.extend(self.semantic_keep_ranges(anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
+        events.extend(self.doc().semantic_keep_ranges(anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
 
         for siblings in children {
             for pair in siblings.windows(2) {
@@ -540,54 +636,10 @@ impl RendererCore {
         Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
     }
 
-    fn render_start_line_at(&self, offset_y: f64, epsilon: f64) -> usize {
-        let lines = self.document.render_view().text().lines();
-        let mut lo = 0;
-        let mut hi = lines.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    fn render_end_line_at(&self, offset_y: f64, epsilon: f64) -> Option<usize> {
-        let lines = self.document.render_view().text().lines();
-        let Some(first_line) = lines.first() else {
-            return None;
-        };
-        if first_line.point().y + first_line.height() > offset_y + epsilon {
-            return None;
-        }
-        let mut lo = 0;
-        let mut hi = lines.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        Some(lo)
-    }
-
     /// Compute x-coordinate for a column given a local x offset
     #[inline]
     pub(crate) fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
         self.layout.col_gap + col_index * (self.layout.col_width + self.layout.col_gap) + local_x
-    }
-
-    /// Compute scaled image dimensions to fit column width
-    fn scaled_image_size(&self, frag: &html::layout::RenderImageFragment) -> (f64, f64) {
-        let size = frag.size();
-        (size.width, size.height)
     }
 
     fn resolve_point_at(&self, point: Point, elem_height: f64, mut render_state: RenderState, start_offset_y: f64) -> (Option<Point>, RenderState) {
@@ -664,7 +716,7 @@ impl RendererCore {
                 continue;
             }
             if decoration.is_inline() {
-                if let Some(line_idx) = decoration.line_idx().or_else(|| self.find_line_index_for_decoration(rect.y0, rect.y1)) {
+                if let Some(line_idx) = decoration.line_idx().or_else(|| self.doc().find_line_index_for_decoration(rect.y0, rect.y1)) {
                     if let Some(screen) = line_positions.and_then(|positions| positions.get(line_idx)) {
                         let Some(line) = lines.get(line_idx) else {
                             continue;
@@ -839,40 +891,6 @@ impl RendererCore {
         crate::InlineMetrics { offset: half_gap / 2.0 }
     }
 
-    fn find_line_index_for_decoration(&self, y0: f64, y1: f64) -> Option<usize> {
-        // find first line overlapping a decoration rect
-        let lines = self.document.render_view().text().lines();
-        if lines.is_empty() {
-            return None;
-        }
-        let mut lo = 0usize;
-        let mut hi = lines.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() < y0 {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        for idx in lo..lines.len() {
-            let line = lines.get(idx).expect("line index must be within line count");
-            let ly0 = line.point().y;
-            let ly1 = line.point().y + line.height();
-            if ly0 > y1 {
-                break;
-            }
-            // Inline top and bottom borders sit immediately outside the line
-            // box and therefore only touch its edge. Keep that owning line so
-            // pagination can project the decoration into the correct column.
-            if ly1 >= y0 && ly0 <= y1 {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
     fn paint_inline_decoration_at(&self, cx: &mut impl Painter, rect: &kurbo::Rect, line: &html::layout::RenderLine, screen_point: Point, x_offset: f64, decoration: &html::layout::RenderDecoration) {
         // Inline backgrounds, borders, and text decorations share the same
         // paint-only optical shift as their glyphs. The source rect remains in
@@ -960,7 +978,7 @@ impl RendererCore {
     }
 
     fn draw_image_fragment_with_placeholder(&self, cx: &mut impl Painter, frag: &html::layout::RenderImageFragment, point: Point, placeholder: Color) {
-        let (width, height) = self.scaled_image_size(frag);
+        let (width, height) = scaled_image_size(frag);
         let offset = frag.offset();
         let rect = Rect::new(point.x + offset.x, point.y + offset.y, point.x + offset.x + width, point.y + offset.y + height);
         if let Some(decoded) = self.image_pipeline.get_decoded(frag.image_idx()) {
@@ -971,20 +989,6 @@ impl RendererCore {
         } else {
             cx.fill_rect(rect, placeholder);
         }
-    }
-
-    pub(super) fn effective_line_height(&self, line_idx: usize, fallback: f64) -> f64 {
-        if line_idx >= self.document.render_view().text().line_count() {
-            return fallback;
-        }
-        let mut max_height = 0.0;
-        for frag in self.document.render_view().fragments().images_for_line(line_idx).iter() {
-            let (_, height) = self.scaled_image_size(&frag);
-            if height > max_height {
-                max_height = height;
-            }
-        }
-        if max_height > 0.0 { max_height } else { fallback }
     }
 
     fn fill_selection_rect(&self, cx: &mut impl Painter, x0: f64, x1: f64, y: f64, height: f64) {
@@ -1003,9 +1007,9 @@ impl RendererCore {
             return;
         };
         let semantic_cells = self.semantic_cell_glyph_ranges(sel_start, sel_end);
-        let mut selected_ranges = self.line_text_intersections(line_idx, sel_start, sel_end).map(|(start, end)| start..end).collect::<Vec<_>>();
+        let mut selected_ranges = self.doc().line_text_intersections(line_idx, sel_start, sel_end).map(|(start, end)| start..end).collect::<Vec<_>>();
         for promoted in self.semantic_promoted_glyph_ranges(sel_start, sel_end) {
-            selected_ranges.extend(self.line_text_intersections(line_idx, promoted.start, promoted.end).map(|(start, end)| start..end));
+            selected_ranges.extend(self.doc().line_text_intersections(line_idx, promoted.start, promoted.end).map(|(start, end)| start..end));
         }
         selected_ranges.sort_by_key(|range| range.start);
         let mut merged: Vec<std::ops::Range<u32>> = Vec::new();
@@ -1048,7 +1052,7 @@ impl RendererCore {
 
     fn build_forward_positions(&self, start_offset_y: f64, positions: Vec<LineScreen>, table_events: &[TablePaginationEvent], forced_break_events: &[ForcedBreakEvent], keep_events: &[KeepRangeEvent]) -> PagePositions {
         let lines = self.document.render_view().text().lines();
-        let start_line = self.render_start_line_at(start_offset_y, 0.1);
+        let start_line = self.doc().start_line_at(start_offset_y, 0.1);
         let mut table_event_idx = table_events.partition_point(|event| event.trigger_line < start_line);
         let mut forced_break_event_idx = forced_break_events.partition_point(|event| event.trigger_line < start_line);
         let mut keep_event_idx = keep_events.partition_point(|event| event.trigger_line < start_line);
@@ -1087,7 +1091,7 @@ impl RendererCore {
                 table_event_idx += 1;
             }
             let line = lines.get(line_idx).expect("line index must stay within line_count");
-            let effective_height = self.effective_line_height(line_idx, line.height());
+            let effective_height = self.doc().effective_line_height(line_idx, line.height());
             let oversized = effective_height > self.layout.size.height;
             // An indivisible line taller than a column can never satisfy the
             // normal fit check. Fit it as one column-high atomic item so a
@@ -1243,7 +1247,7 @@ impl RendererCore {
     pub(crate) fn prepare_forward(&mut self) {
         // render forward from current offset
         let positions = self.frame_scratch.take_line_position_buffer(&mut self.frame.last_line_positions);
-        let boundary_anchors = self.pagination_boundary_anchors();
+        let boundary_anchors = self.doc().pagination_boundary_anchors();
         let table_events = self.table_pagination_events();
         let forced_break_events = self.forced_break_events(&boundary_anchors);
         let keep_events = self.automatic_keep_events(&boundary_anchors);
@@ -1297,7 +1301,7 @@ impl RendererCore {
         let lines = self.document.render_view().text().lines();
         let end_line = if let Some(idx) = self.viewport.back_anchor_end_line {
             idx.min(lines.len().saturating_sub(1))
-        } else if let Some(idx) = self.render_end_line_at(self.viewport.end_offset_y, 1e-6) {
+        } else if let Some(idx) = self.doc().end_line_at(self.viewport.end_offset_y, 1e-6) {
             idx
         } else {
             self.viewport.start_offset_y = 0.0;
@@ -1315,7 +1319,7 @@ impl RendererCore {
 
         let available_height = self.layout.col_count * self.layout.size.height;
         let end_line_data = lines.get(end_line).expect("end line must be within line count");
-        let end_line_height = self.effective_line_height(end_line, end_line_data.height());
+        let end_line_height = self.doc().effective_line_height(end_line, end_line_data.height());
         // Keep a tiny safety margin so the anchor line doesn't land exactly on the
         // bottom edge and get treated as overflow by column fit logic.
         let end_line_target_y = (available_height - end_line_height - 0.1).max(0.0);
@@ -1324,7 +1328,7 @@ impl RendererCore {
         // Use the same forward position resolver as normal rendering so lines that share
         // the same document Y (e.g. table rows across columns) keep consistent screen Y.
         let positions = self.frame_scratch.take_line_position_buffer(&mut self.frame.last_line_positions);
-        let boundary_anchors = self.pagination_boundary_anchors();
+        let boundary_anchors = self.doc().pagination_boundary_anchors();
         let table_events = self.table_pagination_events();
         let forced_break_events = self.forced_break_events(&boundary_anchors);
         let keep_events = self.automatic_keep_events(&boundary_anchors);

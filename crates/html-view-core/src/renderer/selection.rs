@@ -1,22 +1,54 @@
+use crate::doc_query::DocQuery;
 use crate::{FormatState, RendererCore};
 use kurbo::Point;
 
-impl RendererCore {
-    pub fn selection_range(&self) -> Option<(u32, u32)> {
-        // normalize selection anchor/active into a range
-        let (Some(a), Some(b)) = (self.selection.selection_anchor, self.selection.selection_active) else {
-            return None;
-        };
-        if a == b {
-            return None;
-        }
-        let (start, end) = if a < b { (a, b) } else { (b, a) }; // normalize range order
-        Some((start, end))
-    }
+fn tag_is_one_of(tag: &str, candidates: &[&str]) -> bool {
+    // case-insensitive tag membership check
+    candidates.iter().any(|c| tag.eq_ignore_ascii_case(c))
+}
 
-    pub fn block_ancestor(&self, box_idx: usize) -> usize {
+fn push_newline(plain: &mut String, markdown: &mut String) {
+    // keep plain/markdown buffers in sync on line breaks
+    if !plain.ends_with('\n') {
+        plain.push('\n');
+    }
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+}
+
+fn apply_format_transition(markdown: &mut String, prev: FormatState, next: FormatState) {
+    // emit markdown toggles for format changes
+    if prev.italic && !next.italic {
+        markdown.push('*');
+    }
+    if prev.bold && !next.bold {
+        markdown.push_str("**");
+    }
+    if prev.strike && !next.strike {
+        markdown.push_str("~~");
+    }
+    if prev.code && !next.code {
+        markdown.push('`');
+    }
+    if !prev.strike && next.strike {
+        markdown.push_str("~~");
+    }
+    if !prev.bold && next.bold {
+        markdown.push_str("**");
+    }
+    if !prev.italic && next.italic {
+        markdown.push('*');
+    }
+    if !prev.code && next.code {
+        markdown.push('`');
+    }
+}
+
+impl<'a> DocQuery<'a> {
+    pub(crate) fn block_ancestor(self, box_idx: usize) -> usize {
         // walk up to the nearest block box
-        let boxes = self.document.render_view().boxes();
+        let boxes = self.boxes();
         let mut idx = box_idx;
         loop {
             if boxes.is_block_container(idx) {
@@ -29,17 +61,12 @@ impl RendererCore {
         }
     }
 
-    pub fn box_tag(&self, box_idx: usize) -> String {
+    pub(crate) fn box_tag(self, box_idx: usize) -> String {
         // get tag name for a box
-        self.document.render_view().boxes().tag(box_idx).unwrap_or("").to_string()
+        self.boxes().tag(box_idx).unwrap_or("").to_string()
     }
 
-    pub fn tag_is_one_of(tag: &str, candidates: &[&str]) -> bool {
-        // case-insensitive tag membership check
-        candidates.iter().any(|c| tag.eq_ignore_ascii_case(c))
-    }
-
-    pub fn header_prefix(&self, block_idx: usize) -> Option<&'static str> {
+    pub(crate) fn header_prefix(self, block_idx: usize) -> Option<&'static str> {
         // map header tags to markdown prefixes
         let tag = self.box_tag(block_idx);
         if tag.eq_ignore_ascii_case("h1") {
@@ -59,26 +86,26 @@ impl RendererCore {
         }
     }
 
-    pub fn format_state_for_box(&self, box_idx: usize) -> FormatState {
+    pub(crate) fn format_state_for_box(self, box_idx: usize) -> FormatState {
         // derive formatting from style + tag
         let tag = self.box_tag(box_idx);
-        let style = self.document.render_view().boxes().text_format(box_idx);
+        let style = self.boxes().text_format(box_idx);
 
         let mut state = FormatState::default();
         state.italic = matches!(style.font_style, html::layout::FontStyle::Italic | html::layout::FontStyle::Oblique);
         state.bold = style.font_weight >= 600;
         state.strike = style.text_decoration.line_through();
 
-        if Self::tag_is_one_of(&tag, &["em", "i"]) {
+        if tag_is_one_of(&tag, &["em", "i"]) {
             state.italic = true;
         }
-        if Self::tag_is_one_of(&tag, &["strong", "b"]) {
+        if tag_is_one_of(&tag, &["strong", "b"]) {
             state.bold = true;
         }
-        if Self::tag_is_one_of(&tag, &["s", "del", "strike"]) {
+        if tag_is_one_of(&tag, &["s", "del", "strike"]) {
             state.strike = true;
         }
-        if Self::tag_is_one_of(&tag, &["code"]) {
+        if tag_is_one_of(&tag, &["code"]) {
             state.code = true;
             state.bold = false;
             state.italic = false;
@@ -87,45 +114,7 @@ impl RendererCore {
         state
     }
 
-    pub fn push_newline(plain: &mut String, markdown: &mut String) {
-        // keep plain/markdown buffers in sync on line breaks
-        if !plain.ends_with('\n') {
-            plain.push('\n');
-        }
-        if !markdown.ends_with('\n') {
-            markdown.push('\n');
-        }
-    }
-
-    pub fn apply_format_transition(markdown: &mut String, prev: FormatState, next: FormatState) {
-        // emit markdown toggles for format changes
-        if prev.italic && !next.italic {
-            markdown.push('*');
-        }
-        if prev.bold && !next.bold {
-            markdown.push_str("**");
-        }
-        if prev.strike && !next.strike {
-            markdown.push_str("~~");
-        }
-        if prev.code && !next.code {
-            markdown.push('`');
-        }
-        if !prev.strike && next.strike {
-            markdown.push_str("~~");
-        }
-        if !prev.bold && next.bold {
-            markdown.push_str("**");
-        }
-        if !prev.italic && next.italic {
-            markdown.push('*');
-        }
-        if !prev.code && next.code {
-            markdown.push('`');
-        }
-    }
-
-    pub fn build_selection_text(&self, start: u32, end: u32) -> (Option<String>, Option<String>) {
+    pub(crate) fn build_selection_text(self, start: u32, end: u32) -> (Option<String>, Option<String>) {
         // extract selected text as plain and markdown
         let mut plain = String::new();
         let mut markdown = String::new();
@@ -133,7 +122,7 @@ impl RendererCore {
         let mut prev_block: Option<usize> = None;
         let mut at_block_start = true;
 
-        for run in self.document.render_view().text().text_runs() {
+        for run in self.text().text_runs() {
             let glyphs = run.glyphs();
             if glyphs.end <= start || glyphs.start >= end {
                 continue;
@@ -147,9 +136,9 @@ impl RendererCore {
             if let Some(prev) = prev_block
                 && prev != block
             {
-                Self::apply_format_transition(&mut markdown, current_format, FormatState::default());
+                apply_format_transition(&mut markdown, current_format, FormatState::default());
                 current_format = FormatState::default();
-                Self::push_newline(&mut plain, &mut markdown);
+                push_newline(&mut plain, &mut markdown);
                 at_block_start = true;
             }
 
@@ -161,18 +150,18 @@ impl RendererCore {
             }
 
             if desired_format != current_format {
-                Self::apply_format_transition(&mut markdown, current_format, desired_format);
+                apply_format_transition(&mut markdown, current_format, desired_format);
                 current_format = desired_format;
             }
 
             for i in run_start..run_end {
-                let text = self.document.render_view().text();
+                let text = self.text();
                 let glyph_index = text.glyph_at(i as usize).unwrap_or_default();
                 let c = text.glyph_metric(glyph_index).expect("layout glyph IDs are registered").ch();
                 if c == '\n' {
-                    Self::apply_format_transition(&mut markdown, current_format, FormatState::default());
+                    apply_format_transition(&mut markdown, current_format, FormatState::default());
                     current_format = FormatState::default();
-                    Self::push_newline(&mut plain, &mut markdown);
+                    push_newline(&mut plain, &mut markdown);
                     at_block_start = true;
                 } else {
                     plain.push(c);
@@ -186,11 +175,42 @@ impl RendererCore {
             prev_block = Some(block);
         }
 
-        Self::apply_format_transition(&mut markdown, current_format, FormatState::default());
+        apply_format_transition(&mut markdown, current_format, FormatState::default());
         if plain.is_empty() {
             return (None, None);
         }
         (Some(plain), Some(markdown))
+    }
+
+    pub(crate) fn find_line_for_glyph(self, glyph_idx: u32) -> Option<usize> {
+        self.text().line_index_for_glyph(glyph_idx)
+    }
+
+    pub(crate) fn line_text_intersections(self, line_idx: usize, start: u32, end: u32) -> impl Iterator<Item = (u32, u32)> + 'a {
+        self.text().line_text_fragments(line_idx).into_iter().flatten().filter_map(move |fragment| {
+            let glyphs = fragment.glyphs();
+            let fragment_start = start.max(glyphs.start);
+            let fragment_end = end.min(glyphs.end);
+            (start < end && fragment_start < fragment_end).then_some((fragment_start, fragment_end))
+        })
+    }
+
+    pub(crate) fn glyph_advance_override(self, line_idx: usize, glyph_idx: u32) -> Option<f64> {
+        self.text().line_glyph_advances(line_idx)?.iter().find(|run| run.range().contains(&glyph_idx)).map(|run| run.advance())
+    }
+}
+
+impl RendererCore {
+    pub fn selection_range(&self) -> Option<(u32, u32)> {
+        // normalize selection anchor/active into a range
+        let (Some(a), Some(b)) = (self.selection.selection_anchor, self.selection.selection_active) else {
+            return None;
+        };
+        if a == b {
+            return None;
+        }
+        let (start, end) = if a < b { (a, b) } else { (b, a) }; // normalize range order
+        Some((start, end))
     }
 
     pub fn update_selection_text(&mut self) {
@@ -200,23 +220,10 @@ impl RendererCore {
             self.selection.selected_text_markdown = None;
             return;
         };
-        let (plain, ordinary_markdown) = self.build_selection_text(start, end);
+        let (plain, ordinary_markdown) = self.doc().build_selection_text(start, end);
         let markdown = if self.selection.semantic_selection { self.build_semantic_selection_text(start, end).1 } else { ordinary_markdown };
         self.selection.selected_text = plain;
         self.selection.selected_text_markdown = markdown;
-    }
-
-    pub fn find_line_for_glyph(&self, glyph_idx: u32) -> Option<usize> {
-        self.document.render_view().text().line_index_for_glyph(glyph_idx)
-    }
-
-    pub(crate) fn line_text_intersections(&self, line_idx: usize, start: u32, end: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.document.render_view().text().line_text_fragments(line_idx).into_iter().flatten().filter_map(move |fragment| {
-            let glyphs = fragment.glyphs();
-            let fragment_start = start.max(glyphs.start);
-            let fragment_end = end.min(glyphs.end);
-            (start < end && fragment_start < fragment_end).then_some((fragment_start, fragment_end))
-        })
     }
 
     /// Returns whether a point intersects the selection as it is painted.
@@ -229,16 +236,16 @@ impl RendererCore {
         }
         let promoted = self.semantic_promoted_glyph_ranges(selection_start, selection_end);
         for (line_idx, screen) in self.frame.last_line_positions.iter() {
-            let Some(line) = self.document.render_view().text().line(line_idx) else {
+            let Some(line) = self.doc().text().line(line_idx) else {
                 continue;
             };
             if position.y < screen.point.y || position.y > screen.point.y + line.height() {
                 continue;
             }
 
-            let mut ranges = self.line_text_intersections(line_idx, selection_start, selection_end).collect::<Vec<_>>();
+            let mut ranges = self.doc().line_text_intersections(line_idx, selection_start, selection_end).collect::<Vec<_>>();
             for range in &promoted {
-                ranges.extend(self.line_text_intersections(line_idx, range.start, range.end));
+                ranges.extend(self.doc().line_text_intersections(line_idx, range.start, range.end));
             }
             for (start, end) in ranges {
                 let (x0, x1) = self.glyph_x_span_in_line(&line, start, end);
@@ -275,7 +282,7 @@ impl RendererCore {
                 return line.optical_offset_x() + offset_x + x;
             }
         }
-        let text = self.document.render_view().text();
+        let text = self.doc().text();
         let fallback_fragment = line_idx.and_then(|line_idx| {
             let leading = || text.line_text_fragments(line_idx)?.find(|fragment| fragment.glyphs().start == position);
             let trailing_fragment = || {
@@ -293,7 +300,7 @@ impl RendererCore {
             }
             let glyph_index = text.glyph_at(i as usize).unwrap_or_default();
             let metric = text.glyph_metric(glyph_index).expect("layout glyph IDs are registered");
-            if let Some(advance) = line_idx.and_then(|line_idx| self.glyph_advance_override(line_idx, i)) {
+            if let Some(advance) = line_idx.and_then(|line_idx| self.doc().glyph_advance_override(line_idx, i)) {
                 x += advance;
             } else {
                 let next_is_conditional_hyphen = text.glyph_at(i as usize + 1).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|next| next.ch() == '\u{00ad}');
@@ -315,7 +322,7 @@ impl RendererCore {
 
     pub fn hit_test_glyph(&self, pos: Point) -> Option<u32> {
         // find nearest glyph index for a screen position
-        let lines = self.document.render_view().text().lines();
+        let lines = self.doc().text().lines();
         if self.frame.last_line_positions.is_empty() || lines.is_empty() || self.layout.col_count <= 0.0 {
             return None;
         }
@@ -373,7 +380,7 @@ impl RendererCore {
         let rel_x = pos.x - screen.point.x;
         let mut native_hit = None;
         let mut native_distance = f64::INFINITY;
-        let text = self.document.render_view().text();
+        let text = self.doc().text();
         let contains_conditional_hyphen = line.glyphs().any(|index| text.glyph_at(index as usize).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == '\u{00ad}'));
         if line.letter_spacing() == 0.0 && line.word_spacing() == 0.0 && !contains_conditional_hyphen {
             for (offset_x, shaped) in self.shaped_line_fragments(line_idx) {
@@ -403,7 +410,7 @@ impl RendererCore {
             for i in glyphs.start..glyphs.end {
                 let glyph_index = text.glyph_at(i as usize).unwrap_or_default();
                 let metric = text.glyph_metric(glyph_index).expect("layout glyph IDs are registered");
-                let override_advance = self.glyph_advance_override(line_idx, i);
+                let override_advance = self.doc().glyph_advance_override(line_idx, i);
                 let next_is_conditional_hyphen = text.glyph_at(i as usize + 1).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|next| next.ch() == '\u{00ad}');
                 let tracking = if i + 1 < line.end() && text.is_character_cluster_boundary(i + 1) && metric.ch() != '\u{00ad}' && !next_is_conditional_hyphen { line.letter_spacing() } else { 0.0 };
                 let w = override_advance.unwrap_or(text.character_advance(i).unwrap_or_else(|| metric.advance()) as f64 + tracking + if metric.ch() == ' ' { line.word_spacing() } else { 0.0 });
@@ -423,10 +430,6 @@ impl RendererCore {
         self.frame.shaped_lines.iter().filter(move |fragment| fragment.shaped.line_index == line_idx).map(|fragment| (fragment.offset_x, &fragment.shaped))
     }
 
-    fn glyph_advance_override(&self, line_idx: usize, glyph_idx: u32) -> Option<f64> {
-        self.document.render_view().text().line_glyph_advances(line_idx)?.iter().find(|run| run.range().contains(&glyph_idx)).map(|run| run.advance())
-    }
-
     pub fn hit_test_image(&self, pos: Point) -> Option<u32> {
         if self.frame.last_line_positions.is_empty() || self.layout.col_count <= 0.0 {
             return None;
@@ -435,7 +438,7 @@ impl RendererCore {
         let max_col = self.layout.col_count as i32 - 1;
         let target_col = (((pos.x - self.layout.col_gap) / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col);
 
-        let fragments = self.document.render_view().fragments();
+        let fragments = self.doc().view().fragments();
         for (line_idx, screen) in self.frame.last_line_positions.iter() {
             if screen.col_index != target_col || fragments.images_for_line(line_idx).is_empty() {
                 continue;

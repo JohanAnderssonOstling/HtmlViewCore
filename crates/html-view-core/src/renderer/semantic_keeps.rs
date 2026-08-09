@@ -1,4 +1,5 @@
-use crate::{RendererCore, render::BoundaryAnchors};
+use crate::doc_query::DocQuery;
+use crate::render::BoundaryAnchors;
 
 const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
 const EPSILON: f64 = 0.01;
@@ -32,12 +33,12 @@ fn is_semantic_label(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> 
     has_epub_type(boxes, box_idx, "label") || boxes.tag(box_idx).is_some_and(|tag| ["h1", "h2", "h3", "h4", "h5", "h6"].iter().any(|heading| tag.eq_ignore_ascii_case(heading)))
 }
 
-impl RendererCore {
+impl<'a> DocQuery<'a> {
     /// Returns soft keep ranges for compact book structures. These are
     /// pagination preferences, not layout constraints: the normal keep event
     /// path discards any range taller than a fragmentainer.
-    pub(super) fn semantic_keep_ranges(&self, anchors: &BoundaryAnchors) -> Vec<(usize, f64, f64)> {
-        let root = self.document.render_view();
+    pub(crate) fn semantic_keep_ranges(self, anchors: &BoundaryAnchors) -> Vec<(usize, f64, f64)> {
+        let root = self.view();
         let boxes = root.boxes();
         let lines = root.text().lines();
         let mut lines_by_y = lines.iter().enumerate().map(|(line_idx, line)| (line.point().y, line_idx)).collect::<Vec<_>>();

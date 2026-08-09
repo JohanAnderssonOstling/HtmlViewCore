@@ -4,6 +4,7 @@ use peniko::Color;
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::doc_query::DocQuery;
 use crate::{Painter, RendererCore, TableCellRange};
 
 struct SemanticTableSelection {
@@ -166,8 +167,11 @@ impl RendererCore {
         }
     }
 
-    fn box_descends_from(&self, mut box_idx: usize, ancestor: usize) -> bool {
-        let boxes = self.document.render_view().boxes();
+}
+
+impl<'a> DocQuery<'a> {
+    pub(crate) fn box_descends_from(self, mut box_idx: usize, ancestor: usize) -> bool {
+        let boxes = self.boxes();
         loop {
             if box_idx == ancestor {
                 return true;
@@ -177,8 +181,8 @@ impl RendererCore {
         }
     }
 
-    fn nearest_table_ancestor(&self, mut box_idx: usize) -> Option<usize> {
-        let boxes = self.document.render_view().boxes();
+    pub(crate) fn nearest_table_ancestor(self, mut box_idx: usize) -> Option<usize> {
+        let boxes = self.boxes();
         loop {
             if boxes.is_table(box_idx) {
                 return Some(box_idx);
@@ -187,8 +191,8 @@ impl RendererCore {
         }
     }
 
-    fn nearest_tag_ancestor(&self, mut box_idx: usize, wanted: &str) -> Option<usize> {
-        let boxes = self.document.render_view().boxes();
+    pub(crate) fn nearest_tag_ancestor(self, mut box_idx: usize, wanted: &str) -> Option<usize> {
+        let boxes = self.boxes();
         loop {
             if boxes.tag(box_idx).is_some_and(|tag| tag.eq_ignore_ascii_case(wanted)) {
                 return Some(box_idx);
@@ -197,8 +201,8 @@ impl RendererCore {
         }
     }
 
-    fn nearest_code_block_ancestor(&self, mut box_idx: usize) -> Option<usize> {
-        let boxes = self.document.render_view().boxes();
+    pub(crate) fn nearest_code_block_ancestor(self, mut box_idx: usize) -> Option<usize> {
+        let boxes = self.boxes();
         loop {
             let tag = boxes.tag(box_idx);
             if tag.is_some_and(|tag| tag.eq_ignore_ascii_case("pre") || (tag.eq_ignore_ascii_case("code") && boxes.is_block_container(box_idx))) {
@@ -208,18 +212,30 @@ impl RendererCore {
         }
     }
 
-    fn box_text_glyph_ranges(&self, box_idx: usize, include_marker: bool) -> Vec<Range<u32>> {
-        let text = self.document.render_view().text();
+    pub(crate) fn box_text_glyph_ranges(self, box_idx: usize, include_marker: bool) -> Vec<Range<u32>> {
+        let text = self.text();
         let mut ranges = text.text_runs().filter(|run| self.box_descends_from(run.box_idx(), box_idx)).map(|run| run.glyphs()).collect::<Vec<_>>();
-        if include_marker && let Some(marker) = self.document.render_view().boxes().list_marker(box_idx) {
+        if include_marker && let Some(marker) = self.boxes().list_marker(box_idx) {
             ranges.extend(text.marker_runs().only_box(marker.marker_box()).map(|run| run.glyphs()));
         }
         ranges.sort_by_key(|range| range.start);
         ranges
     }
 
-    fn glyph_text(&self, ranges: &[Range<u32>]) -> String {
-        let text = self.document.render_view().text();
+    pub(crate) fn cell_glyph_range(self, table_box: usize, cell: &RenderTableCell) -> Option<std::ops::Range<u32>> {
+        let mut start = u32::MAX;
+        let mut end = 0;
+        for run in self.text().text_runs() {
+            if self.box_descends_from(run.box_idx(), cell.box_idx()) && self.nearest_table_ancestor(run.box_idx()) == Some(table_box) {
+                start = start.min(run.glyphs().start);
+                end = end.max(run.glyphs().end);
+            }
+        }
+        (start < end).then_some(start..end)
+    }
+
+    fn glyph_text(self, ranges: &[Range<u32>]) -> String {
+        let text = self.text();
         let mut output = String::new();
         for range in ranges {
             for index in range.clone() {
@@ -231,21 +247,21 @@ impl RendererCore {
         output
     }
 
-    fn list_marker_markdown(&self, list_item: usize) -> String {
-        let text = self.document.render_view().text();
-        let marker = self.document.render_view().boxes().list_marker(list_item).map(|marker| {
+    fn list_marker_markdown(self, list_item: usize) -> String {
+        let text = self.text();
+        let marker = self.boxes().list_marker(list_item).map(|marker| {
             text.marker_runs().only_box(marker.marker_box()).flat_map(|run| run.glyphs()).filter_map(|index| text.glyph_at(index as usize).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>()
         });
-        let fallback = if self.document.render_view().boxes().ancestors(list_item).any(|ancestor| self.document.render_view().boxes().tag(ancestor).is_some_and(|tag| tag.eq_ignore_ascii_case("ol"))) { "1." } else { "-" };
+        let fallback = if self.boxes().ancestors(list_item).any(|ancestor| self.boxes().tag(ancestor).is_some_and(|tag| tag.eq_ignore_ascii_case("ol"))) { "1." } else { "-" };
         let marker = marker.as_deref().unwrap_or(fallback).trim();
         if marker.chars().next().is_some_and(|character| character.is_alphanumeric()) && (marker.ends_with('.') || marker.ends_with(')')) { marker.to_owned() } else { "-".to_owned() }
     }
 
-    fn direct_list_item_text_ranges(&self, list_item: usize) -> Vec<Range<u32>> {
-        self.document.render_view().text().text_runs().filter(|run| self.box_descends_from(run.box_idx(), list_item) && self.nearest_tag_ancestor(run.box_idx(), "li") == Some(list_item)).map(|run| run.glyphs()).collect()
+    fn direct_list_item_text_ranges(self, list_item: usize) -> Vec<Range<u32>> {
+        self.text().text_runs().filter(|run| self.box_descends_from(run.box_idx(), list_item) && self.nearest_tag_ancestor(run.box_idx(), "li") == Some(list_item)).map(|run| run.glyphs()).collect()
     }
 
-    fn list_item_markdown(&self, list_item: usize, depth: usize) -> String {
+    pub(crate) fn list_item_markdown(self, list_item: usize, depth: usize) -> String {
         let own_ranges = self.direct_list_item_text_ranges(list_item);
         let mut body = String::new();
         for range in own_ranges {
@@ -257,7 +273,7 @@ impl RendererCore {
         let continuation = format!("\n{indent}    ");
         let mut output = format!("{indent}{} {}", self.list_marker_markdown(list_item), body.trim_end().replace('\n', &continuation));
 
-        let boxes = self.document.render_view().boxes();
+        let boxes = self.boxes();
         for child in (0..boxes.len()).filter(|&candidate| boxes.tag(candidate).is_some_and(|tag| tag.eq_ignore_ascii_case("li")) && self.nearest_tag_ancestor(boxes.parent(candidate).unwrap_or(candidate), "li") == Some(list_item)) {
             output.push('\n');
             output.push_str(&self.list_item_markdown(child, depth + 1));
@@ -265,8 +281,8 @@ impl RendererCore {
         output
     }
 
-    fn code_block_language(&self, block: usize) -> Option<String> {
-        let boxes = self.document.render_view().boxes();
+    fn code_block_language(self, block: usize) -> Option<String> {
+        let boxes = self.boxes();
         let language_from_class = |class: &str| class.split_ascii_whitespace().find_map(|token| token.strip_prefix("language-").or_else(|| token.strip_prefix("lang-")).filter(|language| !language.is_empty()).map(str::to_owned));
         if let Some(language) = boxes.attribute(block, "class").and_then(language_from_class) {
             return Some(language);
@@ -288,7 +304,7 @@ impl RendererCore {
         None
     }
 
-    fn code_block_markdown(&self, block: usize, ranges: &[Range<u32>]) -> String {
+    fn code_block_markdown(self, block: usize, ranges: &[Range<u32>]) -> String {
         let source = self.glyph_text(ranges);
         let longest_backticks = source.split(|character| character != '`').map(str::len).max().unwrap_or(0);
         let fence = "`".repeat(3.max(longest_backticks + 1));
@@ -296,7 +312,9 @@ impl RendererCore {
         let trailing_newline = if source.ends_with('\n') { "" } else { "\n" };
         format!("{fence}{language}\n{source}{trailing_newline}{fence}")
     }
+}
 
+impl RendererCore {
     fn semantic_text_units(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticMarkdownUnit> {
         if !self.selection.semantic_selection || selection_start >= selection_end {
             return Vec::new();
@@ -305,12 +323,12 @@ impl RendererCore {
         let mut code_blocks = HashSet::new();
         for run in self.document.render_view().text().text_runs() {
             let glyphs = run.glyphs();
-            if glyphs.start >= selection_end || glyphs.end <= selection_start || self.nearest_table_ancestor(run.box_idx()).is_some() {
+            if glyphs.start >= selection_end || glyphs.end <= selection_start || self.doc().nearest_table_ancestor(run.box_idx()).is_some() {
                 continue;
             }
-            if let Some(block) = self.nearest_code_block_ancestor(run.box_idx()) {
+            if let Some(block) = self.doc().nearest_code_block_ancestor(run.box_idx()) {
                 code_blocks.insert(block);
-            } else if let Some(item) = self.nearest_tag_ancestor(run.box_idx(), "li") {
+            } else if let Some(item) = self.doc().nearest_tag_ancestor(run.box_idx(), "li") {
                 list_items.insert(item);
             }
         }
@@ -320,13 +338,13 @@ impl RendererCore {
 
         let mut units = Vec::new();
         for item in list_items {
-            let ranges = self.box_text_glyph_ranges(item, true);
+            let ranges = self.doc().box_text_glyph_ranges(item, true);
             if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
-                units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown: self.list_item_markdown(item, 0) });
+                units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown: self.doc().list_item_markdown(item, 0) });
             }
         }
         for block in code_blocks {
-            let ranges = self.box_text_glyph_ranges(block, false);
+            let ranges = self.doc().box_text_glyph_ranges(block, false);
             if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
                 // Code remains character-selectable while both ends of the
                 // selection stay inside it. Promote only when the drag crosses
@@ -334,24 +352,12 @@ impl RendererCore {
                 if selection_start >= start && selection_end <= end {
                     continue;
                 }
-                let markdown = self.code_block_markdown(block, &ranges);
+                let markdown = self.doc().code_block_markdown(block, &ranges);
                 units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown });
             }
         }
         units.sort_by_key(|unit| unit.glyph_start);
         units
-    }
-
-    fn cell_glyph_range(&self, table_box: usize, cell: &RenderTableCell) -> Option<std::ops::Range<u32>> {
-        let mut start = u32::MAX;
-        let mut end = 0;
-        for run in self.document.render_view().text().text_runs() {
-            if self.box_descends_from(run.box_idx(), cell.box_idx()) && self.nearest_table_ancestor(run.box_idx()) == Some(table_box) {
-                start = start.min(run.glyphs().start);
-                end = end.max(run.glyphs().end);
-            }
-        }
-        (start < end).then_some(start..end)
     }
 
     fn semantic_table_selections(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticTableSelection> {
@@ -362,7 +368,7 @@ impl RendererCore {
         let mut selections = Vec::new();
         for table_box in (0..boxes.len()).filter(|&index| boxes.is_table(index)) {
             let Some(table) = boxes.table(table_box) else { continue };
-            let cells = table.rows().iter().flat_map(|row| row.cells()).filter_map(|cell| self.cell_glyph_range(table_box, cell).map(|glyphs| (cell, glyphs))).collect::<Vec<_>>();
+            let cells = table.rows().iter().flat_map(|row| row.cells()).filter_map(|cell| self.doc().cell_glyph_range(table_box, cell).map(|glyphs| (cell, glyphs))).collect::<Vec<_>>();
             let touched = cells.iter().filter(|(_, glyphs)| glyphs.start < selection_end && glyphs.end > selection_start).collect::<Vec<_>>();
             if touched.is_empty() {
                 continue;
@@ -406,9 +412,9 @@ impl RendererCore {
         }));
         units.sort_by_key(|unit| unit.glyph_start);
         if units.is_empty() {
-            return self.build_selection_text(selection_start, selection_end);
+            return self.doc().build_selection_text(selection_start, selection_end);
         }
-        let plain = self.build_selection_text(selection_start, selection_end).0;
+        let plain = self.doc().build_selection_text(selection_start, selection_end).0;
         let mut markdown = String::new();
         let mut cursor = selection_start;
         let append = |target: &mut String, value: &str| {
@@ -423,7 +429,7 @@ impl RendererCore {
         for unit in units {
             let ordinary_end = unit.glyph_start.min(selection_end);
             if cursor < ordinary_end {
-                let (_, segment_markdown) = self.build_selection_text(cursor, ordinary_end);
+                let (_, segment_markdown) = self.doc().build_selection_text(cursor, ordinary_end);
                 if let Some(value) = segment_markdown.as_deref() {
                     append(&mut markdown, value);
                 }
@@ -432,7 +438,7 @@ impl RendererCore {
             cursor = cursor.max(unit.glyph_end);
         }
         if cursor < selection_end {
-            let (_, segment_markdown) = self.build_selection_text(cursor, selection_end);
+            let (_, segment_markdown) = self.doc().build_selection_text(cursor, selection_end);
             if let Some(value) = segment_markdown.as_deref() {
                 append(&mut markdown, value);
             }

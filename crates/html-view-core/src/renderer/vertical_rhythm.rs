@@ -30,7 +30,7 @@ impl RendererCore {
             let Some(last_line) = lines.get(last_idx) else {
                 continue;
             };
-            let last_height = self.effective_line_height(last_idx, last_line.height());
+            let last_height = self.doc().effective_line_height(last_idx, last_line.height());
             let slack = (self.layout.size.height - (last_screen.point.y + last_height)).max(0.0);
             if slack <= EPSILON {
                 continue;
@@ -42,7 +42,7 @@ impl RendererCore {
                 let (Some(current), Some(next)) = (lines.get(*current_idx), lines.get(*next_idx)) else {
                     continue;
                 };
-                let current_height = self.effective_line_height(*current_idx, current.height());
+                let current_height = self.doc().effective_line_height(*current_idx, current.height());
                 if next.point().y - (current.point().y + current_height) <= EPSILON {
                     continue;
                 }

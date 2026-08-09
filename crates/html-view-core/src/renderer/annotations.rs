@@ -15,7 +15,7 @@ impl RendererCore {
 
     pub(crate) fn paint_media_overlay_for_line(&self, painter: &mut impl Painter, line: &html::layout::RenderLine, screen: Point) {
         let Some((range_start, range_end)) = self.media_overlay.visible else { return };
-        for (start, end) in self.line_text_intersections(line.index(), range_start, range_end) {
+        for (start, end) in self.doc().line_text_intersections(line.index(), range_start, range_end) {
             let (x0, x1) = self.glyph_x_span_in_line(line, start, end);
             let (x0, x1) = (screen.x + x0, screen.x + x1);
             if x1 > x0 {
@@ -68,7 +68,7 @@ impl RendererCore {
 
     pub(crate) fn paint_annotations_for_line(&self, painter: &mut impl Painter, line_idx: usize, line: &html::layout::RenderLine, screen: Point) {
         for (_, range_start, range_end, style, rgba) in &self.annotations.visible {
-            for (start, end) in self.line_text_intersections(line_idx, *range_start, *range_end) {
+            for (start, end) in self.doc().line_text_intersections(line_idx, *range_start, *range_end) {
                 let (x0, x1) = self.glyph_x_span_in_line(line, start, end);
                 let (x0, x1) = (screen.x + x0, screen.x + x1);
                 if x1 <= x0 {

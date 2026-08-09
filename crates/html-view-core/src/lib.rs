@@ -17,6 +17,7 @@ use html::resources::ImagePipeline;
 pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider, TocEntry};
 
 pub mod cfi;
+mod doc_query;
 
 pub mod layout {
     pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
@@ -1266,7 +1267,7 @@ impl RendererCore {
     pub fn set_search_query(&mut self, query: &str) {
         self.highlight.query = query.to_string();
         self.highlight.options.scope = SearchScope::CurrentDocument;
-        self.highlight.matches = self.find_matches_with_options(query, self.highlight.options);
+        self.highlight.matches = self.doc().find_matches_with_options(query, self.highlight.options);
         self.highlight.book_matches = self.highlight.matches.iter().enumerate().map(|(occurrence, _)| BookSearchMatch { doc: self.nav.current_doc_index, occurrence, excerpt: query.to_owned() }).collect();
         self.highlight.current_match = 0;
         self.highlight.current_local_match = 0;
@@ -1288,7 +1289,7 @@ impl RendererCore {
         if query.is_empty() {
             self.highlight.matches.clear();
         } else if options.scope == SearchScope::CurrentDocument {
-            self.highlight.matches = self.find_matches_with_options(query, options);
+            self.highlight.matches = self.doc().find_matches_with_options(query, options);
             self.highlight.book_matches = self.highlight.matches.iter().enumerate().map(|(occurrence, _)| BookSearchMatch { doc: self.nav.current_doc_index, occurrence, excerpt: query.to_owned() }).collect();
         } else {
             for (doc, uri) in self.nav.document_uris.iter().enumerate() {
@@ -1354,7 +1355,7 @@ impl RendererCore {
         if hit.doc != self.nav.current_doc_index {
             self.set_position(glyph_shaper, hit.doc, None);
         }
-        self.highlight.matches = self.find_matches_with_options(&self.highlight.query, self.highlight.options);
+        self.highlight.matches = self.doc().find_matches_with_options(&self.highlight.query, self.highlight.options);
         self.highlight.current_local_match = hit.occurrence.min(self.highlight.matches.len().saturating_sub(1));
         self.navigate_to_current_match();
     }
