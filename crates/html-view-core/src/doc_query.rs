@@ -24,6 +24,11 @@ impl<'a> DocQuery<'a> {
         Self { document }
     }
 
+    /// The underlying document, for the few APIs that take it directly.
+    pub(crate) fn document(self) -> &'a LaidOutDocument {
+        self.document
+    }
+
     pub(crate) fn view(self) -> html::layout::RenderView<'a> {
         self.document.render_view()
     }
