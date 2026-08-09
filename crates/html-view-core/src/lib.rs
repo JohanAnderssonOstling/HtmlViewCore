@@ -19,7 +19,7 @@ pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy}
 use html::resources::ImagePipeline;
 pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider, TocEntry};
 
-pub mod cfi;
+pub use html_view_cfi as cfi;
 mod doc_query;
 mod document_cache;
 mod navigation;
@@ -1338,4 +1338,4 @@ mod nav;
 #[path = "renderer/interaction.rs"]
 mod interaction;
 
-pub mod load;
+pub use html_view_load as load;

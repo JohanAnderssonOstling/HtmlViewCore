@@ -633,15 +633,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "html-view-cfi"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
+]
+
+[[package]]
 name = "html-view-core"
 version = "0.1.0"
 dependencies = [
  "html-engine",
+ "html-view-cfi",
+ "html-view-load",
  "kurbo",
  "peniko",
  "scraper",
  "smallvec",
  "unicode-normalization",
+]
+
+[[package]]
+name = "html-view-load"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
 ]
 
 [[package]]
