@@ -4,7 +4,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::doc_query::DocQuery;
-use crate::{CachedDocument, DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
+use crate::document_cache::{CachedDocument, FootnoteDocumentIndex};
+use crate::{ DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
 
 impl<'a> DocQuery<'a> {
     pub(crate) fn best_anchor_from_glyphs(self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
@@ -123,12 +124,12 @@ impl RendererCore {
     }
 
     fn replace_document_state(&mut self, loaded: load::LoadedRenderDocument, sync_doc_title: bool) {
-        let footnote_index = Self::build_footnote_document_index(&loaded.inputs.source);
+        let footnote_index = FootnoteDocumentIndex::parse(&loaded.inputs.source);
         self.document = loaded.document;
         self.pipeline_session = loaded.session;
         self.pipeline_inputs = loaded.inputs;
         self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
-        self.insert_footnote_document_index(self.nav.current_doc_index, footnote_index);
+        self.document_cache.insert_footnotes(self.nav.current_doc_index, footnote_index);
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
         if sync_doc_title {
@@ -143,41 +144,13 @@ impl RendererCore {
     }
 
     fn cache_current_document(&mut self) {
-        if self.document_cache_capacity == 0 {
+        if self.document_cache.is_disabled() {
             return;
         }
 
         let current_index = self.nav.current_doc_index;
         let cached = CachedDocument { session: mem::replace(&mut self.pipeline_session, html::engine::Engine::new(self.provider.clone())), inputs: self.pipeline_inputs.clone(), document: self.document.clone() };
-        self.insert_cached_document(current_index, cached);
-    }
-
-    fn cache_order_remove(&mut self, doc_index: usize) {
-        self.document_cache_order.retain(|cached_index| *cached_index != doc_index);
-    }
-
-    fn insert_cached_document(&mut self, doc_index: usize, cached: CachedDocument) {
-        if self.document_cache_capacity == 0 {
-            return;
-        }
-
-        if self.document_cache.contains_key(&doc_index) {
-            self.document_cache_order.retain(|cached_index| *cached_index != doc_index);
-        }
-
-        self.document_cache.insert(doc_index, cached);
-        self.document_cache_order.push_back(doc_index);
-
-        while self.document_cache_order.len() > self.document_cache_capacity {
-            if let Some(evicted) = self.document_cache_order.pop_front() {
-                self.document_cache.remove(&evicted);
-            }
-        }
-    }
-
-    fn take_cached_document(&mut self, doc_index: usize) -> Option<CachedDocument> {
-        self.cache_order_remove(doc_index);
-        self.document_cache.remove(&doc_index)
+        self.document_cache.insert_document(current_index, cached);
     }
 
     fn rebased_inputs_for_doc_index(&self, doc_index: usize, source_inputs: &html::pipeline::PipelineInputs) -> html::pipeline::PipelineInputs {
@@ -248,21 +221,6 @@ impl RendererCore {
         true
     }
 
-    pub(crate) fn build_footnote_document_index(source: &str) -> crate::FootnoteDocumentIndex {
-        crate::FootnoteDocumentIndex { document: scraper::Html::parse_document(source) }
-    }
-
-    pub(crate) fn insert_footnote_document_index(&mut self, doc: usize, index: crate::FootnoteDocumentIndex) {
-        self.footnote_document_order.retain(|candidate| *candidate != doc);
-        self.footnote_documents.insert(doc, index);
-        self.footnote_document_order.push_back(doc);
-        while self.footnote_document_order.len() > self.document_cache_capacity.max(1) {
-            if let Some(evicted) = self.footnote_document_order.pop_front() {
-                self.footnote_documents.remove(&evicted);
-            }
-        }
-    }
-
     fn footnote_preview(&mut self, href: &str) -> Option<crate::FootnotePreview> {
         self.footnote_preview_for_reference(href, false)
     }
@@ -274,12 +232,12 @@ impl RendererCore {
         }
         let (doc, _) = self.resolve_href_target(href)?;
         let authoritative_target_semantics = (doc == self.nav.current_doc_index).then(|| self.document.render_view().addressing().is_note_target(fragment)).unwrap_or(false);
-        if !self.footnote_documents.contains_key(&doc) {
+        if !self.document_cache.has_footnotes(doc) {
             let target_uri = self.nav.document_uris.get(doc)?;
             let target_source = self.provider.read_string(target_uri).ok()?;
-            self.insert_footnote_document_index(doc, Self::build_footnote_document_index(&target_source));
+            self.document_cache.insert_footnotes(doc, FootnoteDocumentIndex::parse(&target_source));
         }
-        let indexed = self.footnote_documents.get(&doc)?;
+        let indexed = self.document_cache.footnotes(doc)?;
         let selector = scraper::Selector::parse("[id]").expect("static id selector must parse");
         let element = indexed.document.select(&selector).find(|element| element.value().attr("id") == Some(fragment))?;
         let has_token = |attribute: &str, expected: &str| element.value().attr(attribute).is_some_and(|value| value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case(expected)));
@@ -772,7 +730,7 @@ impl RendererCore {
 
         self.cache_current_document();
 
-        if let Some(mut cached) = self.take_cached_document(doc_index) {
+        if let Some(mut cached) = self.document_cache.take_document(doc_index) {
             let Ok(document) = cached.session.rehydrate_glyphs(glyph_shaper) else {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
                 self.nav.current_doc_index = doc_index;
