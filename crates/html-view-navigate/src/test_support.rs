@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use crate::{RendererEvent, RendererHost};
+use html_view_types::{RendererEvent, RendererHost};
 
 /// A [`RendererHost`] that records what it was told, for components whose
 /// observable behavior is which events they emit.

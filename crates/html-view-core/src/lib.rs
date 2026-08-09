@@ -6,10 +6,10 @@ use std::sync::Arc;
 use kurbo::Point;
 pub use html_view_types::*;
 pub use html_view_doc::DocQuery;
+pub use html_view_navigate::NavigationState;
 pub use html_view_select::{SelectionState, TableSelectionState};
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
-use crate::navigation::{LocationHistory, NavSignals, TocAnchors};
 use crate::prepared_page::PreparedPageCache;
 use html::engine::Engine;
 use html::layout::GlyphShaper;
@@ -22,12 +22,6 @@ pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider
 pub use html_view_cfi as cfi;
 
 mod document_cache;
-mod navigation;
-#[cfg(test)]
-mod test_support;
-
-#[path = "renderer/navigate.rs"]
-mod navigate;
 mod prepared_page;
 
 pub mod layout {
@@ -201,17 +195,6 @@ pub struct HighlightState {
     pub current_local_match: usize,
     pub search_active: bool,
     pub options: SearchOptions,
-}
-
-pub struct NavigationState {
-    pub document_uris: Vec<String>,
-    pub document_text_lengths: Vec<u64>,
-    pub current_doc_index: usize,
-    pub nav_anchor_glyph: Option<u32>,
-    pub pending_nav_anchor_update: bool,
-    pub signals: NavSignals,
-    pub history: LocationHistory,
-    pub toc_anchors: TocAnchors,
 }
 
 pub(crate) struct RendererCore {

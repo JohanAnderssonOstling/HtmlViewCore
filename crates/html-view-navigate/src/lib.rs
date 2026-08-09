@@ -9,21 +9,25 @@
 use std::collections::HashSet;
 
 use html_view_doc::DocQuery;
-use crate::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
+
+mod navigate;
+#[cfg(test)]
+mod test_support;
+use html_view_types::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
 
 /// Everything within-document navigation reads.
 ///
 /// Where the reader is depends on the document, the scroll offset and the page
 /// currently laid out -- and on nothing else in the renderer.
 #[derive(Clone, Copy)]
-pub(crate) struct NavView<'a> {
+pub struct NavView<'a> {
     pub doc: DocQuery<'a>,
     pub viewport: &'a ViewportState,
     pub frame: &'a VisibleFrame,
 }
 
 /// [`NavView`] plus the ability to move the viewport and notify the host.
-pub(crate) struct NavContext<'a> {
+pub struct NavContext<'a> {
     pub doc: DocQuery<'a>,
     pub viewport: &'a mut ViewportState,
     pub frame: &'a VisibleFrame,
@@ -31,7 +35,7 @@ pub(crate) struct NavContext<'a> {
 }
 
 impl<'a> NavContext<'a> {
-    pub(crate) fn view(&self) -> NavView<'_> {
+    pub fn view(&self) -> NavView<'_> {
         NavView { doc: self.doc, viewport: self.viewport, frame: self.frame }
     }
 }
@@ -121,8 +125,8 @@ impl LocationHistory {
     }
 
     /// Whether the cursor sits on the newest entry, i.e. nothing to go forward
-    /// to. Vacuously true for an empty stack.
-    #[cfg(test)]
+    /// to. Vacuously true for an empty stack. Asserted by tests in the renderer
+    /// crate, which cannot reach a `#[cfg(test)]` item here.
     pub fn is_at_newest(&self) -> bool {
         !self.availability().1
     }
@@ -166,7 +170,7 @@ impl TocAnchors {
     /// Resolves this document's anchor strings to interned string ids. Anchors
     /// that do not occur in the document drop out; an empty result disables the
     /// filter rather than matching nothing.
-    pub(crate) fn rebuild(&mut self, doc: DocQuery<'_>, current_doc: usize) {
+    pub fn rebuild(&mut self, doc: DocQuery<'_>, current_doc: usize) {
         let Some(anchor_ids) = self.strings_by_doc.get(current_doc).filter(|ids| !ids.is_empty()) else {
             self.filter = None;
             return;
@@ -304,4 +308,15 @@ mod tests {
         anchors.set_strings_by_doc(vec![vec![], vec![], vec![], vec![]], 2);
         assert_eq!(anchors.strings_by_doc.len(), 4, "padding must not truncate");
     }
+}
+
+pub struct NavigationState {
+    pub document_uris: Vec<String>,
+    pub document_text_lengths: Vec<u64>,
+    pub current_doc_index: usize,
+    pub nav_anchor_glyph: Option<u32>,
+    pub pending_nav_anchor_update: bool,
+    pub signals: NavSignals,
+    pub history: LocationHistory,
+    pub toc_anchors: TocAnchors,
 }

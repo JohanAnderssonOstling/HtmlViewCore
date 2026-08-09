@@ -8,31 +8,32 @@
 //! Crossing a document boundary stays on `RendererCore`: it asks these methods
 //! for a target, then performs the swap.
 
-use crate::navigation::{Location, NavContext, NavView};
-use crate::{DocAnchor, NavigationState, PaintDirection, RendererEvent};
+use crate::{Location, NavContext, NavView};
+use crate::NavigationState;
+use html_view_types::{DocAnchor, PaintDirection, RendererEvent};
 
 /// Characters per reported reading location. Fixed-size spans keep location
 /// numbers stable as font size and column width change.
 const LOCATION_CHARS: u64 = 150;
 
 impl NavigationState {
-    pub(crate) fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
+    pub fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
         self.document_uris.iter().position(|uri| uri == candidate).or_else(|| self.document_uris.iter().position(|uri| uri.ends_with(candidate)))
     }
 
-    pub(crate) fn fragment_part(fragment: &str) -> Option<String> {
+    pub fn fragment_part(fragment: &str) -> Option<String> {
         (!fragment.is_empty()).then(|| fragment.to_string())
     }
 
     // -- position queries ---------------------------------------------------
 
-    pub(crate) fn find_start_line(&self, cx: NavView<'_>) -> usize {
+    pub fn find_start_line(&self, cx: NavView<'_>) -> usize {
         cx.doc.start_line_at(cx.viewport.start_offset_y, 0.1)
     }
 
     /// The glyph at the top of the page on screen, or at the scroll offset when
     /// no page has been laid out yet.
-    pub(crate) fn current_glyph_position(&self, cx: NavView<'_>) -> Option<u32> {
+    pub fn current_glyph_position(&self, cx: NavView<'_>) -> Option<u32> {
         if cx.doc.text().lines().is_empty() {
             return None;
         }
@@ -43,7 +44,7 @@ impl NavigationState {
     /// The nearest preceding anchor id, restricted to table-of-contents anchors
     /// when a filter is active. With a filter, no match means no anchor rather
     /// than falling back to an arbitrary id in the markup.
-    pub(crate) fn current_anchor_id(&self, cx: NavView<'_>) -> Option<String> {
+    pub fn current_anchor_id(&self, cx: NavView<'_>) -> Option<String> {
         let current_y = cx.viewport.start_offset_y;
         let filter = self.toc_anchors.filter();
 
@@ -65,12 +66,12 @@ impl NavigationState {
         cx.doc.best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| cx.doc.view().string(id_idx).to_string())
     }
 
-    pub(crate) fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
+    pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
         let glyph_idx = self.nav_anchor_glyph.or_else(|| self.current_glyph_position(cx))?;
-        crate::cfi::generate_cfi(cx.doc.document(), self.current_doc_index, glyph_idx)
+        html_view_cfi::generate_cfi(cx.doc.document(), self.current_doc_index, glyph_idx)
     }
 
-    pub(crate) fn current_location(&self, cx: NavView<'_>) -> Location {
+    pub fn current_location(&self, cx: NavView<'_>) -> Location {
         (self.current_doc_index, self.current_anchor_id(cx))
     }
 
@@ -86,7 +87,7 @@ impl NavigationState {
         self.pending_nav_anchor_update = pending_nav_anchor_update;
     }
 
-    pub(crate) fn restore_glyph_position(&mut self, cx: &mut NavContext<'_>, glyph_idx: u32) {
+    pub fn restore_glyph_position(&mut self, cx: &mut NavContext<'_>, glyph_idx: u32) {
         let Some(line_idx) = cx.doc.find_line_for_glyph(glyph_idx) else {
             return;
         };
@@ -116,8 +117,8 @@ impl NavigationState {
         true
     }
 
-    pub(crate) fn restore_position_from_cfi(&mut self, cx: &mut NavContext<'_>, cfi: &str) -> bool {
-        let Some((doc_idx, glyph_idx)) = crate::cfi::parse_cfi(cx.doc.document(), cfi) else {
+    pub fn restore_position_from_cfi(&mut self, cx: &mut NavContext<'_>, cfi: &str) -> bool {
+        let Some((doc_idx, glyph_idx)) = html_view_cfi::parse_cfi(cx.doc.document(), cfi) else {
             return false;
         };
         if doc_idx != self.current_doc_index {
@@ -127,7 +128,7 @@ impl NavigationState {
         true
     }
 
-    pub(crate) fn jump_to_id(&mut self, cx: &mut NavContext<'_>, id: &str) -> bool {
+    pub fn jump_to_id(&mut self, cx: &mut NavContext<'_>, id: &str) -> bool {
         let Some(id_idx) = cx.doc.view().lookup_string(id) else {
             println!("jump_to_id: missing id '{}'", id);
             return false;
@@ -146,7 +147,7 @@ impl NavigationState {
         true
     }
 
-    pub(crate) fn next_line(&mut self, cx: &mut NavContext<'_>) {
+    pub fn next_line(&mut self, cx: &mut NavContext<'_>) {
         let lines = cx.doc.text().lines();
         if lines.is_empty() {
             return;
@@ -166,7 +167,7 @@ impl NavigationState {
         }
     }
 
-    pub(crate) fn prev_line(&mut self, cx: &mut NavContext<'_>) {
+    pub fn prev_line(&mut self, cx: &mut NavContext<'_>) {
         let lines = cx.doc.text().lines();
         if lines.is_empty() {
             return;
@@ -189,7 +190,7 @@ impl NavigationState {
     }
 
     /// Settles the viewport after arriving in a document.
-    pub(crate) fn finish_document_navigation(&mut self, cx: &mut NavContext<'_>, anchor: DocAnchor) {
+    pub fn finish_document_navigation(&mut self, cx: &mut NavContext<'_>, anchor: DocAnchor) {
         match anchor {
             DocAnchor::Start => {
                 cx.viewport.direction = PaintDirection::Forward;
@@ -219,31 +220,31 @@ impl NavigationState {
 
     // -- bookkeeping --------------------------------------------------------
 
-    pub(crate) fn update_nav_anchor_from_layout(&mut self, cx: NavView<'_>) {
+    pub fn update_nav_anchor_from_layout(&mut self, cx: NavView<'_>) {
         self.nav_anchor_glyph = self.current_glyph_position(cx);
     }
 
-    pub(crate) fn update_toc_anchor_filter(&mut self, cx: NavView<'_>) {
+    pub fn update_toc_anchor_filter(&mut self, cx: NavView<'_>) {
         let current_doc = self.current_doc_index;
         self.toc_anchors.rebuild(cx.doc, current_doc);
     }
 
-    pub(crate) fn update_history_availability_signals(&mut self, host: &dyn crate::RendererHost) {
+    pub fn update_history_availability_signals(&mut self, host: &dyn html_view_types::RendererHost) {
         self.history.emit_availability(host);
     }
 
-    pub(crate) fn push_history_location(&mut self, location: Location, host: &dyn crate::RendererHost) {
+    pub fn push_history_location(&mut self, location: Location, host: &dyn html_view_types::RendererHost) {
         self.history.push(location, host);
     }
 
-    pub(crate) fn push_current_location_if_missing(&mut self, cx: &mut NavContext<'_>) {
+    pub fn push_current_location_if_missing(&mut self, cx: &mut NavContext<'_>) {
         let current = self.current_location(cx.view());
         self.push_history_location(current, cx.host);
     }
 
     /// Emits every signal derived from the reading position. Each is
     /// deduplicated independently, so an unchanged one stays silent.
-    pub(crate) fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
+    pub fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
         let host = cx.host;
         let view = cx.view();
         let glyph = self.nav_anchor_glyph.or_else(|| self.current_glyph_position(view));
@@ -251,7 +252,7 @@ impl NavigationState {
 
         self.signals.position.emit_if_changed((current_doc, glyph), host, |(doc, glyph)| RendererEvent::PositionChanged { doc, glyph });
 
-        let cfi_string = glyph.and_then(|glyph_idx| crate::cfi::generate_cfi(view.doc.document(), current_doc, glyph_idx));
+        let cfi_string = glyph.and_then(|glyph_idx| html_view_cfi::generate_cfi(view.doc.document(), current_doc, glyph_idx));
         self.signals.cfi.emit_if_changed(cfi_string, host, RendererEvent::CfiChanged);
 
         let (fraction, location, total_locations) = self.reading_progress(view, glyph);
@@ -279,7 +280,7 @@ impl NavigationState {
     /// The publication-wide position of `in_document_fraction` through the
     /// current document. Split from [`Self::reading_progress`] so the mapping
     /// can be exercised without a laid-out document.
-    pub(crate) fn progress_at(&self, in_document_fraction: f64) -> (f32, u64, u64) {
+    pub fn progress_at(&self, in_document_fraction: f64) -> (f32, u64, u64) {
         let current_doc = self.current_doc_index;
         let total_chars = self.document_text_lengths.iter().sum::<u64>().max(1);
         let preceding_chars = self.document_text_lengths.iter().take(current_doc).sum::<u64>();
@@ -293,7 +294,7 @@ impl NavigationState {
 
     /// Inverse of [`Self::reading_progress`]: maps a publication-wide fraction
     /// to a spine index and the fraction within that document.
-    pub(crate) fn document_at_fraction(&self, fraction: f32) -> (usize, f64) {
+    pub fn document_at_fraction(&self, fraction: f32) -> (usize, f64) {
         let total = self.document_text_lengths.iter().sum::<u64>().max(1);
         let target = (fraction.clamp(0.0, 1.0) as f64 * total as f64) as u64;
         // The last document owns the end of the publication: a target equal to

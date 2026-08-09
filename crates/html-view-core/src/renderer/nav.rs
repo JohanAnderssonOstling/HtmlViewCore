@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use html_view_doc::DocQuery;
-use crate::navigation::{NavContext, NavView};
+use html_view_navigate::{NavContext, NavView};
 use crate::document_cache::{CachedDocument, FootnoteDocumentIndex};
 use crate::{NavigationState,  DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
 
@@ -26,7 +26,7 @@ impl RendererCore {
         self.nav.current_cfi(self.nav_view())
     }
 
-    fn current_location(&self) -> crate::navigation::Location {
+    fn current_location(&self) -> html_view_navigate::Location {
         self.nav.current_location(self.nav_view())
     }
 
@@ -79,7 +79,7 @@ impl RendererCore {
         self.nav.update_history_availability_signals(self.host.as_ref());
     }
 
-    fn push_history_location(&mut self, location: crate::navigation::Location) {
+    fn push_history_location(&mut self, location: html_view_navigate::Location) {
         self.nav.push_history_location(location, self.host.as_ref());
     }
 

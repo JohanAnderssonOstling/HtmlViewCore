@@ -647,6 +647,7 @@ dependencies = [
  "html-view-cfi",
  "html-view-doc",
  "html-view-load",
+ "html-view-navigate",
  "html-view-paginate",
  "html-view-select",
  "html-view-types",
@@ -673,6 +674,16 @@ name = "html-view-load"
 version = "0.1.0"
 dependencies = [
  "html-engine",
+]
+
+[[package]]
+name = "html-view-navigate"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
+ "html-view-cfi",
+ "html-view-doc",
+ "html-view-types",
 ]
 
 [[package]]

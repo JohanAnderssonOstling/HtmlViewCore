@@ -10,6 +10,7 @@ html.workspace = true
 html-view-cfi.workspace = true
 html-view-doc.workspace = true
 html-view-load.workspace = true
+html-view-navigate.workspace = true
 html-view-paginate.workspace = true
 html-view-select.workspace = true
 html-view-types.workspace = true
