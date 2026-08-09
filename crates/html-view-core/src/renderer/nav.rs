@@ -1789,8 +1789,8 @@ mod tests {
         let right_line = core.document.render_view().text().line(right_line_idx).expect("right cell geometry");
         let left_screen = core.frame.last_line_positions.get(left_line_idx).expect("left cell visible");
         let right_screen = core.frame.last_line_positions.get(right_line_idx).expect("right cell visible");
-        let left_point = Point::new(left_screen.point.x + core.glyph_x_in_line(&left_line, left_glyph) + 0.1, left_screen.point.y + left_line.height() / 2.0);
-        let right_point = Point::new(right_screen.point.x + core.glyph_x_in_line(&right_line, right_glyph) + 0.1, right_screen.point.y + right_line.height() / 2.0);
+        let left_point = Point::new(left_screen.point.x + core.text_geometry().glyph_x_in_line(&left_line, left_glyph) + 0.1, left_screen.point.y + left_line.height() / 2.0);
+        let right_point = Point::new(right_screen.point.x + core.text_geometry().glyph_x_in_line(&right_line, right_glyph) + 0.1, right_screen.point.y + right_line.height() / 2.0);
 
         assert_eq!(left_screen.point.y, right_screen.point.y, "fixture must exercise vertically overlapping cell lines");
         assert_eq!(core.hit_test_glyph(left_point), Some(left_glyph));
@@ -1918,7 +1918,7 @@ mod tests {
         let line_idx = core.doc().find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
         let screen = core.frame.last_line_positions.get(line_idx).expect("linked line should be painted");
         let line = core.document.render_view().text().line(line_idx).expect("linked line should be present");
-        let position = Point::new(screen.point.x + core.glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let position = Point::new(screen.point.x + core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
         assert!(core.link_at(position));
         assert!(core.begin_selection_at(position, false));
         assert_eq!(core.finish_selection(), Some(linked_glyph));

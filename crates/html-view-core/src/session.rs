@@ -567,7 +567,7 @@ mod tests {
         let line_idx = renderer.core.doc().find_line_for_glyph(linked_glyph).unwrap();
         let screen = renderer.core.frame.last_line_positions.get(line_idx).unwrap();
         let line = renderer.core.document.render_view().text().line(line_idx).expect("linked line should be present");
-        let position = Point::new(screen.point.x + renderer.core.glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let position = Point::new(screen.point.x + renderer.core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
 
         let hover = renderer.pointer_move(position, false);
         assert!(hover.over_link);
@@ -799,8 +799,8 @@ mod tests {
             .expect("text on both sides of an inline image should remain independently positioned on one line");
         let line = view.line(line_idx).unwrap();
         let boundary = before_range.end;
-        let before_image = renderer.core.glyph_x_in_line_trailing(&line, boundary);
-        let after_image = renderer.core.glyph_x_in_line(&line, boundary);
+        let before_image = renderer.core.text_geometry().glyph_x_in_line_trailing(&line, boundary);
+        let after_image = renderer.core.text_geometry().glyph_x_in_line(&line, boundary);
         assert!(after_image > before_image, "leading and trailing affinity must preserve the replaced-content gap");
         assert_eq!(
             renderer.core.doc().line_text_intersections(line_idx, before_range.start, after_range.end).collect::<Vec<_>>(),

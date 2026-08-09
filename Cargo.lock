@@ -663,6 +663,7 @@ dependencies = [
  "html-engine",
  "html-view-cfi",
  "html-view-types",
+ "kurbo",
  "unicode-normalization",
 ]
 
