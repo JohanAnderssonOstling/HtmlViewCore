@@ -9,6 +9,7 @@ use kurbo::{Point, Size};
 pub use peniko::Color;
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
+use crate::navigation::{LocationHistory, NavSignals, TocAnchors};
 use crate::prepared_page::PreparedPageCache;
 use html::engine::Engine;
 use html::layout::GlyphShaper;
@@ -21,6 +22,7 @@ pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider
 pub mod cfi;
 mod doc_query;
 mod document_cache;
+mod navigation;
 mod prepared_page;
 
 pub mod layout {
@@ -768,17 +770,11 @@ pub struct NavigationState {
     pub document_uris: Vec<String>,
     pub document_text_lengths: Vec<u64>,
     pub current_doc_index: usize,
-    pub last_position_update: Option<(usize, Option<u32>)>,
-    pub last_cfi_position: Option<Option<String>>,
-    pub last_nav_anchor: Option<(usize, Option<String>)>,
-    pub last_history_availability: Option<(bool, bool)>,
-    pub last_progress: Option<(u64, u64, usize)>,
     pub nav_anchor_glyph: Option<u32>,
     pub pending_nav_anchor_update: bool,
-    pub location_history: Vec<(usize, Option<String>)>,
-    pub location_history_index: usize,
-    pub toc_anchor_strings_by_doc: Vec<Vec<String>>,
-    pub toc_anchor_filter: Option<HashSet<u16>>,
+    pub signals: NavSignals,
+    pub history: LocationHistory,
+    pub toc_anchors: TocAnchors,
 }
 
 pub(crate) struct RendererCore {
@@ -965,17 +961,11 @@ impl RendererCore {
                 document_uris,
                 document_text_lengths,
                 current_doc_index,
-                last_position_update: None,
-                last_cfi_position: None,
-                last_nav_anchor: None,
-                last_history_availability: None,
-                last_progress: None,
                 nav_anchor_glyph: None,
                 pending_nav_anchor_update: false,
-                location_history: Vec::new(),
-                location_history_index: 0,
-                toc_anchor_strings_by_doc: Vec::new(),
-                toc_anchor_filter: None,
+                signals: Default::default(),
+                history: Default::default(),
+                toc_anchors: Default::default(),
             },
             origin: Point::ZERO,
             interaction_palette: config.interaction_palette,
@@ -1063,7 +1053,7 @@ impl RendererCore {
     pub fn emit_state_snapshot(&mut self) {
         self.host.emit(RendererEvent::TitleChanged(self.document.render_view().title().map(str::to_owned)));
         self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.document)));
-        self.host.emit(RendererEvent::HistoryAvailability { back: self.nav.location_history_index > 0, forward: self.nav.location_history_index + 1 < self.nav.location_history.len() });
+        self.nav.history.emit_availability(self.host.as_ref());
         self.host.emit(RendererEvent::SearchActiveChanged(self.highlight.search_active));
         self.update_match_signal();
         self.host.emit(RendererEvent::ColumnWidthChanged(self.layout.base_col_width));
@@ -1098,7 +1088,7 @@ impl RendererCore {
             RendererCommand::SetDocumentTextLengths(lengths) => {
                 if lengths.len() == self.nav.document_uris.len() && lengths.iter().all(|length| *length > 0) {
                     self.nav.document_text_lengths = lengths;
-                    self.nav.last_progress = None;
+                    self.nav.signals.progress.invalidate();
                     self.update_nav_signal();
                 }
             }
@@ -1228,11 +1218,8 @@ impl RendererCore {
     }
 
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
-        self.nav.toc_anchor_strings_by_doc = anchors_by_doc;
         let document_count = self.nav.document_uris.len();
-        if self.nav.toc_anchor_strings_by_doc.len() < document_count {
-            self.nav.toc_anchor_strings_by_doc.resize_with(document_count, Vec::new);
-        }
+        self.nav.toc_anchors.set_strings_by_doc(anchors_by_doc, document_count);
         self.update_toc_anchor_filter();
     }
 

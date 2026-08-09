@@ -47,9 +47,9 @@ document, the viewport, the current frame and the host.
 
 | step | change | status |
 | --- | --- | --- |
-| 1a | `Debounced<T>` owning compare/assign/emit; bundle the four `update_nav_signal` markers into `NavSignals` | not started |
-| 1b | `LocationHistory` owning the stack, cursor and availability marker; route `emit_state_snapshot` through it | not started |
-| 1c | `TocAnchors` owning `toc_anchor_strings_by_doc` + `toc_anchor_filter`, rebuilt from `DocQuery` | not started |
+| 1a | `Debounced<T>` owning compare/assign/emit; bundle the four `update_nav_signal` markers into `NavSignals` | done |
+| 1b | `LocationHistory` owning the stack, cursor and availability marker; route `emit_state_snapshot` through it | done |
+| 1c | `TocAnchors` owning `toc_anchor_strings_by_doc` + `toc_anchor_filter`, rebuilt from `DocQuery` | done |
 
 Left bare on `NavigationState`: `current_doc_index`, `document_uris`,
 `document_text_lengths`, `nav_anchor_glyph`, `pending_nav_anchor_update`. These
@@ -85,5 +85,18 @@ Mitigation: build the context at the point of use and keep it short-lived.
 
 ## Outcome
 
-Not yet implemented. This section records measured results once the steps
-above are done.
+### Phase 1 (done)
+
+`NavigationState`: 14 fields to 8. Defects 1 and 2 fixed; defect 3 outstanding.
+
+`emit_state_snapshot` now calls `LocationHistory::emit_availability` instead of
+emitting `HistoryAvailability` from its own inline predicate, so the dedup
+marker is always written. `Debounced<T>` makes the old failure mode
+unrepresentable: emitting requires going through the type that stores.
+
+One test assertion changed shape. It reached into `location_history` and
+`location_history_index` to assert the cursor sat on the last entry; it now
+asserts `history.is_at_newest()`, which states the same property without
+depending on the representation.
+
+117 tests pass, 4 warnings.

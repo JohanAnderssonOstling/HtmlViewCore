@@ -110,13 +110,7 @@ impl RendererCore {
     }
 
     fn update_history_availability_signals(&mut self) {
-        let len = self.nav.location_history.len();
-        let can_back = len > 0 && self.nav.location_history_index > 0;
-        let can_forward = len > 0 && self.nav.location_history_index + 1 < len;
-        if self.nav.last_history_availability != Some((can_back, can_forward)) {
-            self.nav.last_history_availability = Some((can_back, can_forward));
-            self.host.emit(RendererEvent::HistoryAvailability { back: can_back, forward: can_forward });
-        }
+        self.nav.history.emit_availability(self.host.as_ref());
     }
 
     fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
@@ -326,15 +320,9 @@ impl RendererCore {
     }
 
     fn navigate_history_step(&mut self, glyph_shaper: &mut impl GlyphShaper, step: isize) -> bool {
-        let len = self.nav.location_history.len() as isize;
-        let next_index = self.nav.location_history_index as isize + step;
-        if next_index < 0 || next_index >= len {
-            self.update_history_availability_signals();
+        let Some(target) = self.nav.history.step(step, self.host.as_ref()) else {
             return false;
-        }
-
-        self.nav.location_history_index = next_index as usize;
-        let target = self.nav.location_history[self.nav.location_history_index].clone();
+        };
         let ok = self.navigate_to_location(glyph_shaper, target);
         self.update_history_availability_signals();
         ok
@@ -367,23 +355,11 @@ impl RendererCore {
 
     fn push_current_location_if_missing(&mut self) {
         let current = self.current_location();
-        if self.nav.location_history.get(self.nav.location_history_index) != Some(&current) {
-            self.push_history_location(current);
-        } else {
-            self.update_history_availability_signals();
-        }
+        self.push_history_location(current);
     }
 
-    fn push_history_location(&mut self, location: (usize, Option<String>)) {
-        if self.nav.location_history.get(self.nav.location_history_index) == Some(&location) {
-            self.update_history_availability_signals();
-            return;
-        }
-        let keep_len = self.nav.location_history_index + 1;
-        self.nav.location_history.truncate(keep_len);
-        self.nav.location_history.push(location);
-        self.nav.location_history_index = self.nav.location_history.len().saturating_sub(1);
-        self.update_history_availability_signals();
+    fn push_history_location(&mut self, location: crate::navigation::Location) {
+        self.nav.history.push(location, self.host.as_ref());
     }
 
     fn jump_to_id(&mut self, id: &str) -> bool {
@@ -470,7 +446,7 @@ impl RendererCore {
 
     pub fn current_anchor_id(&self) -> Option<String> {
         let current_y = self.viewport.start_offset_y;
-        let filter = self.nav.toc_anchor_filter.as_ref();
+        let filter = self.nav.toc_anchors.filter();
 
         if let Some(current_glyph) = self.current_glyph_position()
             && let Some(id_idx) = self.doc().best_anchor_from_glyphs(current_glyph, filter)
@@ -504,40 +480,35 @@ impl RendererCore {
     pub(crate) fn update_nav_signal(&mut self) {
         use crate::cfi;
 
+        let host = self.host.clone();
         let glyph = self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position());
-        let nav_state = (self.nav.current_doc_index, glyph);
-        if self.nav.last_position_update != Some(nav_state) {
-            self.nav.last_position_update = Some(nav_state);
-            self.host.emit(RendererEvent::PositionChanged { doc: nav_state.0, glyph: nav_state.1 });
-        }
+        let current_doc = self.nav.current_doc_index;
+        self.nav.signals.position.emit_if_changed((current_doc, glyph), host.as_ref(), |(doc, glyph)| RendererEvent::PositionChanged { doc, glyph });
 
-        let cfi_string = glyph.and_then(|glyph_idx| cfi::generate_cfi(&self.document, self.nav.current_doc_index, glyph_idx));
-        if self.nav.last_cfi_position.as_ref() != Some(&cfi_string) {
-            self.nav.last_cfi_position = Some(cfi_string.clone());
-            self.host.emit(RendererEvent::CfiChanged(cfi_string));
-        }
+        let cfi_string = glyph.and_then(|glyph_idx| cfi::generate_cfi(&self.document, current_doc, glyph_idx));
+        self.nav.signals.cfi.emit_if_changed(cfi_string, host.as_ref(), RendererEvent::CfiChanged);
 
         const LOCATION_CHARS: u64 = 150;
         let total_chars = self.nav.document_text_lengths.iter().sum::<u64>().max(1);
-        let preceding_chars = self.nav.document_text_lengths.iter().take(self.nav.current_doc_index).sum::<u64>();
-        let current_length = self.nav.document_text_lengths.get(self.nav.current_doc_index).copied().unwrap_or(1);
+        let preceding_chars = self.nav.document_text_lengths.iter().take(current_doc).sum::<u64>();
+        let current_length = self.nav.document_text_lengths.get(current_doc).copied().unwrap_or(1);
         let glyph_count = self.document.render_view().text().glyph_count().max(1) as f64;
         let in_document = ((glyph.unwrap_or(0) as f64 / glyph_count).clamp(0.0, 1.0) * current_length as f64) as u64;
         let current_chars = (preceding_chars + in_document).min(total_chars);
         let location = (current_chars / LOCATION_CHARS + 1).max(1);
         let total_locations = total_chars.div_ceil(LOCATION_CHARS).max(1);
-        let progress_state = (location, total_locations, self.nav.current_doc_index);
-        if self.nav.last_progress != Some(progress_state) {
-            self.nav.last_progress = Some(progress_state);
-            self.host.emit(RendererEvent::ReadingProgress { fraction: current_chars as f32 / total_chars as f32, location, total_locations, doc: self.nav.current_doc_index, doc_count: self.nav.document_uris.len() });
-        }
+        let fraction = current_chars as f32 / total_chars as f32;
+        let doc_count = self.nav.document_uris.len();
+        self.nav.signals.progress.emit_if_changed((location, total_locations, current_doc), host.as_ref(), |(location, total_locations, doc)| RendererEvent::ReadingProgress {
+            fraction,
+            location,
+            total_locations,
+            doc,
+            doc_count,
+        });
 
         let anchor = self.current_anchor_id();
-        let anchor_state = (self.nav.current_doc_index, anchor);
-        if self.nav.last_nav_anchor.as_ref() != Some(&anchor_state) {
-            self.nav.last_nav_anchor = Some(anchor_state.clone());
-            self.host.emit(RendererEvent::NavAnchorChanged { doc: anchor_state.0, anchor: anchor_state.1 });
-        }
+        self.nav.signals.anchor.emit_if_changed((current_doc, anchor), host.as_ref(), |(doc, anchor)| RendererEvent::NavAnchorChanged { doc, anchor });
     }
 
     pub(crate) fn update_nav_anchor_from_layout(&mut self) {
@@ -801,21 +772,9 @@ impl RendererCore {
     }
 
     pub fn update_toc_anchor_filter(&mut self) {
-        let Some(anchor_ids) = self.nav.toc_anchor_strings_by_doc.get(self.nav.current_doc_index) else {
-            self.nav.toc_anchor_filter = None;
-            return;
-        };
-        if anchor_ids.is_empty() {
-            self.nav.toc_anchor_filter = None;
-            return;
-        }
-        let mut filter: HashSet<u16> = HashSet::new();
-        for id in anchor_ids {
-            if let Some(id_idx) = self.document.render_view().lookup_string(id) {
-                filter.insert(id_idx);
-            }
-        }
-        self.nav.toc_anchor_filter = if filter.is_empty() { None } else { Some(filter) };
+        let current_doc = self.nav.current_doc_index;
+        let doc = DocQuery::new(&self.document);
+        self.nav.toc_anchors.rebuild(doc, current_doc);
     }
 }
 
@@ -2380,9 +2339,7 @@ mod tests {
         }
         assert_eq!(core.nav.current_doc_index, 0);
 
-        if !core.nav.location_history.is_empty() {
-            assert_eq!(core.nav.location_history_index, core.nav.location_history.len() - 1);
-        }
+        assert!(core.nav.history.is_at_newest(), "walking back to the first document should leave the history cursor at its newest entry");
         assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 6);
     }
 
