@@ -1812,7 +1812,7 @@ mod tests {
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("| Head A | Head B |\n| --- | --- |\n| One | Two |"));
         assert!(markdown.contains("After"));
-        assert_eq!(core.semantic_cell_glyph_ranges(0, glyph_count).len(), 4);
+        assert_eq!(core.selection_view().semantic_cell_glyph_ranges(0, glyph_count).len(), 4);
 
         let one = glyph_index_for_character(&core, 'O');
         core.selection.selection_anchor = Some(one);
@@ -1821,7 +1821,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("O"), "annotation text remains tied to the actual glyph range");
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("|  |\n| --- |\n| One |"));
-        assert_eq!(core.semantic_cell_glyph_ranges(one, one + 1).len(), 1);
+        assert_eq!(core.selection_view().semantic_cell_glyph_ranges(one, one + 1).len(), 1);
     }
 
     #[test]
@@ -1837,7 +1837,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("p"), "annotation text remains tied to the actual glyph range");
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("5. Alpha\n    - Beta"));
-        let promoted = core.semantic_promoted_glyph_ranges(alpha, alpha + 1);
+        let promoted = core.selection_view().semantic_promoted_glyph_ranges(alpha, alpha + 1);
         assert!(promoted.len() >= 2, "the complete parent and nested item text should be selected");
 
         let beta = glyph_index_for_character(&core, 't');
@@ -1860,7 +1860,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("x"));
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("`x`"));
-        assert!(core.semantic_promoted_glyph_ranges(selected, selected + 1).is_empty(), "a selection contained by the code block must remain granular");
+        assert!(core.selection_view().semantic_promoted_glyph_ranges(selected, selected + 1).is_empty(), "a selection contained by the code block must remain granular");
 
         let before = glyph_index_for_character(&core, 'B');
         core.selection.selection_anchor = Some(before);
@@ -1870,7 +1870,7 @@ mod tests {
         let markdown = core.selection.selected_text_markdown.as_deref().expect("cross-boundary Markdown selection");
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("````rust\nlet x = ```;\nnext();\n````"));
-        assert!(!core.semantic_promoted_glyph_ranges(before, selected + 1).is_empty(), "crossing into the code block must promote it completely");
+        assert!(!core.selection_view().semantic_promoted_glyph_ranges(before, selected + 1).is_empty(), "crossing into the code block must promote it completely");
     }
 
     #[test]

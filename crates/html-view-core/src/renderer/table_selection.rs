@@ -80,18 +80,6 @@ impl RendererCore {
         self.selection_view().table_selection_at(position)
     }
 
-    pub(crate) fn paint_table_selection(&self, painter: &mut impl crate::Painter) {
-        self.selection_view().paint_table_selection(painter);
-    }
-
-    pub(crate) fn semantic_cell_glyph_ranges(&self, start: u32, end: u32) -> Vec<std::ops::Range<u32>> {
-        self.selection_view().semantic_cell_glyph_ranges(start, end)
-    }
-
-    pub(crate) fn semantic_promoted_glyph_ranges(&self, start: u32, end: u32) -> Vec<std::ops::Range<u32>> {
-        self.selection_view().semantic_promoted_glyph_ranges(start, end)
-    }
-
     pub fn selection_range(&self) -> Option<(u32, u32)> {
         self.selection_view().range()
     }

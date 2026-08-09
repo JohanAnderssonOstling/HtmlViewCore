@@ -7,6 +7,7 @@ use kurbo::Point;
 pub use html_view_types::*;
 pub use html_view_doc::DocQuery;
 pub use html_view_navigate::NavigationState;
+pub use html_view_paint::{AnnotationOverlayState, HighlightState, MediaOverlayHighlightState};
 pub use html_view_select::{SelectionState, TableSelectionState};
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
@@ -111,18 +112,6 @@ pub fn publication_text_lengths(provider: &dyn ResourceProvider, document_uris: 
 }
 
 #[derive(Default)]
-struct AnnotationOverlayState {
-    source: Vec<RendererAnnotation>,
-    visible: Vec<(String, u32, u32, AnnotationStyle, [u8; 4])>,
-}
-
-#[derive(Default)]
-struct MediaOverlayHighlightState {
-    target_href: Option<String>,
-    visible: Option<(u32, u32)>,
-}
-
-#[derive(Default)]
 struct FrameScratch {
     line_position_buffers: Vec<Vec<LineScreen>>,
     desired_images: HashSet<u32>,
@@ -184,17 +173,6 @@ mod frame_cache_tests {
         let reused = scratch.take_line_position_buffer(&mut frame.last_line_positions);
         assert!(reused.capacity() >= capacity);
     }
-}
-
-#[derive(Default)]
-pub struct HighlightState {
-    pub query: String,
-    pub matches: Vec<(u32, u32)>,
-    pub book_matches: Vec<BookSearchMatch>,
-    pub current_match: usize,
-    pub current_local_match: usize,
-    pub search_active: bool,
-    pub options: SearchOptions,
 }
 
 pub(crate) struct RendererCore {
