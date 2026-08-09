@@ -256,3 +256,44 @@ why.
 under their old paths, so the public API is unchanged.
 
 148 tests pass across the workspace; warning count unchanged at 4.
+
+## Final crate layout
+
+| crate | code | tests | depends on |
+| --- | ---: | ---: | --- |
+| `html-view-core` | 3880 | 2805 | all of the below |
+| `html-view-paginate` | 877 | 0 | types, doc |
+| `html-view-doc` | 840 | 0 | types, cfi |
+| `html-view-types` | 569 | 37 | html |
+| `html-view-select` | 566 | 56 | types, doc |
+| `html-view-load` | 192 | 338 | html |
+| `html-view-cfi` | 136 | 72 | html |
+
+`html-view-core` holds what genuinely coordinates: the `RendererCore` facade and
+`RendererSession` public API, painting, cross-document navigation orchestration,
+frame preparation and pointer handling.
+
+### Text geometry went to `html-view-doc`, not to selection
+
+`glyph_x_span_in_line` and the hit tests were in `selection.rs`, but every
+overlay painter uses them -- annotations, search highlights, selection and
+pointer handling. Putting them in the selection crate would have made
+`render.rs` depend on selection in order to paint search matches. They depend on
+document, frame and column geometry, so `TextGeometry` sits with the document
+queries where all four callers can reach it.
+
+### Selection stopped touching the clipboard
+
+The four `copy_table_*` methods returned `Result<bool, String>` and called
+`host.set_clipboard` themselves. They now return `Option<String>` and
+`RendererCore` performs the copy, which removes `RendererHost` from the crate's
+requirements entirely -- the same move that made the drag machine host-free
+earlier.
+
+### Outstanding
+
+`html-view-doc` and `html-view-paginate` have no tests of their own. The
+pagination rules -- widow and orphan limits, table row-group breaks, figure and
+caption keeps, semantic chapter breaks -- are still exercised only through
+`html-view-core`'s renderer-level tests, which is why that crate still carries
+2805 test lines against 3880 of code.
