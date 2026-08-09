@@ -1,12 +1,11 @@
 use std::collections::HashSet;
-use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use kurbo::Point;
 pub use html_view_types::*;
+pub use html_view_doc::DocQuery;
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
 use crate::navigation::{LocationHistory, NavSignals, TocAnchors};
@@ -20,7 +19,7 @@ use html::resources::ImagePipeline;
 pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider, TocEntry};
 
 pub use html_view_cfi as cfi;
-mod doc_query;
+
 mod document_cache;
 mod navigation;
 #[cfg(test)]
@@ -92,7 +91,7 @@ pub fn search_publication_streaming(provider: &dyn ResourceProvider, document_ur
         let Ok(source) = provider.read_string(uri) else { continue };
         let text = visible_text(&source);
         let chars: Vec<char> = text.chars().collect();
-        for (occurrence, (start, end)) in highlight::find_text_matches(&text, query, options).into_iter().enumerate() {
+        for (occurrence, (start, end)) in html_view_doc::find_text_matches(&text, query, options).into_iter().enumerate() {
             if cancelled() || results.len() >= MAX_RESULTS {
                 break;
             }
@@ -270,6 +269,10 @@ pub(crate) struct RendererCore {
 }
 
 impl RendererCore {
+    pub(crate) fn doc(&self) -> DocQuery<'_> {
+        DocQuery::new(&self.document)
+    }
+
     pub fn revisions(&self) -> RendererRevisions {
         self.revisions
     }

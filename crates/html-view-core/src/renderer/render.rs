@@ -3,9 +3,9 @@ use std::time::Duration;
 use kurbo::{Point, Rect};
 use peniko::Color;
 
-use crate::doc_query::DocQuery;
+use html_view_doc::{DocQuery, scaled_image_size};
 use crate::paginate::{Paginator, initial_render_state};
-use crate::{ColumnLayout, PagePositions, PaintDirection, Painter, RenderState, RendererCore, VisibleLinePositions};
+use crate::{PagePositions, PaintDirection, Painter, RenderState, RendererCore, VisibleLinePositions};
 
 fn line_paint_origin(point: Point) -> Point {
     point
@@ -15,109 +15,6 @@ fn project_inline_decoration_rect(rect: Rect, logical_line_point: Point, screen_
     let x = screen_point.x + extra_x_offset + optical_offset_x + (rect.x0 - logical_line_point.x);
     let y = screen_point.y + (rect.y0 - logical_line_point.y);
     Rect::new(x, y, x + rect.width(), y + rect.height())
-}
-
-/// Compute scaled image dimensions to fit column width
-fn scaled_image_size(frag: &html::layout::RenderImageFragment) -> (f64, f64) {
-    let size = frag.size();
-    (size.width, size.height)
-}
-
-impl<'a> DocQuery<'a> {
-    pub(crate) fn effective_line_height(self, line_idx: usize, fallback: f64) -> f64 {
-        if line_idx >= self.text().line_count() {
-            return fallback;
-        }
-        let mut max_height = 0.0;
-        for frag in self.view().fragments().images_for_line(line_idx).iter() {
-            let (_, height) = scaled_image_size(&frag);
-            if height > max_height {
-                max_height = height;
-            }
-        }
-        if max_height > 0.0 { max_height } else { fallback }
-    }
-
-    pub(crate) fn find_line_index_for_decoration(self, y0: f64, y1: f64) -> Option<usize> {
-        // find first line overlapping a decoration rect
-        let lines = self.text().lines();
-        if lines.is_empty() {
-            return None;
-        }
-        let mut lo = 0usize;
-        let mut hi = lines.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() < y0 {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        for idx in lo..lines.len() {
-            let line = lines.get(idx).expect("line index must be within line count");
-            let ly0 = line.point().y;
-            let ly1 = line.point().y + line.height();
-            if ly0 > y1 {
-                break;
-            }
-            // Inline top and bottom borders sit immediately outside the line
-            // box and therefore only touch its edge. Keep that owning line so
-            // pagination can project the decoration into the correct column.
-            if ly1 >= y0 && ly0 <= y1 {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn first_line_in_vertical_range(self, top: f64, bottom: f64) -> Option<usize> {
-        let lines = self.text().lines();
-        // Bottom captions can occur before their rows in source/line order
-        // while being below them geometrically, so this cannot be a binary
-        // search over line Y coordinates.
-        lines.iter().position(|line| line.point().y >= top - 0.01 && line.point().y < bottom - 0.01)
-    }
-
-    pub(crate) fn start_line_at(self, offset_y: f64, epsilon: f64) -> usize {
-        let lines = self.text().lines();
-        let mut lo = 0;
-        let mut hi = lines.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    pub(crate) fn end_line_at(self, offset_y: f64, epsilon: f64) -> Option<usize> {
-        let lines = self.text().lines();
-        let Some(first_line) = lines.first() else {
-            return None;
-        };
-        if first_line.point().y + first_line.height() > offset_y + epsilon {
-            return None;
-        }
-        let mut lo = 0;
-        let mut hi = lines.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        Some(lo)
-    }
-
 }
 
 impl RendererCore {

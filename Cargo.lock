@@ -645,12 +645,23 @@ version = "0.1.0"
 dependencies = [
  "html-engine",
  "html-view-cfi",
+ "html-view-doc",
  "html-view-load",
  "html-view-types",
  "kurbo",
  "peniko",
  "scraper",
  "smallvec",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "html-view-doc"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
+ "html-view-cfi",
+ "html-view-types",
  "unicode-normalization",
 ]
 

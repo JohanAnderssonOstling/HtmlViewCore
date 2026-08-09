@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use crate::doc_query::DocQuery;
+use html_view_doc::DocQuery;
 use crate::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
 
 /// Everything within-document navigation reads.

@@ -9,7 +9,7 @@
 //! composition policy. It reads no frame, no viewport, no host and no pipeline;
 //! storing the result is the caller's job. [`Paginator`] makes that checkable.
 
-use crate::doc_query::DocQuery;
+use html_view_doc::DocQuery;
 use crate::{ColumnLayout, LineScreen, PagePositions, RenderState, RepeatedTableHeader, VisibleLinePositions};
 
 // These epub/ARIA predicates are pagination's own. `semantic_keeps` carries a
@@ -212,60 +212,58 @@ fn apply_table_pagination_event(layout: &ColumnLayout, event: TablePaginationEve
     Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
 }
 
-impl<'a> DocQuery<'a> {
-    pub(crate) fn pagination_boundary_anchors(self) -> BoundaryAnchors {
-        let root = self.view();
-        let boxes = root.boxes();
-        let text = root.text();
-        let mut first_line: Vec<Option<usize>> = vec![None; boxes.len()];
-        for run in text.text_runs().chain(text.marker_runs()) {
-            let first = run.glyphs().find_map(|glyph_idx| text.line_index_for_glyph(glyph_idx));
-            if let Some(slot) = first_line.get_mut(run.box_idx()) {
-                *slot = match (*slot, first) {
-                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
-                    (None, candidate) => candidate,
-                    (current, None) => current,
-                };
-            }
-        }
-
-        // Replaced content participates in a line but has no text glyph range.
-        // Use its positive box geometry only as a fallback; zero-height empty
-        // boxes must anchor to later content instead of stealing a coincident line.
-        for box_idx in 0..boxes.len() {
-            let (Some(point), Some(size)) = (boxes.point(box_idx), boxes.size(box_idx)) else {
-                continue;
+fn pagination_boundary_anchors(doc: DocQuery<'_>) -> BoundaryAnchors {
+    let root = doc.view();
+    let boxes = root.boxes();
+    let text = root.text();
+    let mut first_line: Vec<Option<usize>> = vec![None; boxes.len()];
+    for run in text.text_runs().chain(text.marker_runs()) {
+        let first = run.glyphs().find_map(|glyph_idx| text.line_index_for_glyph(glyph_idx));
+        if let Some(slot) = first_line.get_mut(run.box_idx()) {
+            *slot = match (*slot, first) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, candidate) => candidate,
+                (current, None) => current,
             };
-            if size.height <= 0.01 || first_line[box_idx].is_some() {
-                continue;
-            }
-            let bottom = point.y + size.height;
-            first_line[box_idx] = self.first_line_in_vertical_range(point.y, bottom);
         }
-
-        let mut subtree_end = (0..boxes.len()).collect::<Vec<_>>();
-        for box_idx in (0..boxes.len()).rev() {
-            if let Some(parent) = boxes.parent(box_idx) {
-                subtree_end[parent] = subtree_end[parent].max(subtree_end[box_idx]);
-                first_line[parent] = match (first_line[parent], first_line[box_idx]) {
-                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
-                    (None, candidate) => candidate,
-                    (current, None) => current,
-                };
-            }
-        }
-
-        let mut next_from_index = vec![None; boxes.len() + 1];
-        let mut next = None;
-        for box_idx in (0..boxes.len()).rev() {
-            next_from_index[box_idx + 1] = next;
-            if first_line[box_idx].is_some() {
-                next = first_line[box_idx];
-            }
-        }
-        let next_line = subtree_end.iter().map(|end| next_from_index.get(end + 1).copied().flatten()).collect();
-        BoundaryAnchors { first_line, next_line, subtree_end }
     }
+
+    // Replaced content participates in a line but has no text glyph range.
+    // Use its positive box geometry only as a fallback; zero-height empty
+    // boxes must anchor to later content instead of stealing a coincident line.
+    for box_idx in 0..boxes.len() {
+        let (Some(point), Some(size)) = (boxes.point(box_idx), boxes.size(box_idx)) else {
+            continue;
+        };
+        if size.height <= 0.01 || first_line[box_idx].is_some() {
+            continue;
+        }
+        let bottom = point.y + size.height;
+        first_line[box_idx] = doc.first_line_in_vertical_range(point.y, bottom);
+    }
+
+    let mut subtree_end = (0..boxes.len()).collect::<Vec<_>>();
+    for box_idx in (0..boxes.len()).rev() {
+        if let Some(parent) = boxes.parent(box_idx) {
+            subtree_end[parent] = subtree_end[parent].max(subtree_end[box_idx]);
+            first_line[parent] = match (first_line[parent], first_line[box_idx]) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, candidate) => candidate,
+                (current, None) => current,
+            };
+        }
+    }
+
+    let mut next_from_index = vec![None; boxes.len() + 1];
+    let mut next = None;
+    for box_idx in (0..boxes.len()).rev() {
+        next_from_index[box_idx + 1] = next;
+        if first_line[box_idx].is_some() {
+            next = first_line[box_idx];
+        }
+    }
+    let next_line = subtree_end.iter().map(|end| next_from_index.get(end + 1).copied().flatten()).collect();
+    BoundaryAnchors { first_line, next_line, subtree_end }
 }
 
 /// Pagination events for one document, computed once and reused across page
@@ -294,7 +292,7 @@ impl<'a> Paginator<'a> {
     }
 
     pub(crate) fn events(&self) -> PaginationEvents {
-        let anchors = self.doc.pagination_boundary_anchors();
+        let anchors = pagination_boundary_anchors(self.doc);
         PaginationEvents { tables: self.table_pagination_events(), forced_breaks: self.forced_break_events(&anchors), keeps: self.automatic_keep_events(&anchors) }
     }
 
@@ -464,7 +462,7 @@ impl<'a> Paginator<'a> {
             }
         }
 
-        events.extend(self.doc.semantic_keep_ranges(anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
+        events.extend(crate::semantic_keeps::semantic_keep_ranges(self.doc, anchors).into_iter().filter_map(|(trigger_line, top, bottom)| self.keep_range_event(trigger_line, top, bottom)));
 
         for siblings in children {
             for pair in siblings.windows(2) {

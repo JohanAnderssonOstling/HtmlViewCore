@@ -1,48 +1,11 @@
-use std::collections::HashSet;
 use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::doc_query::DocQuery;
+use html_view_doc::DocQuery;
 use crate::navigation::{NavContext, NavView};
 use crate::document_cache::{CachedDocument, FootnoteDocumentIndex};
 use crate::{NavigationState,  DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
-
-impl<'a> DocQuery<'a> {
-    pub(crate) fn best_anchor_from_glyphs(self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, u32)> = None;
-        for (id_idx, glyph_idx) in self.view().addressing().anchor_glyphs() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_glyph)) => glyph_idx > best_glyph,
-            };
-            if glyph_idx <= glyph_limit && is_better {
-                best = Some((id_idx, glyph_idx));
-            }
-        }
-        best.map(|(id_idx, _)| id_idx)
-    }
-
-    pub(crate) fn best_anchor_from_positions(self, current_y: f64, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, f64, u32)> = None;
-        for (id_idx, pos) in self.view().addressing().anchor_positions().iter() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_y, best_order)) => pos.y() > best_y || (pos.y() == best_y && pos.order() > best_order),
-            };
-            if pos.y() <= current_y + 0.1 && is_better {
-                best = Some((id_idx, pos.y(), pos.order()));
-            }
-        }
-        best.map(|(id_idx, _, _)| id_idx)
-    }
-}
 
 impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
@@ -55,11 +18,9 @@ impl RendererCore {
         (&mut self.nav, NavContext { doc: DocQuery::new(&self.document), viewport: &mut self.viewport, frame: &self.frame, host: self.host.as_ref() })
     }
 
-
     pub fn current_glyph_position(&self) -> Option<u32> {
         self.nav.current_glyph_position(self.nav_view())
     }
-
 
     pub fn current_cfi(&self) -> Option<String> {
         self.nav.current_cfi(self.nav_view())

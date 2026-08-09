@@ -1,40 +1,7 @@
-use crate::doc_query::DocQuery;
+use html_view_doc::DocQuery;
 use crate::{AnnotationOverlayState, MediaOverlayHighlightState, Painter, RendererCore, RendererHost};
 use kurbo::{Point, Rect};
 use peniko::Color;
-
-impl<'a> DocQuery<'a> {
-    pub(crate) fn glyph_range_for_anchor(self, fragment: &str) -> Option<(u32, u32)> {
-        self.view().addressing().glyph_range_for_anchor(fragment).map(|range| (range.start, range.end))
-    }
-
-    /// Locates an annotation whose CFI no longer resolves, by matching its
-    /// quoted text against the document with the recorded prefix and suffix as
-    /// disambiguators. Returns `None` for annotations belonging to another
-    /// spine document.
-    fn recover_annotation_range(self, annotation: &crate::RendererAnnotation, current_doc: usize) -> Option<(u32, u32)> {
-        if crate::cfi::parse_cfi_spine_only(&annotation.cfi_range)? != current_doc {
-            return None;
-        }
-        let view = self.text();
-        let document = view.glyph_slice(0..view.glyph_count() as u32)?.iter().map(|glyph| view.glyph_metric(*glyph).map(|metric| metric.ch())).collect::<Option<Vec<_>>>()?;
-        let exact: Vec<char> = annotation.exact_text.chars().collect();
-        if exact.is_empty() || exact.len() > document.len() {
-            return None;
-        }
-        let prefix: Vec<char> = annotation.prefix.as_deref().unwrap_or_default().chars().collect();
-        let suffix: Vec<char> = annotation.suffix.as_deref().unwrap_or_default().chars().collect();
-        (0..=document.len() - exact.len()).find_map(|start| {
-            let end = start + exact.len();
-            if document[start..end] != exact {
-                return None;
-            }
-            let prefix_matches = prefix.is_empty() || document[..start].ends_with(&prefix);
-            let suffix_matches = suffix.is_empty() || document[end..].starts_with(&suffix);
-            (prefix_matches && suffix_matches).then_some((start as u32, end as u32))
-        })
-    }
-}
 
 impl AnnotationOverlayState {
     /// Recomputes which annotations fall in the document now on screen,
