@@ -1,0 +1,13 @@
+[package]
+name = "html-view-doc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository.workspace = true
+
+[dependencies]
+html.workspace = true
+kurbo.workspace = true
+html-view-cfi.workspace = true
+html-view-types.workspace = true
+unicode-normalization.workspace = true

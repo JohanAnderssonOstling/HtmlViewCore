@@ -2,23 +2,11 @@ use std::time::Duration;
 
 use kurbo::{Point, Size};
 
-use crate::{FrameGeometryCacheKey, GlyphShaper, PREPARED_PAGE_CACHE_CAPACITY, PaintDirection, PreparedPage, RendererCore};
+use crate::prepared_page::PreparedPage;
+use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
 use html::pipeline::PipelineInputs;
 
 impl RendererCore {
-    fn insert_prepared_page(&mut self, mut prepared: PreparedPage) {
-        // Native text-run IDs are handles into backend-owned transient storage.
-        // Prepared pages outlive that storage, so only retain portable geometry.
-        prepared.frame.clear_backend_shaping();
-        if let Some(index) = self.prepared_pages.iter().position(|candidate| candidate.key == prepared.key) {
-            self.prepared_pages.remove(index);
-        }
-        self.prepared_pages.push_back(prepared);
-        while self.prepared_pages.len() > PREPARED_PAGE_CACHE_CAPACITY {
-            self.prepared_pages.pop_front();
-        }
-    }
-
     fn install_prepared_page(&mut self, prepared: PreparedPage) {
         self.viewport.direction = PaintDirection::Forward;
         self.viewport.start_offset_y = prepared.frame.paint_start_offset_y;
@@ -31,10 +19,7 @@ impl RendererCore {
     }
 
     fn restore_prepared_page(&mut self, key: FrameGeometryCacheKey) -> bool {
-        let Some(index) = self.prepared_pages.iter().position(|candidate| candidate.key == key) else {
-            return false;
-        };
-        let Some(prepared) = self.prepared_pages.remove(index) else {
+        let Some(prepared) = self.prepared_pages.take(key) else {
             return false;
         };
         self.install_prepared_page(prepared);
@@ -46,24 +31,12 @@ impl RendererCore {
             return;
         };
         let frame = std::mem::take(&mut self.frame);
-        self.insert_prepared_page(PreparedPage { key, frame, reached_end: self.viewport.reached_end, next_start_offset_y: self.viewport.next_start_offset_y });
+        self.prepared_pages.insert(PreparedPage { key, frame, reached_end: self.viewport.reached_end, next_start_offset_y: self.viewport.next_start_offset_y });
     }
 
     pub(crate) fn restore_prepared_page_ending_at(&mut self, end_line: usize) -> bool {
         let current = self.frame_geometry_cache_key();
-        let Some(index) = self.prepared_pages.iter().position(|candidate| {
-            candidate.frame.current_page_end_line == Some(end_line)
-                && candidate.key.layout_revision == current.layout_revision
-                && candidate.key.viewport_width_bits == current.viewport_width_bits
-                && candidate.key.viewport_height_bits == current.viewport_height_bits
-                && candidate.key.column_width_bits == current.column_width_bits
-                && candidate.key.column_gap_bits == current.column_gap_bits
-                && candidate.key.column_count == current.column_count
-                && candidate.key.scale_bits == current.scale_bits
-        }) else {
-            return false;
-        };
-        let Some(prepared) = self.prepared_pages.remove(index) else {
+        let Some(prepared) = self.prepared_pages.take_ending_at(end_line, current) else {
             return false;
         };
         self.install_prepared_page(prepared);
@@ -96,7 +69,7 @@ impl RendererCore {
         self.viewport.reached_end = false;
         self.viewport.next_start_offset_y = next_start_offset_y;
         let key = self.frame_geometry_cache_key();
-        if self.prepared_pages.iter().any(|candidate| candidate.key == key) {
+        if self.prepared_pages.contains(key) {
             (self.viewport.direction, self.viewport.start_offset_y, self.viewport.end_offset_y, self.viewport.back_start_offset_y, self.viewport.back_anchor_end_line, self.viewport.reached_end, self.viewport.next_start_offset_y) =
                 saved_viewport;
             return;
@@ -109,19 +82,17 @@ impl RendererCore {
         self.frame = current_frame;
         (self.viewport.direction, self.viewport.start_offset_y, self.viewport.end_offset_y, self.viewport.back_start_offset_y, self.viewport.back_anchor_end_line, self.viewport.reached_end, self.viewport.next_start_offset_y) =
             saved_viewport;
-        self.insert_prepared_page(prepared);
+        self.prepared_pages.insert(prepared);
     }
 
     fn schedule_or_prefetch_adjacent_page(&mut self) {
         let Some(current_key) = self.frame.geometry_key else {
             return;
         };
-        if self.prefetch_scheduled_for == Some(current_key) {
-            self.prefetch_scheduled_for = None;
-            self.prefetched_for = Some(current_key);
+        if self.prepared_pages.claim_scheduled(current_key) {
             self.prefetch_next_prepared_page();
-        } else if self.prefetched_for != Some(current_key) {
-            self.prefetch_scheduled_for = Some(current_key);
+        } else if !self.prepared_pages.is_prefetched(current_key) {
+            self.prepared_pages.mark_scheduled(current_key);
             self.host.schedule_repaint(Duration::from_millis(25));
         }
     }
@@ -262,7 +233,7 @@ impl RendererCore {
         if self.document.render_view().addressing().link_for_glyph(glyph_idx).is_none() {
             return false;
         }
-        let Some(line_idx) = self.find_line_for_glyph(glyph_idx) else {
+        let Some(line_idx) = self.doc().find_line_for_glyph(glyph_idx) else {
             return false;
         };
         let Some(screen) = self.frame.last_line_positions.get(line_idx) else {
@@ -318,8 +289,8 @@ impl RendererCore {
             let prefix_start = start.saturating_sub(48);
             let glyph_count = self.document.render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
-            let prefix = self.build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
-            let suffix = self.build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
+            let prefix = self.doc().build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
+            let suffix = self.doc().build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
             self.host.emit(crate::RendererEvent::SelectionFinished { doc: self.nav.current_doc_index, cfi_range, exact_text, prefix, suffix });
         }
         let click = match (self.selection.selection_anchor, self.selection.selection_active, self.selection.pending_link_glyph) {

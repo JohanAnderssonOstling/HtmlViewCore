@@ -564,10 +564,10 @@ mod tests {
         let text = root.text();
         let addressing = root.addressing();
         let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
-        let line_idx = renderer.core.find_line_for_glyph(linked_glyph).unwrap();
+        let line_idx = renderer.core.doc().find_line_for_glyph(linked_glyph).unwrap();
         let screen = renderer.core.frame.last_line_positions.get(line_idx).unwrap();
         let line = renderer.core.document.render_view().text().line(line_idx).expect("linked line should be present");
-        let position = Point::new(screen.point.x + renderer.core.glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let position = Point::new(screen.point.x + renderer.core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
 
         let hover = renderer.pointer_move(position, false);
         assert!(hover.over_link);
@@ -799,11 +799,11 @@ mod tests {
             .expect("text on both sides of an inline image should remain independently positioned on one line");
         let line = view.line(line_idx).unwrap();
         let boundary = before_range.end;
-        let before_image = renderer.core.glyph_x_in_line_trailing(&line, boundary);
-        let after_image = renderer.core.glyph_x_in_line(&line, boundary);
+        let before_image = renderer.core.text_geometry().glyph_x_in_line_trailing(&line, boundary);
+        let after_image = renderer.core.text_geometry().glyph_x_in_line(&line, boundary);
         assert!(after_image > before_image, "leading and trailing affinity must preserve the replaced-content gap");
         assert_eq!(
-            renderer.core.line_text_intersections(line_idx, before_range.start, after_range.end).collect::<Vec<_>>(),
+            renderer.core.doc().line_text_intersections(line_idx, before_range.start, after_range.end).collect::<Vec<_>>(),
             vec![(before_range.start, before_range.end), (after_range.start, after_range.end)],
             "interaction overlays must preserve the replaced-content gap instead of merging both text fragments",
         );
@@ -826,14 +826,14 @@ mod tests {
 
         let view = renderer.core.document.render_view().text();
         let glyph_for = |target| (0..view.glyph_count() as u32).find(|index| view.glyph_at(*index as usize).and_then(|glyph| view.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == target)).expect("fixture character must exist");
-        let outer_line = renderer.core.find_line_for_glyph(glyph_for('A')).unwrap();
+        let outer_line = renderer.core.doc().find_line_for_glyph(glyph_for('A')).unwrap();
         let nested = glyph_for('I');
-        let nested_line = renderer.core.find_line_for_glyph(nested).unwrap();
+        let nested_line = renderer.core.doc().find_line_for_glyph(nested).unwrap();
 
         assert_ne!(outer_line, nested_line);
-        assert_eq!(renderer.core.line_text_intersections(outer_line, nested, nested + 1).next(), None);
-        assert_eq!(renderer.core.line_text_intersections(nested_line, nested, nested + 1).next(), Some((nested, nested + 1)));
-        assert_eq!(renderer.core.find_line_for_glyph(glyph_for('B')), Some(outer_line));
+        assert_eq!(renderer.core.doc().line_text_intersections(outer_line, nested, nested + 1).next(), None);
+        assert_eq!(renderer.core.doc().line_text_intersections(nested_line, nested, nested + 1).next(), Some((nested, nested + 1)));
+        assert_eq!(renderer.core.doc().find_line_for_glyph(glyph_for('B')), Some(outer_line));
         assert_eq!(renderer.core.visible_text(), "AINNERB", "speakable text must merge nested atomic lines back into source reading order");
 
         std::fs::remove_dir_all(fixture).unwrap();

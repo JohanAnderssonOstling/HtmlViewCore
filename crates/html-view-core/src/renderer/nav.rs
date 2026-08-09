@@ -1,25 +1,113 @@
-use std::collections::HashSet;
 use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{CachedDocument, DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
+use html_view_doc::DocQuery;
+use html_view_navigate::{NavContext, NavView};
+use crate::document_cache::{CachedDocument, FootnoteDocumentIndex};
+use crate::{NavigationState,  DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
 
 impl RendererCore {
+    pub(crate) fn nav_view(&self) -> NavView<'_> {
+        NavView { doc: DocQuery::new(&self.document), viewport: &self.viewport, frame: &self.frame }
+    }
+
+    fn nav_cx(&mut self) -> (&mut NavigationState, NavContext<'_>) {
+        // Disjoint field borrows: navigation state is mutated through the
+        // first, everything it reads or writes through the second.
+        (&mut self.nav, NavContext { doc: DocQuery::new(&self.document), viewport: &mut self.viewport, frame: &self.frame, host: self.host.as_ref() })
+    }
+
+    pub fn current_glyph_position(&self) -> Option<u32> {
+        self.nav.current_glyph_position(self.nav_view())
+    }
+
+    pub fn current_cfi(&self) -> Option<String> {
+        self.nav.current_cfi(self.nav_view())
+    }
+
+    fn current_location(&self) -> html_view_navigate::Location {
+        self.nav.current_location(self.nav_view())
+    }
+
+    pub fn restore_glyph_position(&mut self, glyph_idx: u32) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.restore_glyph_position(&mut cx, glyph_idx);
+    }
+
+    pub fn restore_position_from_cfi(&mut self, cfi: &str) -> bool {
+        let (nav, mut cx) = self.nav_cx();
+        nav.restore_position_from_cfi(&mut cx, cfi)
+    }
+
+    fn jump_to_id(&mut self, id: &str) -> bool {
+        let (nav, mut cx) = self.nav_cx();
+        nav.jump_to_id(&mut cx, id)
+    }
+
+    pub fn next_line(&mut self) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.next_line(&mut cx);
+    }
+
+    pub fn prev_line(&mut self) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.prev_line(&mut cx);
+    }
+
+    fn finish_document_navigation(&mut self, anchor: DocAnchor) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.finish_document_navigation(&mut cx, anchor);
+    }
+
+    pub(crate) fn update_nav_signal(&mut self) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.update_nav_signal(&mut cx);
+    }
+
+    pub(crate) fn update_nav_anchor_from_layout(&mut self) {
+        let view = NavView { doc: DocQuery::new(&self.document), viewport: &self.viewport, frame: &self.frame };
+        self.nav.update_nav_anchor_from_layout(view);
+    }
+
+    pub fn update_toc_anchor_filter(&mut self) {
+        let view = NavView { doc: DocQuery::new(&self.document), viewport: &self.viewport, frame: &self.frame };
+        self.nav.update_toc_anchor_filter(view);
+    }
+
+    fn update_history_availability_signals(&mut self) {
+        self.nav.update_history_availability_signals(self.host.as_ref());
+    }
+
+    fn push_history_location(&mut self, location: html_view_navigate::Location) {
+        self.nav.push_history_location(location, self.host.as_ref());
+    }
+
+    fn push_current_location_if_missing(&mut self) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.push_current_location_if_missing(&mut cx);
+    }
+
+    fn jump_to_forward_offset(&mut self, start_offset_y: f64, pending_nav_anchor_update: bool) {
+        self.viewport.direction = PaintDirection::Forward;
+        self.viewport.reached_end = false;
+        self.viewport.back_anchor_end_line = None;
+        self.viewport.start_offset_y = start_offset_y;
+        self.viewport.end_offset_y = self.viewport.start_offset_y;
+        self.host.request_repaint();
+        self.nav.pending_nav_anchor_update = pending_nav_anchor_update;
+    }
+
+    fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
+        self.nav.find_doc_index_by_uri_or_suffix(candidate)
+    }
+
+    fn fragment_part(fragment: &str) -> Option<String> {
+        NavigationState::fragment_part(fragment)
+    }
+
     pub(crate) fn set_progress_fraction(&mut self, glyph_shaper: &mut impl GlyphShaper, fraction: f32) {
-        let total = self.nav.document_text_lengths.iter().sum::<u64>().max(1);
-        let target = (fraction.clamp(0.0, 1.0) as f64 * total as f64) as u64;
-        let mut preceding = 0_u64;
-        let mut doc = self.nav.document_text_lengths.len().saturating_sub(1);
-        for (index, length) in self.nav.document_text_lengths.iter().copied().enumerate() {
-            if target < preceding.saturating_add(length) {
-                doc = index;
-                break;
-            }
-            preceding = preceding.saturating_add(length);
-        }
-        let doc_length = self.nav.document_text_lengths.get(doc).copied().unwrap_or(1).max(1);
-        let in_doc_fraction = target.saturating_sub(preceding) as f64 / doc_length as f64;
+        let (doc, in_doc_fraction) = self.nav.document_at_fraction(fraction);
         self.set_position(glyph_shaper, doc, None);
         let glyph_count = self.document.render_view().text().glyph_count();
         let glyph = (in_doc_fraction * glyph_count as f64) as u32;
@@ -71,27 +159,13 @@ impl RendererCore {
         convert_nodes(view, view.document_toc_entries())
     }
 
-    fn update_history_availability_signals(&mut self) {
-        let len = self.nav.location_history.len();
-        let can_back = len > 0 && self.nav.location_history_index > 0;
-        let can_forward = len > 0 && self.nav.location_history_index + 1 < len;
-        if self.nav.last_history_availability != Some((can_back, can_forward)) {
-            self.nav.last_history_availability = Some((can_back, can_forward));
-            self.host.emit(RendererEvent::HistoryAvailability { back: can_back, forward: can_forward });
-        }
-    }
-
-    fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
-        self.nav.document_uris.iter().position(|uri| uri == candidate).or_else(|| self.nav.document_uris.iter().position(|uri| uri.ends_with(candidate)))
-    }
-
     fn replace_document_state(&mut self, loaded: load::LoadedRenderDocument, sync_doc_title: bool) {
-        let footnote_index = Self::build_footnote_document_index(&loaded.inputs.source);
+        let footnote_index = FootnoteDocumentIndex::parse(&loaded.inputs.source);
         self.document = loaded.document;
         self.pipeline_session = loaded.session;
         self.pipeline_inputs = loaded.inputs;
         self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
-        self.insert_footnote_document_index(self.nav.current_doc_index, footnote_index);
+        self.document_cache.insert_footnotes(self.nav.current_doc_index, footnote_index);
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
         if sync_doc_title {
@@ -106,41 +180,13 @@ impl RendererCore {
     }
 
     fn cache_current_document(&mut self) {
-        if self.document_cache_capacity == 0 {
+        if self.document_cache.is_disabled() {
             return;
         }
 
         let current_index = self.nav.current_doc_index;
         let cached = CachedDocument { session: mem::replace(&mut self.pipeline_session, html::engine::Engine::new(self.provider.clone())), inputs: self.pipeline_inputs.clone(), document: self.document.clone() };
-        self.insert_cached_document(current_index, cached);
-    }
-
-    fn cache_order_remove(&mut self, doc_index: usize) {
-        self.document_cache_order.retain(|cached_index| *cached_index != doc_index);
-    }
-
-    fn insert_cached_document(&mut self, doc_index: usize, cached: CachedDocument) {
-        if self.document_cache_capacity == 0 {
-            return;
-        }
-
-        if self.document_cache.contains_key(&doc_index) {
-            self.document_cache_order.retain(|cached_index| *cached_index != doc_index);
-        }
-
-        self.document_cache.insert(doc_index, cached);
-        self.document_cache_order.push_back(doc_index);
-
-        while self.document_cache_order.len() > self.document_cache_capacity {
-            if let Some(evicted) = self.document_cache_order.pop_front() {
-                self.document_cache.remove(&evicted);
-            }
-        }
-    }
-
-    fn take_cached_document(&mut self, doc_index: usize) -> Option<CachedDocument> {
-        self.cache_order_remove(doc_index);
-        self.document_cache.remove(&doc_index)
+        self.document_cache.insert_document(current_index, cached);
     }
 
     fn rebased_inputs_for_doc_index(&self, doc_index: usize, source_inputs: &html::pipeline::PipelineInputs) -> html::pipeline::PipelineInputs {
@@ -181,20 +227,6 @@ impl RendererCore {
         )
     }
 
-    fn fragment_part(fragment: &str) -> Option<String> {
-        (!fragment.is_empty()).then(|| fragment.to_string())
-    }
-
-    fn jump_to_forward_offset(&mut self, start_offset_y: f64, pending_nav_anchor_update: bool) {
-        self.viewport.direction = PaintDirection::Forward;
-        self.viewport.reached_end = false;
-        self.viewport.back_anchor_end_line = None;
-        self.viewport.start_offset_y = start_offset_y;
-        self.viewport.end_offset_y = self.viewport.start_offset_y;
-        self.host.request_repaint();
-        self.nav.pending_nav_anchor_update = pending_nav_anchor_update;
-    }
-
     pub fn handle_link_click(&mut self, glyph_shaper: &mut impl GlyphShaper, glyph_idx: u32) -> bool {
         let view = self.document.render_view();
         let addressing = view.addressing();
@@ -211,21 +243,6 @@ impl RendererCore {
         true
     }
 
-    pub(crate) fn build_footnote_document_index(source: &str) -> crate::FootnoteDocumentIndex {
-        crate::FootnoteDocumentIndex { document: scraper::Html::parse_document(source) }
-    }
-
-    pub(crate) fn insert_footnote_document_index(&mut self, doc: usize, index: crate::FootnoteDocumentIndex) {
-        self.footnote_document_order.retain(|candidate| *candidate != doc);
-        self.footnote_documents.insert(doc, index);
-        self.footnote_document_order.push_back(doc);
-        while self.footnote_document_order.len() > self.document_cache_capacity.max(1) {
-            if let Some(evicted) = self.footnote_document_order.pop_front() {
-                self.footnote_documents.remove(&evicted);
-            }
-        }
-    }
-
     fn footnote_preview(&mut self, href: &str) -> Option<crate::FootnotePreview> {
         self.footnote_preview_for_reference(href, false)
     }
@@ -237,12 +254,12 @@ impl RendererCore {
         }
         let (doc, _) = self.resolve_href_target(href)?;
         let authoritative_target_semantics = (doc == self.nav.current_doc_index).then(|| self.document.render_view().addressing().is_note_target(fragment)).unwrap_or(false);
-        if !self.footnote_documents.contains_key(&doc) {
+        if !self.document_cache.has_footnotes(doc) {
             let target_uri = self.nav.document_uris.get(doc)?;
             let target_source = self.provider.read_string(target_uri).ok()?;
-            self.insert_footnote_document_index(doc, Self::build_footnote_document_index(&target_source));
+            self.document_cache.insert_footnotes(doc, FootnoteDocumentIndex::parse(&target_source));
         }
-        let indexed = self.footnote_documents.get(&doc)?;
+        let indexed = self.document_cache.footnotes(doc)?;
         let selector = scraper::Selector::parse("[id]").expect("static id selector must parse");
         let element = indexed.document.select(&selector).find(|element| element.value().attr("id") == Some(fragment))?;
         let has_token = |attribute: &str, expected: &str| element.value().attr(attribute).is_some_and(|value| value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case(expected)));
@@ -331,15 +348,9 @@ impl RendererCore {
     }
 
     fn navigate_history_step(&mut self, glyph_shaper: &mut impl GlyphShaper, step: isize) -> bool {
-        let len = self.nav.location_history.len() as isize;
-        let next_index = self.nav.location_history_index as isize + step;
-        if next_index < 0 || next_index >= len {
-            self.update_history_availability_signals();
+        let Some(target) = self.nav.history.step(step, self.host.as_ref()) else {
             return false;
-        }
-
-        self.nav.location_history_index = next_index as usize;
-        let target = self.nav.location_history[self.nav.location_history_index].clone();
+        };
         let ok = self.navigate_to_location(glyph_shaper, target);
         self.update_history_availability_signals();
         ok
@@ -366,90 +377,6 @@ impl RendererCore {
         }
     }
 
-    fn current_location(&self) -> (usize, Option<String>) {
-        (self.nav.current_doc_index, self.current_anchor_id())
-    }
-
-    fn push_current_location_if_missing(&mut self) {
-        let current = self.current_location();
-        if self.nav.location_history.get(self.nav.location_history_index) != Some(&current) {
-            self.push_history_location(current);
-        } else {
-            self.update_history_availability_signals();
-        }
-    }
-
-    fn push_history_location(&mut self, location: (usize, Option<String>)) {
-        if self.nav.location_history.get(self.nav.location_history_index) == Some(&location) {
-            self.update_history_availability_signals();
-            return;
-        }
-        let keep_len = self.nav.location_history_index + 1;
-        self.nav.location_history.truncate(keep_len);
-        self.nav.location_history.push(location);
-        self.nav.location_history_index = self.nav.location_history.len().saturating_sub(1);
-        self.update_history_availability_signals();
-    }
-
-    fn jump_to_id(&mut self, id: &str) -> bool {
-        let view = self.document.render_view();
-        let Some(id_idx) = view.lookup_string(id) else {
-            println!("jump_to_id: missing id '{}'", id);
-            return false;
-        };
-        let addressing = view.addressing();
-        let Some(glyph_idx) = addressing.anchor_glyph(id_idx) else {
-            if let Some(pos) = addressing.anchor_position(id_idx) {
-                return self.restore_anchor_position(pos.y());
-            }
-            println!("jump_to_id: no glyph for id '{}'", id);
-            return false;
-        };
-        self.restore_glyph_position(glyph_idx);
-        self.nav.pending_nav_anchor_update = false;
-        true
-    }
-
-    fn restore_anchor_position(&mut self, target_y: f64) -> bool {
-        if self.document.render_view().text().lines().is_empty() {
-            return false;
-        }
-        let line_idx = self.find_start_line_at(target_y, 0.1);
-        let Some(line) = self.document.render_view().text().line(line_idx) else {
-            return false;
-        };
-        let line_y = line.point().y;
-        let line_start = line.start();
-        let line_end = line.end();
-        self.jump_to_forward_offset(line_y, false);
-        self.nav.nav_anchor_glyph = if line_start < line_end { Some(line_start) } else { None };
-        true
-    }
-    pub fn find_start_line_at(&self, offset_y: f64, epsilon: f64) -> usize {
-        let lines = self.document.render_view().text().lines();
-        if lines.is_empty() {
-            return 0;
-        }
-
-        let mut lo = 0;
-        let mut hi = lines.len();
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    pub fn find_start_line(&self) -> usize {
-        self.find_start_line_at(self.viewport.start_offset_y, 0.1)
-    }
-
     pub fn parse_nav_state(raw: &str) -> Option<(usize, u32)> {
         use crate::cfi;
 
@@ -467,164 +394,6 @@ impl RendererCore {
         }
 
         trimmed.parse::<u32>().ok().map(|glyph| (0, glyph))
-    }
-
-    pub fn restore_position_from_cfi(&mut self, cfi: &str) -> bool {
-        use crate::cfi;
-
-        if let Some((doc_idx, glyph_idx)) = cfi::parse_cfi(&self.document, cfi)
-            && doc_idx == self.nav.current_doc_index
-        {
-            self.restore_glyph_position(glyph_idx);
-            return true;
-        }
-        false
-    }
-
-    pub fn current_cfi(&self) -> Option<String> {
-        let glyph_idx = self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position())?;
-        crate::cfi::generate_cfi(&self.document, self.nav.current_doc_index, glyph_idx)
-    }
-
-    pub fn current_glyph_position(&self) -> Option<u32> {
-        if self.document.render_view().text().lines().is_empty() {
-            return None;
-        }
-        let line_idx = self.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line());
-        self.document.render_view().text().line(line_idx).map(|line| line.start())
-    }
-
-    pub fn current_anchor_id(&self) -> Option<String> {
-        let current_y = self.viewport.start_offset_y;
-        let filter = self.nav.toc_anchor_filter.as_ref();
-
-        if let Some(current_glyph) = self.current_glyph_position()
-            && let Some(id_idx) = self.best_anchor_from_glyphs(current_glyph, filter)
-        {
-            return Some(self.document.render_view().string(id_idx).to_string());
-        }
-
-        if let Some(id_idx) = self.best_anchor_from_positions(current_y, filter) {
-            return Some(self.document.render_view().string(id_idx).to_string());
-        }
-
-        if filter.is_some() {
-            return None;
-        }
-
-        let glyph_idx = self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position())?;
-        self.best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| self.document.render_view().string(id_idx).to_string())
-    }
-
-    fn best_anchor_from_glyphs(&self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, u32)> = None;
-        for (id_idx, glyph_idx) in self.document.render_view().addressing().anchor_glyphs() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_glyph)) => glyph_idx > best_glyph,
-            };
-            if glyph_idx <= glyph_limit && is_better {
-                best = Some((id_idx, glyph_idx));
-            }
-        }
-        best.map(|(id_idx, _)| id_idx)
-    }
-
-    fn best_anchor_from_positions(&self, current_y: f64, filter: Option<&HashSet<u16>>) -> Option<u16> {
-        let mut best: Option<(u16, f64, u32)> = None;
-        for (id_idx, pos) in self.document.render_view().addressing().anchor_positions().iter() {
-            if filter.is_some_and(|f| !f.contains(&id_idx)) {
-                continue;
-            }
-            let is_better = match best {
-                None => true,
-                Some((_, best_y, best_order)) => pos.y() > best_y || (pos.y() == best_y && pos.order() > best_order),
-            };
-            if pos.y() <= current_y + 0.1 && is_better {
-                best = Some((id_idx, pos.y(), pos.order()));
-            }
-        }
-        best.map(|(id_idx, _, _)| id_idx)
-    }
-
-    pub fn restore_glyph_position(&mut self, glyph_idx: u32) {
-        let Some(line_idx) = self.find_line_for_glyph(glyph_idx) else {
-            return;
-        };
-        let Some(line) = self.document.render_view().text().line(line_idx) else {
-            return;
-        };
-        self.jump_to_forward_offset(line.point().y, false);
-        self.nav.nav_anchor_glyph = Some(glyph_idx);
-    }
-
-    pub(crate) fn update_nav_signal(&mut self) {
-        use crate::cfi;
-
-        let glyph = self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position());
-        let nav_state = (self.nav.current_doc_index, glyph);
-        if self.nav.last_position_update != Some(nav_state) {
-            self.nav.last_position_update = Some(nav_state);
-            self.host.emit(RendererEvent::PositionChanged { doc: nav_state.0, glyph: nav_state.1 });
-        }
-
-        let cfi_string = glyph.and_then(|glyph_idx| cfi::generate_cfi(&self.document, self.nav.current_doc_index, glyph_idx));
-        if self.nav.last_cfi_position.as_ref() != Some(&cfi_string) {
-            self.nav.last_cfi_position = Some(cfi_string.clone());
-            self.host.emit(RendererEvent::CfiChanged(cfi_string));
-        }
-
-        const LOCATION_CHARS: u64 = 150;
-        let total_chars = self.nav.document_text_lengths.iter().sum::<u64>().max(1);
-        let preceding_chars = self.nav.document_text_lengths.iter().take(self.nav.current_doc_index).sum::<u64>();
-        let current_length = self.nav.document_text_lengths.get(self.nav.current_doc_index).copied().unwrap_or(1);
-        let glyph_count = self.document.render_view().text().glyph_count().max(1) as f64;
-        let in_document = ((glyph.unwrap_or(0) as f64 / glyph_count).clamp(0.0, 1.0) * current_length as f64) as u64;
-        let current_chars = (preceding_chars + in_document).min(total_chars);
-        let location = (current_chars / LOCATION_CHARS + 1).max(1);
-        let total_locations = total_chars.div_ceil(LOCATION_CHARS).max(1);
-        let progress_state = (location, total_locations, self.nav.current_doc_index);
-        if self.nav.last_progress != Some(progress_state) {
-            self.nav.last_progress = Some(progress_state);
-            self.host.emit(RendererEvent::ReadingProgress { fraction: current_chars as f32 / total_chars as f32, location, total_locations, doc: self.nav.current_doc_index, doc_count: self.nav.document_uris.len() });
-        }
-
-        let anchor = self.current_anchor_id();
-        let anchor_state = (self.nav.current_doc_index, anchor);
-        if self.nav.last_nav_anchor.as_ref() != Some(&anchor_state) {
-            self.nav.last_nav_anchor = Some(anchor_state.clone());
-            self.host.emit(RendererEvent::NavAnchorChanged { doc: anchor_state.0, anchor: anchor_state.1 });
-        }
-    }
-
-    pub(crate) fn update_nav_anchor_from_layout(&mut self) {
-        self.nav.nav_anchor_glyph = self.current_glyph_position();
-    }
-
-    pub fn find_end_line_at(&self, offset_y: f64, epsilon: f64) -> Option<usize> {
-        let lines = self.document.render_view().text().lines();
-        let Some(first_line) = lines.first() else {
-            return None;
-        };
-        if first_line.point().y + first_line.height() > offset_y + epsilon {
-            return None;
-        }
-
-        let mut lo = 0;
-        let mut hi = lines.len() - 1;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let line = lines.get(mid).expect("binary-search index must be within line count");
-            if line.point().y + line.height() <= offset_y + epsilon {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        Some(lo)
     }
 
     pub fn next_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
@@ -647,46 +416,6 @@ impl RendererCore {
         }
         self.cache_current_prepared_page();
         self.jump_to_forward_offset(next_start_offset_y, true);
-    }
-
-    pub fn next_line(&mut self) {
-        let lines = self.document.render_view().text().lines();
-        if lines.is_empty() {
-            return;
-        }
-        let current_idx = self.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line());
-        let Some(current_line) = lines.get(current_idx) else {
-            return;
-        };
-        let search_y = current_line.point().y + current_line.height() + 0.1;
-        let target_idx = self.find_start_line_at(search_y, 0.0);
-        if target_idx >= lines.len() {
-            return;
-        }
-        if let Some(target_line) = lines.get(target_idx) {
-            self.jump_to_forward_offset(target_line.point().y, true);
-        }
-    }
-
-    pub fn prev_line(&mut self) {
-        let lines = self.document.render_view().text().lines();
-        if lines.is_empty() {
-            return;
-        }
-        let current_idx = self.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line());
-        let Some(current_line) = lines.get(current_idx) else {
-            return;
-        };
-        if current_line.point().y <= 0.0 && current_idx == 0 {
-            return;
-        }
-        let search_y = current_line.point().y.max(0.0);
-        let Some(target_idx) = self.find_end_line_at(search_y, 0.1) else {
-            return;
-        };
-        if let Some(target_line) = lines.get(target_idx) {
-            self.jump_to_forward_offset(target_line.point().y, true);
-        }
     }
 
     pub fn prev_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
@@ -813,7 +542,7 @@ impl RendererCore {
 
         self.cache_current_document();
 
-        if let Some(mut cached) = self.take_cached_document(doc_index) {
+        if let Some(mut cached) = self.document_cache.take_document(doc_index) {
             let Ok(document) = cached.session.rehydrate_glyphs(glyph_shaper) else {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
                 self.nav.current_doc_index = doc_index;
@@ -848,33 +577,6 @@ impl RendererCore {
         self.finish_document_navigation(anchor);
     }
 
-    fn finish_document_navigation(&mut self, anchor: DocAnchor) {
-        match anchor {
-            DocAnchor::Start => {
-                self.viewport.direction = PaintDirection::Forward;
-                self.viewport.start_offset_y = 0.0;
-                self.viewport.end_offset_y = 0.0;
-            }
-            DocAnchor::End => {
-                self.viewport.direction = PaintDirection::Backward;
-                if let Some(last) = self.document.render_view().text().lines().last() {
-                    self.viewport.end_offset_y = last.point().y + last.height();
-                    self.viewport.back_anchor_end_line = Some(self.document.render_view().text().line_count().saturating_sub(1));
-                }
-            }
-            DocAnchor::Glyph(glyph_idx) => {
-                self.restore_glyph_position(glyph_idx);
-            }
-        }
-
-        self.host.request_repaint();
-        if matches!(anchor, DocAnchor::Glyph(_)) {
-            self.update_nav_signal();
-        } else {
-            self.nav.pending_nav_anchor_update = true;
-        }
-    }
-
     pub fn reset_view_state(&mut self) {
         self.viewport = ViewportState::default();
         self.frame.clear();
@@ -883,23 +585,6 @@ impl RendererCore {
         self.table_selection = crate::TableSelectionState::default();
     }
 
-    pub fn update_toc_anchor_filter(&mut self) {
-        let Some(anchor_ids) = self.nav.toc_anchor_strings_by_doc.get(self.nav.current_doc_index) else {
-            self.nav.toc_anchor_filter = None;
-            return;
-        };
-        if anchor_ids.is_empty() {
-            self.nav.toc_anchor_filter = None;
-            return;
-        }
-        let mut filter: HashSet<u16> = HashSet::new();
-        for id in anchor_ids {
-            if let Some(id_idx) = self.document.render_view().lookup_string(id) {
-                filter.insert(id_idx);
-            }
-        }
-        self.nav.toc_anchor_filter = if filter.is_empty() { None } else { Some(filter) };
-    }
 }
 
 fn normalize_href_path(path: &str) -> String {
@@ -1976,7 +1661,7 @@ mod tests {
         let row_y = core.document.render_view().text().line(last_row).expect("last row line").point().y;
         let caption_line = core.document.render_view().text().line(caption).expect("bottom caption line");
         assert_eq!(row_y, 40.0, "layout geometry remains continuous");
-        let (group_top, group_bottom) = core.table_row_group_bounds_containing(row_y).expect("the final row owns a pagination group");
+        let (group_top, group_bottom) = core.paginator().table_row_group_bounds_containing(row_y).expect("the final row owns a pagination group");
         assert_eq!(group_top, row_y);
         assert!(group_bottom >= caption_line.point().y + caption_line.height(), "the final row's pagination group must include its bottom caption");
     }
@@ -2104,8 +1789,8 @@ mod tests {
         let right_line = core.document.render_view().text().line(right_line_idx).expect("right cell geometry");
         let left_screen = core.frame.last_line_positions.get(left_line_idx).expect("left cell visible");
         let right_screen = core.frame.last_line_positions.get(right_line_idx).expect("right cell visible");
-        let left_point = Point::new(left_screen.point.x + core.glyph_x_in_line(&left_line, left_glyph) + 0.1, left_screen.point.y + left_line.height() / 2.0);
-        let right_point = Point::new(right_screen.point.x + core.glyph_x_in_line(&right_line, right_glyph) + 0.1, right_screen.point.y + right_line.height() / 2.0);
+        let left_point = Point::new(left_screen.point.x + core.text_geometry().glyph_x_in_line(&left_line, left_glyph) + 0.1, left_screen.point.y + left_line.height() / 2.0);
+        let right_point = Point::new(right_screen.point.x + core.text_geometry().glyph_x_in_line(&right_line, right_glyph) + 0.1, right_screen.point.y + right_line.height() / 2.0);
 
         assert_eq!(left_screen.point.y, right_screen.point.y, "fixture must exercise vertically overlapping cell lines");
         assert_eq!(core.hit_test_glyph(left_point), Some(left_glyph));
@@ -2127,7 +1812,7 @@ mod tests {
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("| Head A | Head B |\n| --- | --- |\n| One | Two |"));
         assert!(markdown.contains("After"));
-        assert_eq!(core.semantic_cell_glyph_ranges(0, glyph_count).len(), 4);
+        assert_eq!(core.selection_view().semantic_cell_glyph_ranges(0, glyph_count).len(), 4);
 
         let one = glyph_index_for_character(&core, 'O');
         core.selection.selection_anchor = Some(one);
@@ -2136,7 +1821,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("O"), "annotation text remains tied to the actual glyph range");
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("|  |\n| --- |\n| One |"));
-        assert_eq!(core.semantic_cell_glyph_ranges(one, one + 1).len(), 1);
+        assert_eq!(core.selection_view().semantic_cell_glyph_ranges(one, one + 1).len(), 1);
     }
 
     #[test]
@@ -2152,7 +1837,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("p"), "annotation text remains tied to the actual glyph range");
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("5. Alpha\n    - Beta"));
-        let promoted = core.semantic_promoted_glyph_ranges(alpha, alpha + 1);
+        let promoted = core.selection_view().semantic_promoted_glyph_ranges(alpha, alpha + 1);
         assert!(promoted.len() >= 2, "the complete parent and nested item text should be selected");
 
         let beta = glyph_index_for_character(&core, 't');
@@ -2175,7 +1860,7 @@ mod tests {
 
         assert_eq!(core.selection.selected_text.as_deref(), Some("x"));
         assert_eq!(core.selection.selected_text_markdown.as_deref(), Some("`x`"));
-        assert!(core.semantic_promoted_glyph_ranges(selected, selected + 1).is_empty(), "a selection contained by the code block must remain granular");
+        assert!(core.selection_view().semantic_promoted_glyph_ranges(selected, selected + 1).is_empty(), "a selection contained by the code block must remain granular");
 
         let before = glyph_index_for_character(&core, 'B');
         core.selection.selection_anchor = Some(before);
@@ -2185,7 +1870,7 @@ mod tests {
         let markdown = core.selection.selected_text_markdown.as_deref().expect("cross-boundary Markdown selection");
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("````rust\nlet x = ```;\nnext();\n````"));
-        assert!(!core.semantic_promoted_glyph_ranges(before, selected + 1).is_empty(), "crossing into the code block must promote it completely");
+        assert!(!core.selection_view().semantic_promoted_glyph_ranges(before, selected + 1).is_empty(), "crossing into the code block must promote it completely");
     }
 
     #[test]
@@ -2230,17 +1915,17 @@ mod tests {
         let text = view.text();
         let addressing = view.addressing();
         let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
-        let line_idx = core.find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
+        let line_idx = core.doc().find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
         let screen = core.frame.last_line_positions.get(line_idx).expect("linked line should be painted");
         let line = core.document.render_view().text().line(line_idx).expect("linked line should be present");
-        let position = Point::new(screen.point.x + core.glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let position = Point::new(screen.point.x + core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
         assert!(core.link_at(position));
         assert!(core.begin_selection_at(position, false));
         assert_eq!(core.finish_selection(), Some(linked_glyph));
 
         assert!(core.handle_link_click(&mut shaper, linked_glyph));
         assert_eq!(core.nav.current_doc_index, 1);
-        assert!(core.current_anchor_id().as_deref() == Some("target") || core.nav.nav_anchor_glyph.is_some());
+        assert!(core.nav.current_anchor_id(core.nav_view()).as_deref() == Some("target") || core.nav.nav_anchor_glyph.is_some());
         assert!(core.navigate_history_back(&mut shaper));
         assert_eq!(core.nav.current_doc_index, 0);
         assert!(core.navigate_history_forward(&mut shaper));
@@ -2463,9 +2148,7 @@ mod tests {
         }
         assert_eq!(core.nav.current_doc_index, 0);
 
-        if !core.nav.location_history.is_empty() {
-            assert_eq!(core.nav.location_history_index, core.nav.location_history.len() - 1);
-        }
+        assert!(core.nav.history.is_at_newest(), "walking back to the first document should leave the history cursor at its newest entry");
         assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 6);
     }
 

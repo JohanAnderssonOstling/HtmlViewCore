@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::GlyphShaper;
-use crate::layout::{LaidOutDocument, LayoutTimings};
-use crate::parser::BuildPipelineTimings;
-use crate::resources::ResourceProvider;
+use html::layout::GlyphShaper;
+use html::layout::{LaidOutDocument, LayoutTimings};
+use html::pipeline::BuildPipelineTimings;
+use html::resources::ResourceProvider;
 use html::engine::Engine;
 use html::pipeline::{
     FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints as PipelineLayoutConstraints, MarkupSyntax, PaintSettingsRevision, PipelineInputs, ReaderStyleOverrides, ResourceRevision, SourceRevision,
@@ -191,10 +191,11 @@ impl PipelineTimings {
 
 #[cfg(test)]
 mod tests {
-    use crate::layout::LayoutConstraints;
-    use crate::parser::DocumentFactory;
-    use crate::resources::{FileSystemProvider, ResourceProvider};
-    use crate::text_backend::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry};
+    use html::layout::LayoutConstraints;
+    use html::layout::GlyphShaper;
+    use html::pipeline::DocumentFactory;
+    use html::resources::{FileSystemProvider, ResourceProvider};
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -206,37 +207,37 @@ mod tests {
         glyphs: HashMap<(char, u32), GlyphId>,
     }
 
-    impl crate::GlyphShaper for TestGlyphShaper {
+    impl GlyphShaper for TestGlyphShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, crate::layout::ShapeError> {
+        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
             let _ = (font_weight, font_slant, color, family);
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(glyph);
             }
-            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(crate::layout::ShapeError::rejected_metric)?;
+            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
             let glyph = glyph_metrics.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
     }
 
-    fn layout_html(html: &str) -> crate::layout::LaidOutDocument {
+    fn layout_html(html: &str) -> html::layout::LaidOutDocument {
         let mut factory = DocumentFactory::new();
         let mut glyph_shaper = TestGlyphShaper::default();
         factory.parse_with_new_pipeline(html, None).shape(&mut glyph_shaper).expect("test shaper must register every glyph").layout(LayoutConstraints::new(600.0, 20.0).unwrap())
     }
 
-    fn li_boxes(document: &crate::layout::LaidOutDocument) -> Vec<usize> {
+    fn li_boxes(document: &html::layout::LaidOutDocument) -> Vec<usize> {
         let boxes = document.render_view().boxes();
         (0..boxes.len()).filter(|&i| boxes.tag(i).is_some_and(|tag| tag.eq_ignore_ascii_case("li"))).collect()
     }
 
     /// Reconstruct a list item's marker text from its marker box's shaped glyphs.
-    fn marker_string(document: &crate::layout::LaidOutDocument, li_box: usize) -> String {
+    fn marker_string(document: &html::layout::LaidOutDocument, li_box: usize) -> String {
         let root = document.render_view();
         let boxes = root.boxes();
         let text = root.text();

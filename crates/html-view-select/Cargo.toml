@@ -1,0 +1,13 @@
+[package]
+name = "html-view-select"
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository.workspace = true
+
+[dependencies]
+html.workspace = true
+html-view-doc.workspace = true
+html-view-types.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
