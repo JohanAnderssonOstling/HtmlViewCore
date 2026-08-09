@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
@@ -9,6 +9,7 @@ use kurbo::{Point, Size};
 pub use peniko::Color;
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
+use crate::prepared_page::PreparedPageCache;
 use html::engine::Engine;
 use html::layout::GlyphShaper;
 pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
@@ -20,6 +21,7 @@ pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider
 pub mod cfi;
 mod doc_query;
 mod document_cache;
+mod prepared_page;
 
 pub mod layout {
     pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
@@ -631,15 +633,6 @@ impl VisibleFrame {
     }
 }
 
-const PREPARED_PAGE_CACHE_CAPACITY: usize = 3;
-
-struct PreparedPage {
-    key: FrameGeometryCacheKey,
-    frame: VisibleFrame,
-    reached_end: bool,
-    next_start_offset_y: f64,
-}
-
 #[derive(Default)]
 struct FrameScratch {
     line_position_buffers: Vec<Vec<LineScreen>>,
@@ -799,9 +792,7 @@ pub(crate) struct RendererCore {
     layout: ColumnLayout,
     viewport: ViewportState,
     document_cache: DocumentCache,
-    prepared_pages: VecDeque<PreparedPage>,
-    prefetch_scheduled_for: Option<FrameGeometryCacheKey>,
-    prefetched_for: Option<FrameGeometryCacheKey>,
+    prepared_pages: PreparedPageCache,
     frame: VisibleFrame,
     frame_scratch: FrameScratch,
     revisions: RendererRevisions,
@@ -961,9 +952,7 @@ impl RendererCore {
             layout,
             viewport: ViewportState::default(),
             document_cache,
-            prepared_pages: VecDeque::with_capacity(PREPARED_PAGE_CACHE_CAPACITY),
-            prefetch_scheduled_for: None,
-            prefetched_for: None,
+            prepared_pages: PreparedPageCache::new(),
             frame: VisibleFrame::default(),
             frame_scratch: FrameScratch::default(),
             revisions: RendererRevisions::default(),
