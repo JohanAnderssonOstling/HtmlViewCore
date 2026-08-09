@@ -1212,10 +1212,9 @@ impl RendererCore {
     }
 
     pub(crate) fn set_search_active(&mut self, active: bool) {
-        if self.highlight.search_active == active {
+        if !self.highlight.set_active(active) {
             return;
         }
-        self.highlight.search_active = active;
         self.host.emit(RendererEvent::SearchActiveChanged(active));
         if !active {
             self.set_search_query("");
@@ -1238,118 +1237,83 @@ impl RendererCore {
     }
 
     pub fn set_search_query(&mut self, query: &str) {
-        self.highlight.query = query.to_string();
-        self.highlight.options.scope = SearchScope::CurrentDocument;
-        self.highlight.matches = self.doc().find_matches_with_options(query, self.highlight.options);
-        self.highlight.book_matches = self.highlight.matches.iter().enumerate().map(|(occurrence, _)| BookSearchMatch { doc: self.nav.current_doc_index, occurrence, excerpt: query.to_owned() }).collect();
-        self.highlight.current_match = 0;
-        self.highlight.current_local_match = 0;
-        self.host.emit(RendererEvent::SearchResults(self.highlight.book_matches.clone()));
-        self.update_match_signal();
-        if !self.highlight.matches.is_empty() {
-            self.navigate_to_current_match();
-        } else {
+        let options = self.highlight.current_document_options();
+        self.highlight.restart(query.to_owned(), options);
+        let matches = self.doc().find_matches_with_options(query, options);
+        let empty = matches.is_empty();
+        self.highlight.set_local_matches(self.nav.current_doc_index, matches);
+        self.highlight.emit_results(self.host.as_ref());
+        if empty {
             self.request_overlay_repaint();
+        } else {
+            self.navigate_to_current_match();
         }
     }
 
     pub fn set_search(&mut self, glyph_shaper: &mut impl GlyphShaper, query: &str, options: SearchOptions) {
-        self.highlight.query = query.to_owned();
-        self.highlight.options = options;
-        self.highlight.current_match = 0;
-        self.highlight.current_local_match = 0;
-        self.highlight.book_matches.clear();
+        self.highlight.restart(query.to_owned(), options);
+        let local_scope = options.scope == SearchScope::CurrentDocument;
         if query.is_empty() {
-            self.highlight.matches.clear();
-        } else if options.scope == SearchScope::CurrentDocument {
-            self.highlight.matches = self.doc().find_matches_with_options(query, options);
-            self.highlight.book_matches = self.highlight.matches.iter().enumerate().map(|(occurrence, _)| BookSearchMatch { doc: self.nav.current_doc_index, occurrence, excerpt: query.to_owned() }).collect();
+            // restart already cleared both result sets.
+        } else if local_scope {
+            let matches = self.doc().find_matches_with_options(query, options);
+            self.highlight.set_local_matches(self.nav.current_doc_index, matches);
         } else {
-            for (doc, uri) in self.nav.document_uris.iter().enumerate() {
-                let Ok(source) = self.provider.read_string(uri) else { continue };
-                let text = crate::visible_text(&source);
-                for (occurrence, (start, end)) in crate::highlight::find_text_matches(&text, query, options).into_iter().enumerate() {
-                    let chars: Vec<char> = text.chars().collect();
-                    let excerpt_start = start.saturating_sub(42);
-                    let excerpt_end = (end + 70).min(chars.len());
-                    let excerpt: String = chars[excerpt_start..excerpt_end].iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-                    self.highlight.book_matches.push(BookSearchMatch { doc, occurrence, excerpt });
-                }
-            }
+            let results = search_publication(self.provider.as_ref(), &self.nav.document_uris, query, options);
+            self.highlight.set_results(query.to_owned(), options, results);
             self.navigate_to_book_match(glyph_shaper);
         }
-        self.host.emit(RendererEvent::SearchResults(self.highlight.book_matches.clone()));
-        self.update_match_signal();
-        if options.scope == SearchScope::CurrentDocument && !self.highlight.matches.is_empty() {
+        self.highlight.emit_results(self.host.as_ref());
+        if local_scope && !self.highlight.is_empty() {
             self.navigate_to_current_match();
-        } else if self.highlight.book_matches.is_empty() {
+        } else if self.highlight.is_empty() {
             self.request_overlay_repaint();
         }
     }
 
     pub fn set_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
-        self.highlight.query = query;
-        self.highlight.options = options;
-        self.highlight.book_matches = results;
-        self.highlight.current_match = 0;
-        self.highlight.current_local_match = 0;
-        self.highlight.matches.clear();
-        if !self.highlight.book_matches.is_empty() {
-            self.navigate_to_book_match(glyph_shaper);
-        } else {
+        self.highlight.set_results(query, options, results);
+        if self.highlight.is_empty() {
             self.request_overlay_repaint();
+        } else {
+            self.navigate_to_book_match(glyph_shaper);
         }
-        self.host.emit(RendererEvent::SearchResults(self.highlight.book_matches.clone()));
-        self.update_match_signal();
+        self.highlight.emit_results(self.host.as_ref());
     }
 
     pub fn append_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
-        if self.highlight.query != query || self.highlight.options != options {
-            self.highlight.query = query;
-            self.highlight.options = options;
-            self.highlight.book_matches.clear();
-            self.highlight.current_match = 0;
-            self.highlight.current_local_match = 0;
-            self.highlight.matches.clear();
-        }
-        let was_empty = self.highlight.book_matches.is_empty();
-        self.highlight.book_matches.extend(results);
-        if was_empty && !self.highlight.book_matches.is_empty() {
+        if self.highlight.append_results(query, options, results) {
             self.navigate_to_book_match(glyph_shaper);
         } else {
             self.request_overlay_repaint();
         }
-        self.host.emit(RendererEvent::SearchResults(self.highlight.book_matches.clone()));
-        self.update_match_signal();
+        self.highlight.emit_results(self.host.as_ref());
     }
 
     fn navigate_to_book_match(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        let Some(hit) = self.highlight.book_matches.get(self.highlight.current_match).cloned() else { return };
+        let Some(hit) = self.highlight.current_book_match() else { return };
         if hit.doc != self.nav.current_doc_index {
             self.set_position(glyph_shaper, hit.doc, None);
         }
         self.highlight.matches = self.doc().find_matches_with_options(&self.highlight.query, self.highlight.options);
-        self.highlight.current_local_match = hit.occurrence.min(self.highlight.matches.len().saturating_sub(1));
+        self.highlight.focus_local_match(hit.occurrence);
         self.navigate_to_current_match();
     }
 
-    pub fn next_match(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        if self.highlight.book_matches.is_empty() {
+    fn step_match(&mut self, glyph_shaper: &mut impl GlyphShaper, forward: bool) {
+        if !self.highlight.step(forward) {
             return;
         }
-        self.highlight.current_match = (self.highlight.current_match + 1) % self.highlight.book_matches.len();
         self.update_match_signal();
         self.navigate_to_book_match(glyph_shaper);
     }
 
+    pub fn next_match(&mut self, glyph_shaper: &mut impl GlyphShaper) {
+        self.step_match(glyph_shaper, true);
+    }
+
     pub fn prev_match(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        if self.highlight.book_matches.is_empty() {
-            return;
-        }
-        let count = self.highlight.book_matches.len();
-        self.highlight.current_match = (self.highlight.current_match + count - 1) % count;
-        self.update_match_signal();
-        self.navigate_to_book_match(glyph_shaper);
+        self.step_match(glyph_shaper, false);
     }
 }
 
