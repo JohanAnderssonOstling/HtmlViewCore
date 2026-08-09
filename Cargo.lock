@@ -682,6 +682,7 @@ dependencies = [
  "html-engine",
  "html-view-doc",
  "html-view-types",
+ "kurbo",
 ]
 
 [[package]]

@@ -663,3 +663,167 @@ impl<'a> Paginator<'a> {
         page
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, LaidOutDocument, LayoutConstraints};
+    use html::pipeline::DocumentFactory;
+    use kurbo::Size;
+    use std::collections::HashMap;
+
+    /// Fixed-metric shaper: every glyph is half the font size wide and
+    /// three-quarters tall, so line heights in these tests are predictable.
+    #[derive(Default)]
+    struct TestShaper {
+        glyphs: HashMap<(char, u32), GlyphId>,
+    }
+
+    impl GlyphShaper for TestShaper {
+        fn reset(&mut self) {
+            self.glyphs.clear();
+        }
+
+        fn shape_glyph<'a>(&mut self, registry: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _weight: u16, _slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
+            let key = (ch, font_size.to_bits());
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return Ok(glyph);
+            }
+            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
+            let glyph = registry.register(metric)?;
+            self.glyphs.insert(key, glyph);
+            Ok(glyph)
+        }
+    }
+
+    fn layout(html: &str, width: f64) -> LaidOutDocument {
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestShaper::default();
+        factory
+            .parse_with_new_pipeline(html, None)
+            .shape(&mut shaper)
+            .expect("the test shaper registers every glyph")
+            .layout(LayoutConstraints::new(width, 16.0).expect("constraints must be valid"))
+    }
+
+    fn columns(width: f64, height: f64, count: f64) -> ColumnLayout {
+        ColumnLayout { col_width: width, base_col_width: width, col_count: count, col_gap: 0.0, size: Size::new(width * count, height), scale: 1.0, max_col_count: None }
+    }
+
+    /// Paginates one page and returns (line index, column, screen y) per line.
+    fn paginate(document: &LaidOutDocument, layout: &ColumnLayout, book: bool) -> Vec<(usize, i32, f64)> {
+        let paginator = Paginator::new(DocQuery::new(document), layout, book, false);
+        let events = paginator.events();
+        let page = paginator.page_at(&events, 0.0, Vec::new());
+        page.positions.iter().map(|(line, screen)| (line, screen.col_index, screen.point.y)).collect()
+    }
+
+    fn column_of(placed: &[(usize, i32, f64)], line: usize) -> Option<i32> {
+        placed.iter().find(|(idx, _, _)| *idx == line).map(|(_, col, _)| *col)
+    }
+
+    const PARAGRAPHS: &str = "<p>aaa</p><p>bbb</p><p>ccc</p><p>ddd</p><p>eee</p><p>fff</p>";
+
+    #[test]
+    fn lines_that_do_not_fit_move_to_the_next_column() {
+        let document = layout(PARAGRAPHS, 200.0);
+        let placed = paginate(&document, &columns(200.0, 40.0, 2.0), true);
+
+        assert!(!placed.is_empty(), "something must be laid out");
+        let columns_used: Vec<i32> = placed.iter().map(|(_, col, _)| *col).collect();
+        assert!(columns_used.contains(&1), "a 40px column cannot hold six paragraphs, so later lines belong in column 1");
+        assert!(columns_used.windows(2).all(|w| w[0] <= w[1]), "columns must fill in order");
+    }
+
+    #[test]
+    fn every_placed_line_sits_within_its_column() {
+        let document = layout(PARAGRAPHS, 200.0);
+        let geometry = columns(200.0, 40.0, 2.0);
+        for (line, _, y) in paginate(&document, &geometry, true) {
+            assert!(y >= 0.0, "line {line} was placed above its column");
+            assert!(y < geometry.size.height, "line {line} at y={y} overflows the {}px column", geometry.size.height);
+        }
+    }
+
+    #[test]
+    fn a_forced_break_before_moves_content_to_a_fresh_column() {
+        let document = layout("<p>aaa</p><p style='break-before: column'>bbb</p>", 200.0);
+        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), true);
+
+        assert_eq!(column_of(&placed, 0), Some(0));
+        assert_eq!(column_of(&placed, 1), Some(1), "an authored column break must move the paragraph even though the column has room");
+    }
+
+    #[test]
+    fn a_semantic_chapter_starts_a_fresh_page_under_book_composition() {
+        let source = "<p>aaa</p><section epub:type='chapter'><p>bbb</p></section>";
+        let document = layout(source, 200.0);
+        let layout = columns(200.0, 200.0, 2.0);
+
+        let book = paginate(&document, &layout, true);
+        assert_eq!(column_of(&book, 0), Some(0));
+        assert_ne!(column_of(&book, 1), Some(0), "a chapter section should not share a page with preceding content");
+    }
+
+    #[test]
+    fn web_composition_ignores_semantic_chapter_breaks() {
+        let source = "<p>aaa</p><section epub:type='chapter'><p>bbb</p></section>";
+        let document = layout(source, 200.0);
+        let layout = columns(200.0, 200.0, 2.0);
+
+        let web = paginate(&document, &layout, false);
+        assert_eq!(column_of(&web, 0), Some(0));
+        assert_eq!(column_of(&web, 1), Some(0), "web composition paginates on CSS alone, so the section stays in flow");
+    }
+
+    #[test]
+    fn book_composition_keeps_a_compact_list_item_whole() {
+        // Four lines is the compact limit for a list item; the column below fits
+        // three, so the whole item must move rather than split.
+        let source = "<p>aaa</p><ul><li>one two three four five six seven eight</li></ul>";
+        let document = layout(source, 60.0);
+        let layout = columns(60.0, 60.0, 2.0);
+
+        let book = paginate(&document, &layout, true);
+        let item_lines: Vec<i32> = book.iter().skip(1).map(|(_, col, _)| *col).collect();
+        assert!(item_lines.len() > 1, "the fixture must wrap onto several lines or the test proves nothing: {book:?}");
+        assert!(item_lines.windows(2).all(|w| w[0] == w[1]), "a compact list item must not be split across columns: {book:?}");
+    }
+
+    #[test]
+    fn events_are_empty_under_web_composition() {
+        let document = layout("<table><tr><td>aaa</td></tr></table><section epub:type='chapter'><p>bbb</p></section>", 200.0);
+        let layout = columns(200.0, 200.0, 2.0);
+        let paginator = Paginator::new(DocQuery::new(&document), &layout, false, false);
+        let events = paginator.events();
+
+        assert!(events.tables.is_empty(), "table pagination is a book-composition rule");
+        assert!(events.keeps.is_empty(), "automatic keeps are a book-composition rule");
+    }
+
+    #[test]
+    fn pagination_is_deterministic_for_the_same_inputs() {
+        let document = layout(PARAGRAPHS, 200.0);
+        let layout = columns(200.0, 40.0, 2.0);
+        assert_eq!(paginate(&document, &layout, true), paginate(&document, &layout, true));
+    }
+
+    #[test]
+    fn a_later_start_offset_begins_at_a_later_line() {
+        let document = layout(PARAGRAPHS, 200.0);
+        let layout = columns(200.0, 40.0, 2.0);
+        let paginator = Paginator::new(DocQuery::new(&document), &layout, true, false);
+        let events = paginator.events();
+
+        let first = paginator.page_at(&events, 0.0, Vec::new());
+        let next = paginator.page_at(&events, first.next_start_offset_y, Vec::new());
+        assert!(next.start_line > first.start_line, "paging forward must advance: {} then {}", first.start_line, next.start_line);
+    }
+
+    #[test]
+    fn an_empty_document_paginates_to_nothing() {
+        let document = layout("", 200.0);
+        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), true);
+        assert!(placed.is_empty());
+    }
+}
