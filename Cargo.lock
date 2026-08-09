@@ -648,6 +648,7 @@ dependencies = [
  "html-view-doc",
  "html-view-load",
  "html-view-paginate",
+ "html-view-select",
  "html-view-types",
  "kurbo",
  "peniko",
@@ -681,6 +682,17 @@ dependencies = [
  "html-engine",
  "html-view-doc",
  "html-view-types",
+]
+
+[[package]]
+name = "html-view-select"
+version = "0.1.0"
+dependencies = [
+ "html-engine",
+ "html-view-doc",
+ "html-view-types",
+ "kurbo",
+ "peniko",
 ]
 
 [[package]]

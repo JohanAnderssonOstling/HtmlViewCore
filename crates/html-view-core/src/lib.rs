@@ -6,6 +6,7 @@ use std::sync::Arc;
 use kurbo::Point;
 pub use html_view_types::*;
 pub use html_view_doc::DocQuery;
+pub use html_view_select::{SelectionState, TableSelectionState};
 
 use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
 use crate::navigation::{LocationHistory, NavSignals, TocAnchors};
@@ -189,34 +190,6 @@ mod frame_cache_tests {
         let reused = scratch.take_line_position_buffer(&mut frame.last_line_positions);
         assert!(reused.capacity() >= capacity);
     }
-}
-
-#[derive(Default)]
-pub struct SelectionState {
-    pub is_selecting: bool,
-    pub selection_anchor: Option<u32>,
-    pub selection_active: Option<u32>,
-    pub pending_link_glyph: Option<u32>,
-    pub selected_text: Option<String>,
-    pub selected_text_markdown: Option<String>,
-    pub link_cursor_active: bool,
-    pub semantic_selection: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TableCellRange {
-    table_box: usize,
-    row_start: usize,
-    row_end: usize,
-    column_start: usize,
-    column_end: usize,
-}
-
-#[derive(Default)]
-pub(crate) struct TableSelectionState {
-    range: Option<TableCellRange>,
-    anchor: Option<(usize, usize, usize, usize, usize)>,
-    dragging: bool,
 }
 
 #[derive(Default)]
