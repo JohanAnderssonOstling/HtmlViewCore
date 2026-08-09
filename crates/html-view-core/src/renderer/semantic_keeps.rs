@@ -1,5 +1,5 @@
 use crate::doc_query::DocQuery;
-use crate::render::BoundaryAnchors;
+use crate::paginate::BoundaryAnchors;
 
 const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
 const EPSILON: f64 = 0.01;

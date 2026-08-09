@@ -1,16 +1,17 @@
-use crate::{PagePositions, RendererCore};
+use crate::PagePositions;
+use crate::paginate::Paginator;
 
 const MAX_GAP_STRETCH: f64 = 2.0;
 const MAX_COLUMN_STRETCH: f64 = 12.0;
 const EPSILON: f64 = 0.01;
 
-impl RendererCore {
+impl Paginator<'_> {
     /// Refines an already-paginated page without changing CSS layout or line
     /// breaking. Only positive gaps between line boxes are elastic, and each
     /// receives at most a two-pixel adjustment. Pagination, tables, and keep
     /// ranges remain authoritative.
     pub(super) fn apply_vertical_rhythm(&self, page: &mut PagePositions, rigid_ranges: &[(f64, f64)]) {
-        let lines = self.document.render_view().text().lines();
+        let lines = self.doc.text().lines();
         let visible: Vec<_> = page.positions.iter().collect();
         let Some(last_visible_column) = visible.iter().map(|(_, screen)| screen.col_index).max() else {
             return;
@@ -30,7 +31,7 @@ impl RendererCore {
             let Some(last_line) = lines.get(last_idx) else {
                 continue;
             };
-            let last_height = self.doc().effective_line_height(last_idx, last_line.height());
+            let last_height = self.doc.effective_line_height(last_idx, last_line.height());
             let slack = (self.layout.size.height - (last_screen.point.y + last_height)).max(0.0);
             if slack <= EPSILON {
                 continue;
@@ -42,7 +43,7 @@ impl RendererCore {
                 let (Some(current), Some(next)) = (lines.get(*current_idx), lines.get(*next_idx)) else {
                     continue;
                 };
-                let current_height = self.doc().effective_line_height(*current_idx, current.height());
+                let current_height = self.doc.effective_line_height(*current_idx, current.height());
                 if next.point().y - (current.point().y + current_height) <= EPSILON {
                     continue;
                 }
@@ -51,8 +52,8 @@ impl RendererCore {
                 if page.offset_breaks.iter().any(|(y, _)| (*y - trigger).abs() <= EPSILON)
                     || rigid_ranges.iter().any(|(top, bottom)| trigger > *top + EPSILON && trigger < *bottom - EPSILON)
                     || self
-                        .document
-                        .render_view()
+                        .doc
+                        .view()
                         .fragments()
                         .decorations()
                         .iter()

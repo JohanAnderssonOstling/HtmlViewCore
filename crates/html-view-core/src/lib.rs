@@ -1323,6 +1323,9 @@ mod highlight;
 #[path = "renderer/render.rs"]
 mod render;
 
+#[path = "renderer/paginate.rs"]
+mod paginate;
+
 #[path = "renderer/vertical_rhythm.rs"]
 mod vertical_rhythm;
 

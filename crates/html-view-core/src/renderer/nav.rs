@@ -1700,7 +1700,7 @@ mod tests {
         let row_y = core.document.render_view().text().line(last_row).expect("last row line").point().y;
         let caption_line = core.document.render_view().text().line(caption).expect("bottom caption line");
         assert_eq!(row_y, 40.0, "layout geometry remains continuous");
-        let (group_top, group_bottom) = core.table_row_group_bounds_containing(row_y).expect("the final row owns a pagination group");
+        let (group_top, group_bottom) = core.paginator().table_row_group_bounds_containing(row_y).expect("the final row owns a pagination group");
         assert_eq!(group_top, row_y);
         assert!(group_bottom >= caption_line.point().y + caption_line.height(), "the final row's pagination group must include its bottom caption");
     }

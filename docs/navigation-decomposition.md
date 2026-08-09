@@ -168,3 +168,41 @@ extraction (verified against `4011bc1`). Fixed by locating the document first
 and summing what precedes it, rather than accumulating during the search.
 
 148 tests pass; warning count unchanged at 4.
+
+## Extracting the paginator
+
+Pagination turned out to be the one genuine subsystem left, and it needed no
+redesign: every method was already `&self` and already returned its result.
+
+| method | reads |
+| --- | --- |
+| `table_pagination_events` | document, composition policy |
+| `automatic_keep_events` | document, composition policy |
+| `forced_break_events` | document, composition policy |
+| `build_forward_positions` | document, column layout, composition policy |
+| `apply_vertical_rhythm` | document, column layout |
+
+None touched the frame, viewport, host, revisions, pipeline or caches. The only
+mutating methods in the cluster -- `prepare_forward`, `prepare_backward`,
+`install_positioned_page` -- store the returned `PagePositions`; they compute
+nothing.
+
+`Paginator<'a>` bundles `DocQuery`, `&ColumnLayout`, and the two policy flags.
+`renderer/paginate.rs` (665 lines) references no `RendererCore` field at all, so
+pagination is now a pure function of document and column geometry by
+construction. `render.rs` drops from 1414 to 817 lines.
+
+`PaginationEvents` is computed once and reused: backward navigation
+binary-searches for a start offset, so recomputing events per candidate would
+have been a regression.
+
+### A near-duplicate that is not a duplicate
+
+`render.rs` and `semantic_keeps.rs` each carried `has_token` and `has_epub_type`,
+flagged early on as obvious duplication. They are not identical: the
+`semantic_keeps` version also matches namespace-prefixed tokens (`foo:chapter`).
+Unifying them would widen what counts as a semantic sidebar or chapter start, so
+both were preserved and the divergence documented at the definition. Worth
+deciding deliberately, but not as a side effect of an extraction.
+
+148 tests pass; warning count unchanged at 4.
