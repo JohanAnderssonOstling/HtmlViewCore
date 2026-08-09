@@ -60,8 +60,8 @@ buys nothing.
 
 | step | change | status |
 | --- | --- | --- |
-| 2a | `NavContext<'a>` bundling `DocQuery`, `&mut ViewportState`, `&VisibleFrame`, `&dyn RendererHost` | not started |
-| 2b | Move within-document navigation onto `Navigator` taking `NavContext` | not started |
+| 2a | `NavView` (read-only) and `NavContext` (read-write) over `DocQuery`, viewport, frame, host | done |
+| 2b | Move within-document navigation onto `NavigationState` taking those contexts | done |
 
 Stays on `RendererCore`: the 12 cross-document entry points, which ask the
 navigator for a target and then perform the swap through the wide primitives.
@@ -100,3 +100,34 @@ asserts `history.is_at_newest()`, which states the same property without
 depending on the representation.
 
 117 tests pass, 4 warnings.
+
+### Phase 2 (done)
+
+23 methods moved to `impl NavigationState` in `renderer/navigate.rs` (302
+lines). The file references no `RendererCore` field outside the two contexts --
+no pipeline, provider, cache, revisions or column layout -- so the claim that
+within-document navigation needs only document, viewport, frame and host is now
+checkable by the compiler rather than asserted.
+
+Two deviations from the plan as written:
+
+- **No separate `Navigator` type.** The methods went onto `NavigationState`
+  itself, matching how `TableSelectionState`, `HighlightState` and
+  `ColumnLayout` were handled in the earlier phase. A wrapper would have added a
+  name without adding a boundary.
+- **Two contexts, not one.** Queries only read the viewport while movement
+  writes it. Forcing both through `&mut` would have made every read-only
+  forwarder on `RendererCore` take `&mut self`, which several callers cannot
+  provide. `NavContext::view()` produces the read-only form.
+
+Defect 3 is fixed: `set_progress_fraction` now calls
+`NavigationState::document_at_fraction`, the named inverse of
+`reading_progress`, instead of repeating the walk over `document_text_lengths`.
+Both are now pure functions of that field and testable directly.
+
+`RendererCore` keeps thin forwarders, so no call site outside `nav.rs` changed.
+The predicted borrow-checker friction appeared exactly once, in the two
+forwarders that mutate `nav` while reading the document; `nav_cx` returning
+`(&mut NavigationState, NavContext)` as disjoint field borrows resolves it.
+
+117 tests pass; warning count unchanged at 4.

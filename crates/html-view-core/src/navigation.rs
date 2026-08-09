@@ -9,7 +9,32 @@
 use std::collections::HashSet;
 
 use crate::doc_query::DocQuery;
-use crate::{RendererEvent, RendererHost};
+use crate::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
+
+/// Everything within-document navigation reads.
+///
+/// Where the reader is depends on the document, the scroll offset and the page
+/// currently laid out -- and on nothing else in the renderer.
+#[derive(Clone, Copy)]
+pub(crate) struct NavView<'a> {
+    pub doc: DocQuery<'a>,
+    pub viewport: &'a ViewportState,
+    pub frame: &'a VisibleFrame,
+}
+
+/// [`NavView`] plus the ability to move the viewport and notify the host.
+pub(crate) struct NavContext<'a> {
+    pub doc: DocQuery<'a>,
+    pub viewport: &'a mut ViewportState,
+    pub frame: &'a VisibleFrame,
+    pub host: &'a dyn RendererHost,
+}
+
+impl<'a> NavContext<'a> {
+    pub(crate) fn view(&self) -> NavView<'_> {
+        NavView { doc: self.doc, viewport: self.viewport, frame: self.frame }
+    }
+}
 
 /// A value the host has already been told about.
 ///

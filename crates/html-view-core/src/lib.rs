@@ -23,6 +23,9 @@ pub mod cfi;
 mod doc_query;
 mod document_cache;
 mod navigation;
+
+#[path = "renderer/navigate.rs"]
+mod navigate;
 mod prepared_page;
 
 pub mod layout {
