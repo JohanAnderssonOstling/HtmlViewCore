@@ -4,7 +4,7 @@ use kurbo::{Point, Rect};
 use peniko::Color;
 
 use crate::doc_query::DocQuery;
-use crate::{LineScreen, PagePositions, PaintDirection, Painter, RenderState, RendererCore, RepeatedTableHeader, VisibleLinePositions};
+use crate::{ColumnLayout, LineScreen, PagePositions, PaintDirection, Painter, RenderState, RendererCore, RepeatedTableHeader, VisibleLinePositions};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum TablePaginationEventKind {
@@ -134,6 +134,124 @@ fn project_inline_decoration_rect(rect: Rect, logical_line_point: Point, screen_
 fn scaled_image_size(frag: &html::layout::RenderImageFragment) -> (f64, f64) {
     let size = frag.size();
     (size.width, size.height)
+}
+
+impl ColumnLayout {
+    /// Compute x-coordinate for a column given a local x offset
+    #[inline]
+    pub(crate) fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
+        self.col_gap + col_index * (self.col_width + self.col_gap) + local_x
+    }
+
+    fn resolve_point_at(&self, point: Point, elem_height: f64, mut render_state: RenderState, start_offset_y: f64) -> (Option<Point>, RenderState) {
+        // map document point to screen columns
+        let mut y = point.y + render_state.y_offset - start_offset_y;
+        let mut col_index = (y / self.size.height).floor(); // initial column based on vertical position
+        y -= col_index * self.size.height;
+
+        if y + elem_height > self.size.height {
+            // move to next column if element would overflow
+            col_index += 1.0;
+            render_state.y_offset += self.size.height - y;
+            y = 0.;
+        }
+
+        // Past all columns - stop rendering
+        if col_index >= self.col_count {
+            // stop when past last column
+            render_state.should_stop = true;
+            return (None, render_state);
+        }
+
+        render_state.col_index = col_index;
+        let x = self.col_x(col_index, point.x);
+        let resolved = Point::new(x, y);
+        (Some(resolved), render_state)
+    }
+
+    fn inline_metrics(&self) -> crate::InlineMetrics {
+        // compute inline decoration offset within column gap
+        const MIN_GAP: f64 = 20.0;
+        let effective_gap = (self.col_gap - MIN_GAP).max(0.0);
+        let half_gap = effective_gap / 2.0;
+        crate::InlineMetrics { offset: half_gap / 2.0 }
+    }
+
+    fn apply_keep_range_event(&self, event: KeepRangeEvent, start_offset_y: f64, render_state: &mut RenderState) {
+        let fragment_height = self.size.height;
+        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+            return;
+        }
+        let height = (event.bottom - event.top).max(0.0);
+        if height > fragment_height + 0.01 {
+            return;
+        }
+        let projected_top = event.top + render_state.y_offset - start_offset_y;
+        let local_top = projected_top.rem_euclid(fragment_height);
+        if local_top > 0.01 && local_top + height > fragment_height + 0.01 {
+            render_state.y_offset += fragment_height - local_top;
+        }
+    }
+
+    fn apply_forced_break_event(&self, event: ForcedBreakEvent, start_offset_y: f64, previous_line: Option<LineScreen>, render_state: &mut RenderState) {
+        let fragment_height = self.size.height;
+        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+            return;
+        }
+        // At the beginning of a newly selected reader page the break has
+        // already been satisfied. Otherwise base the destination solely on
+        // the last column that contains actual content, never on margin-only
+        // document space.
+        let target_col = previous_line.map_or(0.0, |previous| match event.kind {
+            html::layout::RenderForcedBreak::Column => previous.col_index as f64 + 1.0,
+            html::layout::RenderForcedBreak::Page => self.col_count,
+        });
+        let projected_top = event.top + render_state.y_offset - start_offset_y;
+        render_state.y_offset += target_col * fragment_height - projected_top;
+    }
+
+    fn apply_table_pagination_event(&self, event: TablePaginationEvent, start_offset_y: f64, render_state: &mut RenderState) -> Option<RepeatedTableHeader> {
+        let fragment_height = self.size.height;
+        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+            return None;
+        }
+        let projected_top = event.top + render_state.y_offset - start_offset_y;
+        let local_top = projected_top.rem_euclid(fragment_height);
+
+        let height = (event.bottom - event.top).max(0.0);
+        let crosses = local_top + height > fragment_height + 0.01;
+        let move_to_fresh_fragment = match event.kind {
+            // Moving the whole table is useful only when it can actually fit
+            // in a fresh fragment. An intrinsically oversized table should
+            // start in the available space; its row-group events below will
+            // choose safe boundaries as each row is encountered.
+            TablePaginationEventKind::WholeTable => height <= fragment_height && crosses,
+            // A forced break that already lands on a fragment boundary is
+            // satisfied; advancing again would skip an entire column.
+            TablePaginationEventKind::RowGroup => (event.forced && local_top > 0.01) || (height <= fragment_height && crosses),
+        };
+        if move_to_fresh_fragment {
+            render_state.y_offset += fragment_height - local_top;
+        }
+
+        let header = event.repeated_header?;
+        let header_height = header.bottom - header.top;
+        if header_height + height > fragment_height + 0.01 {
+            return None;
+        }
+        let body_projected_top = event.top + render_state.y_offset - start_offset_y;
+        let body_local_top = body_projected_top.rem_euclid(fragment_height);
+        let starts_continuation = move_to_fresh_fragment || (body_local_top <= 0.01 && (start_offset_y >= header.bottom - 0.01 || body_projected_top >= fragment_height - 0.01));
+        if !starts_continuation {
+            return None;
+        }
+        let col_index = (body_projected_top / fragment_height).floor() as i32;
+        if col_index < 0 || col_index as f64 >= self.col_count {
+            return None;
+        }
+        render_state.y_offset += header_height;
+        Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
+    }
 }
 
 impl<'a> DocQuery<'a> {
@@ -490,22 +608,6 @@ impl RendererCore {
         events
     }
 
-    fn apply_keep_range_event(&self, event: KeepRangeEvent, start_offset_y: f64, render_state: &mut RenderState) {
-        let fragment_height = self.layout.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return;
-        }
-        let height = (event.bottom - event.top).max(0.0);
-        if height > fragment_height + 0.01 {
-            return;
-        }
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        let local_top = projected_top.rem_euclid(fragment_height);
-        if local_top > 0.01 && local_top + height > fragment_height + 0.01 {
-            render_state.y_offset += fragment_height - local_top;
-        }
-    }
-
     fn forced_break_events(&self, anchors: &BoundaryAnchors) -> Vec<ForcedBreakEvent> {
         if !self.pipeline_inputs.layout.text_composition_policy.is_book_optimized() {
             return Vec::new();
@@ -571,101 +673,9 @@ impl RendererCore {
         merged
     }
 
-    fn apply_forced_break_event(&self, event: ForcedBreakEvent, start_offset_y: f64, previous_line: Option<LineScreen>, render_state: &mut RenderState) {
-        let fragment_height = self.layout.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return;
-        }
-        // At the beginning of a newly selected reader page the break has
-        // already been satisfied. Otherwise base the destination solely on
-        // the last column that contains actual content, never on margin-only
-        // document space.
-        let target_col = previous_line.map_or(0.0, |previous| match event.kind {
-            html::layout::RenderForcedBreak::Column => previous.col_index as f64 + 1.0,
-            html::layout::RenderForcedBreak::Page => self.layout.col_count,
-        });
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        render_state.y_offset += target_col * fragment_height - projected_top;
-    }
-
     #[cfg(test)]
     pub(crate) fn table_row_group_bounds_containing(&self, y: f64) -> Option<(f64, f64)> {
         self.table_pagination_events().into_iter().find(|event| event.kind == TablePaginationEventKind::RowGroup && event.top <= y + 0.01 && event.bottom > y + 0.01).map(|event| (event.top, event.bottom))
-    }
-
-    fn apply_table_pagination_event(&self, event: TablePaginationEvent, start_offset_y: f64, render_state: &mut RenderState) -> Option<RepeatedTableHeader> {
-        let fragment_height = self.layout.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return None;
-        }
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        let local_top = projected_top.rem_euclid(fragment_height);
-
-        let height = (event.bottom - event.top).max(0.0);
-        let crosses = local_top + height > fragment_height + 0.01;
-        let move_to_fresh_fragment = match event.kind {
-            // Moving the whole table is useful only when it can actually fit
-            // in a fresh fragment. An intrinsically oversized table should
-            // start in the available space; its row-group events below will
-            // choose safe boundaries as each row is encountered.
-            TablePaginationEventKind::WholeTable => height <= fragment_height && crosses,
-            // A forced break that already lands on a fragment boundary is
-            // satisfied; advancing again would skip an entire column.
-            TablePaginationEventKind::RowGroup => (event.forced && local_top > 0.01) || (height <= fragment_height && crosses),
-        };
-        if move_to_fresh_fragment {
-            render_state.y_offset += fragment_height - local_top;
-        }
-
-        let header = event.repeated_header?;
-        let header_height = header.bottom - header.top;
-        if header_height + height > fragment_height + 0.01 {
-            return None;
-        }
-        let body_projected_top = event.top + render_state.y_offset - start_offset_y;
-        let body_local_top = body_projected_top.rem_euclid(fragment_height);
-        let starts_continuation = move_to_fresh_fragment || (body_local_top <= 0.01 && (start_offset_y >= header.bottom - 0.01 || body_projected_top >= fragment_height - 0.01));
-        if !starts_continuation {
-            return None;
-        }
-        let col_index = (body_projected_top / fragment_height).floor() as i32;
-        if col_index < 0 || col_index as f64 >= self.layout.col_count {
-            return None;
-        }
-        render_state.y_offset += header_height;
-        Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
-    }
-
-    /// Compute x-coordinate for a column given a local x offset
-    #[inline]
-    pub(crate) fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
-        self.layout.col_gap + col_index * (self.layout.col_width + self.layout.col_gap) + local_x
-    }
-
-    fn resolve_point_at(&self, point: Point, elem_height: f64, mut render_state: RenderState, start_offset_y: f64) -> (Option<Point>, RenderState) {
-        // map document point to screen columns
-        let mut y = point.y + render_state.y_offset - start_offset_y;
-        let mut col_index = (y / self.layout.size.height).floor(); // initial column based on vertical position
-        y -= col_index * self.layout.size.height;
-
-        if y + elem_height > self.layout.size.height {
-            // move to next column if element would overflow
-            col_index += 1.0;
-            render_state.y_offset += self.layout.size.height - y;
-            y = 0.;
-        }
-
-        // Past all columns - stop rendering
-        if col_index >= self.layout.col_count {
-            // stop when past last column
-            render_state.should_stop = true;
-            return (None, render_state);
-        }
-
-        render_state.col_index = col_index;
-        let x = self.col_x(col_index, point.x);
-        let resolved = Point::new(x, y);
-        (Some(resolved), render_state)
     }
 
     fn initial_render_state() -> RenderState {
@@ -679,7 +689,7 @@ impl RendererCore {
         // draw background decorations across columns
         let page_start = start_offset_y;
         let page_end = start_offset_y + self.layout.col_count * self.layout.size.height; // visible doc y end for this page
-        let inline_metrics = self.inline_metrics();
+        let inline_metrics = self.layout.inline_metrics();
         let lines = self.document.render_view().text().lines();
         for decoration in self.document.render_view().fragments().decorations().iter() {
             if decoration.is_foreground() != foreground {
@@ -724,7 +734,7 @@ impl RendererCore {
                         self.paint_inline_decoration_at(cx, &rect, &line, screen.point, 0.0, &decoration);
                     } else if let Some(line) = self.document.render_view().text().line(line_idx) {
                         let render_state = Self::initial_render_state();
-                        let (point, _) = self.resolve_point_at(line.point(), line.height(), render_state, start_offset_y);
+                        let (point, _) = self.layout.resolve_point_at(line.point(), line.height(), render_state, start_offset_y);
                         if let Some(point) = point {
                             self.paint_inline_decoration_at(cx, &rect, &line, point, inline_metrics.offset, &decoration);
                         }
@@ -780,7 +790,7 @@ impl RendererCore {
                 if source_x1 <= source_x0 || source_y1 <= source_y0 {
                     continue;
                 }
-                let x = self.col_x(header.col_index as f64, source_x0);
+                let x = self.layout.col_x(header.col_index as f64, source_x0);
                 let y = source_y0 - header.source_top;
                 let target = Rect::new(x, y, x + source_x1 - source_x0, y + source_y1 - source_y0);
                 let radii = decoration.radii().map(|mut radii| {
@@ -821,7 +831,7 @@ impl RendererCore {
                 {
                     continue;
                 }
-                let point = Point::new(self.col_x(header.col_index as f64, line.point().x), line.point().y - header.source_top);
+                let point = Point::new(self.layout.col_x(header.col_index as f64, line.point().x), line.point().y - header.source_top);
                 render_state = self.draw_line_at(cx, line_idx, point, render_state);
             }
         }
@@ -862,7 +872,7 @@ impl RendererCore {
             if y1 <= y0 {
                 continue;
             }
-            let x = self.col_x(col as f64, rect.x0);
+            let x = self.layout.col_x(col as f64, rect.x0);
             let y = y0 - col_top;
             let height = y1 - y0;
             let split_rect = kurbo::Rect::new(x, y, x + rect.width(), y + height);
@@ -881,14 +891,6 @@ impl RendererCore {
             // semantic fragment still owns its CSS appearance.
             html::render::paint_projected_decoration(cx, decoration, split_rect, radii);
         }
-    }
-
-    fn inline_metrics(&self) -> crate::InlineMetrics {
-        // compute inline decoration offset within column gap
-        const MIN_GAP: f64 = 20.0;
-        let effective_gap = (self.layout.col_gap - MIN_GAP).max(0.0);
-        let half_gap = effective_gap / 2.0;
-        crate::InlineMetrics { offset: half_gap / 2.0 }
     }
 
     fn paint_inline_decoration_at(&self, cx: &mut impl Painter, rect: &kurbo::Rect, line: &html::layout::RenderLine, screen_point: Point, x_offset: f64, decoration: &html::layout::RenderDecoration) {
@@ -1066,7 +1068,7 @@ impl RendererCore {
             while forced_break_events.get(forced_break_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
                 let previous_line = last_line.and_then(|line_idx| positions.get(line_idx));
-                self.apply_forced_break_event(forced_break_events[forced_break_event_idx], start_offset_y, previous_line, &mut render_state);
+                self.layout.apply_forced_break_event(forced_break_events[forced_break_event_idx], start_offset_y, previous_line, &mut render_state);
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {
                     offset_breaks.push((forced_break_events[forced_break_event_idx].top, render_state.y_offset));
                 }
@@ -1074,7 +1076,7 @@ impl RendererCore {
             }
             while keep_events.get(keep_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
-                self.apply_keep_range_event(keep_events[keep_event_idx], start_offset_y, &mut render_state);
+                self.layout.apply_keep_range_event(keep_events[keep_event_idx], start_offset_y, &mut render_state);
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {
                     offset_breaks.push((keep_events[keep_event_idx].top, render_state.y_offset));
                 }
@@ -1082,7 +1084,7 @@ impl RendererCore {
             }
             while table_events.get(table_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
-                if let Some(repeated_header) = self.apply_table_pagination_event(table_events[table_event_idx], start_offset_y, &mut render_state) {
+                if let Some(repeated_header) = self.layout.apply_table_pagination_event(table_events[table_event_idx], start_offset_y, &mut render_state) {
                     repeated_table_headers.push(repeated_header);
                 }
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {
@@ -1099,7 +1101,7 @@ impl RendererCore {
             // the excess paint below the column.
             let fit_height = if oversized { self.layout.size.height } else { effective_height };
             let previous_offset = render_state.y_offset;
-            let (point, next_state) = self.resolve_point_at(line.point(), fit_height, render_state, start_offset_y);
+            let (point, next_state) = self.layout.resolve_point_at(line.point(), fit_height, render_state, start_offset_y);
             render_state = next_state;
             if (render_state.y_offset - previous_offset).abs() > 1e-6 {
                 offset_breaks.push((line.point().y, render_state.y_offset));

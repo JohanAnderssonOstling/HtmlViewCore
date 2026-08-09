@@ -225,7 +225,7 @@ impl RendererCore {
                 let y0 = page_y0.max(column_top);
                 let y1 = page_y1.min(column_top + height);
                 if y1 > y0 {
-                    let x0 = self.col_x(f64::from(column), rect.x0);
+                    let x0 = self.layout.col_x(f64::from(column), rect.x0);
                     visit(Rect::new(x0, y0 - column_top, x0 + rect.width(), y1 - column_top));
                 }
             }
