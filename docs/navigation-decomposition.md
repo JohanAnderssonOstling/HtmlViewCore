@@ -290,10 +290,27 @@ The four `copy_table_*` methods returned `Result<bool, String>` and called
 requirements entirely -- the same move that made the drag machine host-free
 earlier.
 
-### Outstanding
+### Tests for the extracted crates
 
-`html-view-doc` and `html-view-paginate` have no tests of their own. The
-pagination rules -- widow and orphan limits, table row-group breaks, figure and
-caption keeps, semantic chapter breaks -- are still exercised only through
-`html-view-core`'s renderer-level tests, which is why that crate still carries
-2805 test lines against 3880 of code.
+27 tests added to the two crates that had none, constructing no provider, host
+or `RendererCore`. Documents come from `DocumentFactory` with a fixed-metric
+shaper; column geometry is a `ColumnLayout` literal.
+
+`html-view-paginate` (10): column overflow, the invariant that no placed line
+escapes its column, authored break-before, semantic chapter starts, the compact
+list keep, forward paging, determinism, the empty document. The chapter fixture
+is asserted both ways -- breaking under book composition and not breaking under
+web -- so neither test can pass by accident.
+
+Verified by mutation rather than trusting green: disabling
+`is_semantic_page_start` fails the chapter test, and neutralising the
+forced-break offset fails two. Both restored.
+
+`html-view-doc` (17): selection text and markdown, box-tree ancestor lookup,
+heading prefixes, line lookup including the empty document, search matching with
+each option, marker exclusion, and anchor lookup with and without a filter.
+
+One behavior worth knowing, found while writing them: a heading emits
+`## **Title**`, because the default `h2` font weight trips the same threshold as
+`<strong>`. Redundant but valid markdown; recorded at the assertion rather than
+changed.

@@ -837,3 +837,229 @@ impl<'a> TextGeometry<'a> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, LayoutConstraints};
+    use html::pipeline::DocumentFactory;
+    use html_view_types::{SearchScope, SearchOptions as Opts};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct TestShaper {
+        glyphs: HashMap<(char, u32), GlyphId>,
+    }
+
+    impl GlyphShaper for TestShaper {
+        fn reset(&mut self) {
+            self.glyphs.clear();
+        }
+
+        fn shape_glyph<'a>(&mut self, registry: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _weight: u16, _slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
+            let key = (ch, font_size.to_bits());
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return Ok(glyph);
+            }
+            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
+            let glyph = registry.register(metric)?;
+            self.glyphs.insert(key, glyph);
+            Ok(glyph)
+        }
+    }
+
+    fn layout(html: &str) -> LaidOutDocument {
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestShaper::default();
+        factory
+            .parse_with_new_pipeline(html, None)
+            .shape(&mut shaper)
+            .expect("the test shaper registers every glyph")
+            .layout(LayoutConstraints::new(600.0, 16.0).expect("constraints must be valid"))
+    }
+
+    fn options() -> Opts {
+        Opts { match_case: false, whole_word: false, match_diacritics: false, scope: SearchScope::WholeBook }
+    }
+
+    /// The glyph index of the first occurrence of `wanted`.
+    fn glyph_of(doc: DocQuery<'_>, wanted: char) -> u32 {
+        let text = doc.text();
+        (0..text.glyph_count() as u32).find(|index| text.glyph_at(*index as usize).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == wanted)).expect("character must be present")
+    }
+
+    // -- text extraction ----------------------------------------------------
+
+    #[test]
+    fn selection_text_spans_block_boundaries_with_newlines() {
+        let document = layout("<p>alpha</p><p>beta</p>");
+        let doc = DocQuery::new(&document);
+        let (plain, _) = doc.build_selection_text(0, doc.text().glyph_count() as u32);
+
+        let plain = plain.expect("a non-empty selection yields text");
+        assert!(plain.contains("alpha") && plain.contains("beta"));
+        assert!(plain.contains('\n'), "separate blocks must not run together: {plain:?}");
+    }
+
+    #[test]
+    fn selection_markdown_marks_emphasis_and_headings() {
+        let document = layout("<h2>Title</h2><p><em>soft</em> and <strong>hard</strong></p>");
+        let doc = DocQuery::new(&document);
+        let (_, markdown) = doc.build_selection_text(0, doc.text().glyph_count() as u32);
+
+        let markdown = markdown.expect("a non-empty selection yields markdown");
+        // Headings also carry a bold run, because the default h2 font weight
+        // trips the same threshold as <strong>. The result is redundant but
+        // valid markdown: `## **Title**`.
+        assert!(markdown.starts_with("## "), "h2 becomes a level-two heading: {markdown:?}");
+        assert!(markdown.contains("Title"), "the heading text survives: {markdown:?}");
+        assert!(markdown.contains("*soft*"), "em becomes emphasis: {markdown:?}");
+        assert!(markdown.contains("**hard**"), "strong becomes bold: {markdown:?}");
+    }
+
+    #[test]
+    fn an_empty_range_yields_no_text() {
+        let document = layout("<p>alpha</p>");
+        let doc = DocQuery::new(&document);
+        assert_eq!(doc.build_selection_text(3, 3), (None, None));
+    }
+
+    #[test]
+    fn code_spans_escape_backticks_rather_than_closing_early() {
+        let document = layout("<p><code>a`b</code></p>");
+        let doc = DocQuery::new(&document);
+        let (_, markdown) = doc.build_selection_text(0, doc.text().glyph_count() as u32);
+        assert!(markdown.expect("markdown").contains("\\`"), "a literal backtick inside code must be escaped");
+    }
+
+    // -- box tree -----------------------------------------------------------
+
+    #[test]
+    fn ancestor_lookup_finds_the_nearest_match_and_stops_at_the_root() {
+        let document = layout("<table><tr><td><p id='cell'>x</p></td></tr></table>");
+        let doc = DocQuery::new(&document);
+        let boxes = doc.boxes();
+        let paragraph = (0..boxes.len()).find(|&i| boxes.attribute(i, "id") == Some("cell")).expect("the paragraph is in the box tree");
+
+        let table = doc.nearest_table_ancestor(paragraph).expect("the paragraph sits in a table");
+        assert!(doc.box_descends_from(paragraph, table));
+        assert!(doc.nearest_tag_ancestor(paragraph, "td").is_some());
+        assert!(doc.nearest_tag_ancestor(paragraph, "blockquote").is_none(), "a tag that is not an ancestor must not match");
+    }
+
+    #[test]
+    fn a_box_descends_from_itself() {
+        let document = layout("<p>alpha</p>");
+        let doc = DocQuery::new(&document);
+        assert!(doc.box_descends_from(0, 0));
+    }
+
+    #[test]
+    fn heading_prefixes_cover_every_level() {
+        let document = layout("<h1>a</h1><h3>b</h3><p>c</p>");
+        let doc = DocQuery::new(&document);
+        let boxes = doc.boxes();
+        let tagged = |want: &str| (0..boxes.len()).find(|&i| boxes.tag(i).is_some_and(|t| t.eq_ignore_ascii_case(want))).expect("tag present");
+
+        assert_eq!(doc.header_prefix(tagged("h1")), Some("# "));
+        assert_eq!(doc.header_prefix(tagged("h3")), Some("### "));
+        assert_eq!(doc.header_prefix(tagged("p")), None);
+    }
+
+    // -- line lookup --------------------------------------------------------
+
+    #[test]
+    fn start_and_end_line_lookup_agree_on_a_single_line_document() {
+        let document = layout("<p>alpha</p>");
+        let doc = DocQuery::new(&document);
+        assert_eq!(doc.start_line_at(0.0, 0.1), 0);
+        assert_eq!(doc.find_line_for_glyph(0), Some(0));
+    }
+
+    #[test]
+    fn line_lookup_on_an_empty_document_does_not_panic() {
+        let document = layout("");
+        let doc = DocQuery::new(&document);
+        assert_eq!(doc.start_line_at(0.0, 0.1), 0);
+        assert_eq!(doc.end_line_at(0.0, 0.1), None);
+        assert_eq!(doc.find_line_for_glyph(0), None);
+    }
+
+    #[test]
+    fn start_line_advances_past_earlier_lines() {
+        let document = layout("<p>alpha</p><p>beta</p><p>gamma</p>");
+        let doc = DocQuery::new(&document);
+        let last = doc.text().lines().len() - 1;
+        let last_y = doc.text().line(last).expect("last line").point().y;
+        assert_eq!(doc.start_line_at(last_y, 0.1), last, "an offset at the last line's top selects it");
+        assert_eq!(doc.start_line_at(0.0, 0.1), 0);
+    }
+
+    // -- search -------------------------------------------------------------
+
+    #[test]
+    fn matching_is_case_and_diacritic_insensitive_by_default() {
+        assert_eq!(find_text_matches("Café CAFE cafeteria", "cafe", options()).len(), 3);
+        assert_eq!(find_text_matches("Café CAFE cafeteria", "cafe", Opts { whole_word: true, ..options() }).len(), 2);
+        assert_eq!(find_text_matches("Café CAFE", "cafe", Opts { match_case: true, ..options() }).len(), 0);
+        assert_eq!(find_text_matches("Café CAFE", "cafe", Opts { match_diacritics: true, ..options() }).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_query_matches_nothing() {
+        assert!(find_text_matches("alpha", "", options()).is_empty());
+        let document = layout("<p>alpha</p>");
+        assert!(DocQuery::new(&document).find_matches_with_options("", options()).is_empty());
+    }
+
+    #[test]
+    fn document_matching_returns_glyph_ranges_covering_the_query() {
+        let document = layout("<p>alpha beta alpha</p>");
+        let doc = DocQuery::new(&document);
+        let matches = doc.find_matches_with_options("alpha", options());
+
+        assert_eq!(matches.len(), 2, "both occurrences are found");
+        for (start, end) in matches {
+            assert_eq!(end - start, 5, "each match spans the query length");
+            assert_eq!(doc.glyph_text(&[start..end]).to_lowercase(), "alpha");
+        }
+    }
+
+    #[test]
+    fn list_markers_are_excluded_from_search() {
+        // Browsers exclude generated ::marker content from find-in-page.
+        let document = layout("<ol><li>item</li></ol>");
+        let doc = DocQuery::new(&document);
+        assert!(doc.find_matches_with_options("1", options()).is_empty(), "the generated list marker must not be searchable");
+    }
+
+    // -- anchors ------------------------------------------------------------
+
+    #[test]
+    fn anchor_lookup_finds_the_nearest_preceding_id() {
+        let document = layout("<p id='first'>alpha</p><p id='second'>beta</p>");
+        let doc = DocQuery::new(&document);
+        let beta = glyph_of(doc, 'b');
+
+        let anchor = doc.best_anchor_from_glyphs(beta, None).expect("an anchor precedes the second paragraph");
+        assert_eq!(doc.view().string(anchor), "second");
+    }
+
+    #[test]
+    fn anchor_lookup_respects_a_filter() {
+        let document = layout("<p id='first'>alpha</p><p id='second'>beta</p>");
+        let doc = DocQuery::new(&document);
+        let beta = glyph_of(doc, 'b');
+        let only_first: HashSet<u16> = [doc.view().lookup_string("first").expect("id is interned")].into_iter().collect();
+
+        let anchor = doc.best_anchor_from_glyphs(beta, Some(&only_first)).expect("the filtered anchor still resolves");
+        assert_eq!(doc.view().string(anchor), "first", "a filter restricts the answer to listed anchors");
+    }
+
+    #[test]
+    fn glyph_range_for_a_missing_anchor_is_none() {
+        let document = layout("<p id='here'>alpha</p>");
+        let doc = DocQuery::new(&document);
+        assert!(doc.glyph_range_for_anchor("absent").is_none());
+    }
+}
