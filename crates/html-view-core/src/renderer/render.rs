@@ -23,49 +23,6 @@ fn scaled_image_size(frag: &html::layout::RenderImageFragment) -> (f64, f64) {
     (size.width, size.height)
 }
 
-impl ColumnLayout {
-    /// Compute x-coordinate for a column given a local x offset
-    #[inline]
-    pub(crate) fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
-        self.col_gap + col_index * (self.col_width + self.col_gap) + local_x
-    }
-
-    pub(crate) fn resolve_point_at(&self, point: Point, elem_height: f64, mut render_state: RenderState, start_offset_y: f64) -> (Option<Point>, RenderState) {
-        // map document point to screen columns
-        let mut y = point.y + render_state.y_offset - start_offset_y;
-        let mut col_index = (y / self.size.height).floor(); // initial column based on vertical position
-        y -= col_index * self.size.height;
-
-        if y + elem_height > self.size.height {
-            // move to next column if element would overflow
-            col_index += 1.0;
-            render_state.y_offset += self.size.height - y;
-            y = 0.;
-        }
-
-        // Past all columns - stop rendering
-        if col_index >= self.col_count {
-            // stop when past last column
-            render_state.should_stop = true;
-            return (None, render_state);
-        }
-
-        render_state.col_index = col_index;
-        let x = self.col_x(col_index, point.x);
-        let resolved = Point::new(x, y);
-        (Some(resolved), render_state)
-    }
-
-    fn inline_metrics(&self) -> crate::InlineMetrics {
-        // compute inline decoration offset within column gap
-        const MIN_GAP: f64 = 20.0;
-        let effective_gap = (self.col_gap - MIN_GAP).max(0.0);
-        let half_gap = effective_gap / 2.0;
-        crate::InlineMetrics { offset: half_gap / 2.0 }
-    }
-
-}
-
 impl<'a> DocQuery<'a> {
     pub(crate) fn effective_line_height(self, line_idx: usize, fallback: f64) -> f64 {
         if line_idx >= self.text().line_count() {
@@ -167,7 +124,6 @@ impl RendererCore {
     pub(crate) fn paginator(&self) -> Paginator<'_> {
         Paginator::new(DocQuery::new(&self.document), &self.layout, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm)
     }
-
 
     fn paint_decorations(
         &self, cx: &mut impl Painter, start_offset_y: f64, breaks: &[(f64, f64)], line_positions: Option<&VisibleLinePositions>, foreground: bool, positioned_layer: bool, negative_positioned_layer: bool, independent_positioned_layer: bool,

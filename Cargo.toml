@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-load"]
+members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-load", "crates/html-view-types"]
 
 [workspace.package]
 repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
@@ -8,6 +8,7 @@ repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
 [workspace.dependencies]
 html-view-cfi = { path = "crates/html-view-cfi" }
 html-view-load = { path = "crates/html-view-load" }
+html-view-types = { path = "crates/html-view-types" }
 html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine" }
 kurbo = "0.11.3"
 peniko = "0.2.0"

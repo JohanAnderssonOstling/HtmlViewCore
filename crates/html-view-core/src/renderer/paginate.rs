@@ -136,82 +136,80 @@ impl BoundaryAnchors {
     }
 }
 
-impl ColumnLayout {
-    fn apply_keep_range_event(&self, event: KeepRangeEvent, start_offset_y: f64, render_state: &mut RenderState) {
-        let fragment_height = self.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return;
-        }
-        let height = (event.bottom - event.top).max(0.0);
-        if height > fragment_height + 0.01 {
-            return;
-        }
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        let local_top = projected_top.rem_euclid(fragment_height);
-        if local_top > 0.01 && local_top + height > fragment_height + 0.01 {
-            render_state.y_offset += fragment_height - local_top;
-        }
+fn apply_keep_range_event(layout: &ColumnLayout, event: KeepRangeEvent, start_offset_y: f64, render_state: &mut RenderState) {
+    let fragment_height = layout.size.height;
+    if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+        return;
+    }
+    let height = (event.bottom - event.top).max(0.0);
+    if height > fragment_height + 0.01 {
+        return;
+    }
+    let projected_top = event.top + render_state.y_offset - start_offset_y;
+    let local_top = projected_top.rem_euclid(fragment_height);
+    if local_top > 0.01 && local_top + height > fragment_height + 0.01 {
+        render_state.y_offset += fragment_height - local_top;
+    }
+}
+
+fn apply_forced_break_event(layout: &ColumnLayout, event: ForcedBreakEvent, start_offset_y: f64, previous_line: Option<LineScreen>, render_state: &mut RenderState) {
+    let fragment_height = layout.size.height;
+    if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+        return;
+    }
+    // At the beginning of a newly selected reader page the break has
+    // already been satisfied. Otherwise base the destination solely on
+    // the last column that contains actual content, never on margin-only
+    // document space.
+    let target_col = previous_line.map_or(0.0, |previous| match event.kind {
+        html::layout::RenderForcedBreak::Column => previous.col_index as f64 + 1.0,
+        html::layout::RenderForcedBreak::Page => layout.col_count,
+    });
+    let projected_top = event.top + render_state.y_offset - start_offset_y;
+    render_state.y_offset += target_col * fragment_height - projected_top;
+}
+
+fn apply_table_pagination_event(layout: &ColumnLayout, event: TablePaginationEvent, start_offset_y: f64, render_state: &mut RenderState) -> Option<RepeatedTableHeader> {
+    let fragment_height = layout.size.height;
+    if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
+        return None;
+    }
+    let projected_top = event.top + render_state.y_offset - start_offset_y;
+    let local_top = projected_top.rem_euclid(fragment_height);
+
+    let height = (event.bottom - event.top).max(0.0);
+    let crosses = local_top + height > fragment_height + 0.01;
+    let move_to_fresh_fragment = match event.kind {
+        // Moving the whole table is useful only when it can actually fit
+        // in a fresh fragment. An intrinsically oversized table should
+        // start in the available space; its row-group events below will
+        // choose safe boundaries as each row is encountered.
+        TablePaginationEventKind::WholeTable => height <= fragment_height && crosses,
+        // A forced break that already lands on a fragment boundary is
+        // satisfied; advancing again would skip an entire column.
+        TablePaginationEventKind::RowGroup => (event.forced && local_top > 0.01) || (height <= fragment_height && crosses),
+    };
+    if move_to_fresh_fragment {
+        render_state.y_offset += fragment_height - local_top;
     }
 
-    fn apply_forced_break_event(&self, event: ForcedBreakEvent, start_offset_y: f64, previous_line: Option<LineScreen>, render_state: &mut RenderState) {
-        let fragment_height = self.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return;
-        }
-        // At the beginning of a newly selected reader page the break has
-        // already been satisfied. Otherwise base the destination solely on
-        // the last column that contains actual content, never on margin-only
-        // document space.
-        let target_col = previous_line.map_or(0.0, |previous| match event.kind {
-            html::layout::RenderForcedBreak::Column => previous.col_index as f64 + 1.0,
-            html::layout::RenderForcedBreak::Page => self.col_count,
-        });
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        render_state.y_offset += target_col * fragment_height - projected_top;
+    let header = event.repeated_header?;
+    let header_height = header.bottom - header.top;
+    if header_height + height > fragment_height + 0.01 {
+        return None;
     }
-
-    fn apply_table_pagination_event(&self, event: TablePaginationEvent, start_offset_y: f64, render_state: &mut RenderState) -> Option<RepeatedTableHeader> {
-        let fragment_height = self.size.height;
-        if fragment_height <= 0.0 || event.top < start_offset_y - 0.01 {
-            return None;
-        }
-        let projected_top = event.top + render_state.y_offset - start_offset_y;
-        let local_top = projected_top.rem_euclid(fragment_height);
-
-        let height = (event.bottom - event.top).max(0.0);
-        let crosses = local_top + height > fragment_height + 0.01;
-        let move_to_fresh_fragment = match event.kind {
-            // Moving the whole table is useful only when it can actually fit
-            // in a fresh fragment. An intrinsically oversized table should
-            // start in the available space; its row-group events below will
-            // choose safe boundaries as each row is encountered.
-            TablePaginationEventKind::WholeTable => height <= fragment_height && crosses,
-            // A forced break that already lands on a fragment boundary is
-            // satisfied; advancing again would skip an entire column.
-            TablePaginationEventKind::RowGroup => (event.forced && local_top > 0.01) || (height <= fragment_height && crosses),
-        };
-        if move_to_fresh_fragment {
-            render_state.y_offset += fragment_height - local_top;
-        }
-
-        let header = event.repeated_header?;
-        let header_height = header.bottom - header.top;
-        if header_height + height > fragment_height + 0.01 {
-            return None;
-        }
-        let body_projected_top = event.top + render_state.y_offset - start_offset_y;
-        let body_local_top = body_projected_top.rem_euclid(fragment_height);
-        let starts_continuation = move_to_fresh_fragment || (body_local_top <= 0.01 && (start_offset_y >= header.bottom - 0.01 || body_projected_top >= fragment_height - 0.01));
-        if !starts_continuation {
-            return None;
-        }
-        let col_index = (body_projected_top / fragment_height).floor() as i32;
-        if col_index < 0 || col_index as f64 >= self.col_count {
-            return None;
-        }
-        render_state.y_offset += header_height;
-        Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
+    let body_projected_top = event.top + render_state.y_offset - start_offset_y;
+    let body_local_top = body_projected_top.rem_euclid(fragment_height);
+    let starts_continuation = move_to_fresh_fragment || (body_local_top <= 0.01 && (start_offset_y >= header.bottom - 0.01 || body_projected_top >= fragment_height - 0.01));
+    if !starts_continuation {
+        return None;
     }
+    let col_index = (body_projected_top / fragment_height).floor() as i32;
+    if col_index < 0 || col_index as f64 >= layout.col_count {
+        return None;
+    }
+    render_state.y_offset += header_height;
+    Some(RepeatedTableHeader { source_left: header.left, source_right: header.right, source_top: header.top, source_bottom: header.bottom, col_index })
 }
 
 impl<'a> DocQuery<'a> {
@@ -594,7 +592,7 @@ impl<'a> Paginator<'a> {
             while forced_break_events.get(forced_break_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
                 let previous_line = last_line.and_then(|line_idx| positions.get(line_idx));
-                self.layout.apply_forced_break_event(forced_break_events[forced_break_event_idx], start_offset_y, previous_line, &mut render_state);
+                apply_forced_break_event(self.layout, forced_break_events[forced_break_event_idx], start_offset_y, previous_line, &mut render_state);
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {
                     offset_breaks.push((forced_break_events[forced_break_event_idx].top, render_state.y_offset));
                 }
@@ -602,7 +600,7 @@ impl<'a> Paginator<'a> {
             }
             while keep_events.get(keep_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
-                self.layout.apply_keep_range_event(keep_events[keep_event_idx], start_offset_y, &mut render_state);
+                apply_keep_range_event(self.layout, keep_events[keep_event_idx], start_offset_y, &mut render_state);
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {
                     offset_breaks.push((keep_events[keep_event_idx].top, render_state.y_offset));
                 }
@@ -610,7 +608,7 @@ impl<'a> Paginator<'a> {
             }
             while table_events.get(table_event_idx).is_some_and(|event| event.trigger_line == line_idx) {
                 let previous_offset = render_state.y_offset;
-                if let Some(repeated_header) = self.layout.apply_table_pagination_event(table_events[table_event_idx], start_offset_y, &mut render_state) {
+                if let Some(repeated_header) = apply_table_pagination_event(self.layout, table_events[table_event_idx], start_offset_y, &mut render_state) {
                     repeated_table_headers.push(repeated_header);
                 }
                 if (render_state.y_offset - previous_offset).abs() > 1e-6 {

@@ -9,6 +9,7 @@ repository.workspace = true
 html.workspace = true
 html-view-cfi.workspace = true
 html-view-load.workspace = true
+html-view-types.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 unicode-normalization.workspace = true
