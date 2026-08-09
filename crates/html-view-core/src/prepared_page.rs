@@ -104,3 +104,123 @@ impl PreparedPageCache {
         self.pages.iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(page_offset: u64) -> FrameGeometryCacheKey {
+        FrameGeometryCacheKey {
+            layout_revision: 1,
+            viewport_width_bits: 800f64.to_bits(),
+            viewport_height_bits: 600f64.to_bits(),
+            column_width_bits: 400f64.to_bits(),
+            column_gap_bits: 20f64.to_bits(),
+            column_count: 2,
+            scale_bits: 1f64.to_bits(),
+            page_offset_bits: page_offset,
+            direction: 0,
+        }
+    }
+
+    fn page(key: FrameGeometryCacheKey, end_line: Option<usize>) -> PreparedPage {
+        let mut frame = VisibleFrame::default();
+        frame.current_page_end_line = end_line;
+        PreparedPage { key, frame, reached_end: false, next_start_offset_y: 0.0 }
+    }
+
+    #[test]
+    fn taking_a_page_removes_it() {
+        let mut cache = PreparedPageCache::new();
+        cache.insert(page(key(1), None));
+
+        assert!(cache.contains(key(1)));
+        assert!(cache.take(key(1)).is_some());
+        assert!(!cache.contains(key(1)), "a page is consumed by being taken");
+        assert!(cache.take(key(1)).is_none());
+    }
+
+    #[test]
+    fn a_page_for_different_geometry_is_not_reused() {
+        let mut cache = PreparedPageCache::new();
+        cache.insert(page(key(1), None));
+
+        let mut other = key(1);
+        other.scale_bits = 2f64.to_bits();
+        assert!(!cache.contains(other), "geometry that would paginate differently must not hit");
+        assert!(cache.take(other).is_none());
+    }
+
+    #[test]
+    fn the_oldest_page_is_evicted_past_capacity() {
+        let mut cache = PreparedPageCache::new();
+        for offset in 0..CAPACITY as u64 + 1 {
+            cache.insert(page(key(offset), None));
+        }
+
+        assert!(!cache.contains(key(0)), "the oldest page is evicted");
+        for offset in 1..CAPACITY as u64 + 1 {
+            assert!(cache.contains(key(offset)), "page {offset} should still be cached");
+        }
+    }
+
+    #[test]
+    fn reinserting_a_key_replaces_rather_than_duplicates() {
+        let mut cache = PreparedPageCache::new();
+        cache.insert(page(key(1), Some(10)));
+        cache.insert(page(key(1), Some(20)));
+
+        let restored = cache.take(key(1)).expect("the page is cached");
+        assert_eq!(restored.frame.current_page_end_line, Some(20), "the newer page wins");
+        assert!(cache.take(key(1)).is_none(), "no duplicate is left behind");
+    }
+
+    #[test]
+    fn insertion_discards_backend_shaping_handles() {
+        let mut cache = PreparedPageCache::new();
+        let mut prepared = page(key(1), None);
+        prepared.frame.native_shape_failures.insert(3);
+
+        cache.insert(prepared);
+
+        let restored = cache.take(key(1)).expect("the page is cached");
+        assert!(restored.frame.shaped_lines.is_empty(), "shaped lines index backend-owned storage that a cached page outlives");
+        assert!(restored.frame.native_shape_failures.is_empty());
+        assert!(restored.frame.line_shape_key.is_none());
+    }
+
+    #[test]
+    fn a_page_can_be_found_by_the_line_it_ends_on() {
+        let mut cache = PreparedPageCache::new();
+        cache.insert(page(key(1), Some(42)));
+
+        // Backward navigation knows the line it wants to land on, not the
+        // offset that produces it, so page_offset_bits must not participate.
+        let mut current = key(1);
+        current.page_offset_bits = 999;
+        assert!(cache.take_ending_at(42, current).is_some());
+    }
+
+    #[test]
+    fn ending_line_lookup_still_respects_geometry() {
+        let mut cache = PreparedPageCache::new();
+        cache.insert(page(key(1), Some(42)));
+
+        let mut different = key(1);
+        different.column_count = 3;
+        assert!(cache.take_ending_at(42, different).is_none(), "a page laid out for another column count cannot be reused");
+        assert!(cache.take_ending_at(41, key(1)).is_none(), "the end line must match exactly");
+    }
+
+    #[test]
+    fn prefetch_is_claimed_once_per_key() {
+        let mut cache = PreparedPageCache::new();
+
+        assert!(!cache.claim_scheduled(key(1)), "nothing was scheduled yet");
+        cache.mark_scheduled(key(1));
+        assert!(cache.claim_scheduled(key(1)), "the scheduled prefetch runs");
+        assert!(!cache.claim_scheduled(key(1)), "and does not run twice");
+        assert!(cache.is_prefetched(key(1)), "the page is now marked prefetched, so it is not rescheduled");
+        assert!(!cache.is_prefetched(key(2)));
+    }
+}

@@ -175,3 +175,133 @@ impl TocAnchors {
         self.filter = (!filter.is_empty()).then_some(filter);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{RecordingHost, availability};
+
+    /// Any event carrying the value is fine; these tests are about the
+    /// compare-and-store, not the payload.
+    fn event(value: i32) -> RendererEvent {
+        RendererEvent::SpeakableText(value.to_string())
+    }
+
+    #[test]
+    fn debounced_emits_only_when_the_value_changes() {
+        let host = RecordingHost::default();
+        let mut signal = Debounced::default();
+
+        assert!(signal.emit_if_changed(7, &host, event), "the first value has nothing to match");
+        assert!(!signal.emit_if_changed(7, &host, event), "an unchanged value stays silent");
+        assert!(signal.emit_if_changed(8, &host, event));
+        assert_eq!(host.count(), 2);
+    }
+
+    #[test]
+    fn debounced_re_emits_an_unchanged_value_after_invalidate() {
+        let host = RecordingHost::default();
+        let mut signal = Debounced::default();
+        signal.emit_if_changed(7, &host, event);
+        host.clear();
+
+        signal.emit_if_changed(7, &host, event);
+        assert_eq!(host.count(), 0, "still deduplicated");
+
+        signal.invalidate();
+        signal.emit_if_changed(7, &host, event);
+        assert_eq!(host.count(), 1, "invalidate forces the next value through");
+    }
+
+    fn location(doc: usize) -> Location {
+        (doc, None)
+    }
+
+    #[test]
+    fn history_reports_availability_from_the_cursor() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+
+        history.emit_availability(&host);
+        assert_eq!(availability(&host), vec![(false, false)], "an empty stack goes nowhere");
+
+        history.push(location(0), &host);
+        history.push(location(1), &host);
+        assert_eq!(availability(&host).last().copied(), Some((true, false)), "at the newest entry, only back is available");
+
+        history.step(-1, &host);
+        history.emit_availability(&host);
+        assert_eq!(availability(&host).last().copied(), Some((false, true)), "at the oldest entry, only forward is available");
+    }
+
+    #[test]
+    fn history_ignores_a_push_of_the_current_entry() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+        history.push(location(0), &host);
+        history.push(location(0), &host);
+        history.push(location(0), &host);
+
+        assert!(history.is_at_newest());
+        assert!(history.step(-1, &host).is_none(), "repeated pushes of one location must not build a stack to walk back through");
+    }
+
+    #[test]
+    fn stepping_back_then_pushing_discards_the_forward_entries() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+        history.push(location(0), &host);
+        history.push(location(1), &host);
+        history.push(location(2), &host);
+
+        assert_eq!(history.step(-1, &host), Some(location(1)));
+        history.push(location(9), &host);
+
+        assert!(history.is_at_newest(), "the new branch is the newest entry");
+        assert_eq!(history.step(-1, &host), Some(location(1)), "the discarded branch is unreachable");
+        assert_eq!(history.step(-1, &host), Some(location(0)));
+    }
+
+    #[test]
+    fn stepping_past_either_end_leaves_the_cursor_alone() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+        history.push(location(0), &host);
+        history.push(location(1), &host);
+
+        assert!(history.step(1, &host).is_none(), "already at the newest entry");
+        assert_eq!(history.current(), Some(&location(1)), "a refused step must not move the cursor");
+
+        history.step(-1, &host);
+        assert!(history.step(-1, &host).is_none(), "already at the oldest entry");
+        assert_eq!(history.current(), Some(&location(0)));
+    }
+
+    #[test]
+    fn history_availability_is_deduplicated_across_repeated_queries() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+        history.push(location(0), &host);
+        host.clear();
+
+        history.emit_availability(&host);
+        history.emit_availability(&host);
+        history.emit_availability(&host);
+        assert!(availability(&host).is_empty(), "an unchanged availability pair must not be re-emitted");
+    }
+
+    #[test]
+    fn toc_anchor_strings_are_padded_to_the_spine_length() {
+        let mut anchors = TocAnchors::default();
+        anchors.set_strings_by_doc(vec![vec!["a".to_owned()]], 3);
+        assert_eq!(anchors.strings_by_doc.len(), 3, "documents without listed anchors still need a slot to index");
+        assert!(anchors.filter().is_none(), "no filter exists until it is rebuilt against a document");
+    }
+
+    #[test]
+    fn toc_anchor_strings_longer_than_the_spine_are_left_alone() {
+        let mut anchors = TocAnchors::default();
+        anchors.set_strings_by_doc(vec![vec![], vec![], vec![], vec![]], 2);
+        assert_eq!(anchors.strings_by_doc.len(), 4, "padding must not truncate");
+    }
+}

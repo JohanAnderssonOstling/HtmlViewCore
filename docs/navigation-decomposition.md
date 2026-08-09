@@ -131,3 +131,40 @@ forwarders that mutate `nav` while reading the document; `nav_cx` returning
 `(&mut NavigationState, NavContext)` as disjoint field borrows resolves it.
 
 117 tests pass; warning count unchanged at 4.
+
+## Unit tests for the extracted components
+
+The refactor argued repeatedly that these components became testable in
+isolation, but nothing had exercised them directly: test volume went from 2874
+to 2888 lines across ten commits, and that difference was one changed
+assertion. The renderer-level suite covered them only incidentally.
+
+31 unit tests added, none of which construct a pipeline, provider or glyph
+shaper:
+
+| component | covers |
+| --- | --- |
+| `Debounced` | suppression, re-emission after `invalidate` |
+| `LocationHistory` | availability from the cursor, truncate-on-push after stepping back, refused steps at both ends, repeated pushes of one location |
+| `TocAnchors` | spine-length padding without truncation |
+| `PreparedPageCache` | eviction, replace-not-duplicate, geometry mismatch, end-line lookup, prefetch claim protocol, shaping-handle discard |
+| `DocumentCache` | footnote LRU, and the capacity-zero asymmetry where previews survive but documents do not |
+| `progress_at` / `document_at_fraction` | location numbering, empty publication, and a round-trip property between the two |
+
+`reading_progress` was split so the arithmetic no longer needs a laid-out
+document: `progress_at` takes the in-document fraction, and `reading_progress`
+supplies it from the glyph count.
+
+### Defect found
+
+The round-trip property failed immediately at fraction `1.0`. In
+`document_at_fraction` the search loop never breaks for the final document, so
+the accumulator ends up including that document's own length and the result is
+`(last_doc, 0.0)` instead of `(last_doc, 1.0)` -- dragging a progress slider to
+100% lands at the start of the last chapter rather than its end.
+
+Pre-existing: the same logic was inline in `set_progress_fraction` before the
+extraction (verified against `4011bc1`). Fixed by locating the document first
+and summing what precedes it, rather than accumulating during the search.
+
+148 tests pass; warning count unchanged at 4.

@@ -11,6 +11,10 @@
 use crate::navigation::{Location, NavContext, NavView};
 use crate::{DocAnchor, NavigationState, PaintDirection, RendererEvent};
 
+/// Characters per reported reading location. Fixed-size spans keep location
+/// numbers stable as font size and column width change.
+const LOCATION_CHARS: u64 = 150;
+
 impl NavigationState {
     pub(crate) fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
         self.document_uris.iter().position(|uri| uri == candidate).or_else(|| self.document_uris.iter().position(|uri| uri.ends_with(candidate)))
@@ -268,13 +272,19 @@ impl NavigationState {
     /// number. Locations are fixed-size character spans, so they stay stable as
     /// font size and column width change.
     fn reading_progress(&self, cx: NavView<'_>, glyph: Option<u32>) -> (f32, u64, u64) {
-        const LOCATION_CHARS: u64 = 150;
+        let glyph_count = cx.doc.text().glyph_count().max(1) as f64;
+        self.progress_at(glyph.unwrap_or(0) as f64 / glyph_count)
+    }
+
+    /// The publication-wide position of `in_document_fraction` through the
+    /// current document. Split from [`Self::reading_progress`] so the mapping
+    /// can be exercised without a laid-out document.
+    pub(crate) fn progress_at(&self, in_document_fraction: f64) -> (f32, u64, u64) {
         let current_doc = self.current_doc_index;
         let total_chars = self.document_text_lengths.iter().sum::<u64>().max(1);
         let preceding_chars = self.document_text_lengths.iter().take(current_doc).sum::<u64>();
         let current_length = self.document_text_lengths.get(current_doc).copied().unwrap_or(1);
-        let glyph_count = cx.doc.text().glyph_count().max(1) as f64;
-        let in_document = ((glyph.unwrap_or(0) as f64 / glyph_count).clamp(0.0, 1.0) * current_length as f64) as u64;
+        let in_document = (in_document_fraction.clamp(0.0, 1.0) * current_length as f64) as u64;
         let current_chars = (preceding_chars + in_document).min(total_chars);
         let location = (current_chars / LOCATION_CHARS + 1).max(1);
         let total_locations = total_chars.div_ceil(LOCATION_CHARS).max(1);
@@ -286,16 +296,119 @@ impl NavigationState {
     pub(crate) fn document_at_fraction(&self, fraction: f32) -> (usize, f64) {
         let total = self.document_text_lengths.iter().sum::<u64>().max(1);
         let target = (fraction.clamp(0.0, 1.0) as f64 * total as f64) as u64;
-        let mut preceding = 0_u64;
-        let mut doc = self.document_text_lengths.len().saturating_sub(1);
-        for (index, length) in self.document_text_lengths.iter().copied().enumerate() {
-            if target < preceding.saturating_add(length) {
-                doc = index;
-                break;
-            }
-            preceding = preceding.saturating_add(length);
-        }
+        // The last document owns the end of the publication: a target equal to
+        // the total character count belongs at its end, not past it.
+        let mut running = 0_u64;
+        let doc = self
+            .document_text_lengths
+            .iter()
+            .copied()
+            .position(|length| {
+                running = running.saturating_add(length);
+                target < running
+            })
+            .unwrap_or_else(|| self.document_text_lengths.len().saturating_sub(1));
+        let preceding: u64 = self.document_text_lengths.iter().take(doc).sum();
         let doc_length = self.document_text_lengths.get(doc).copied().unwrap_or(1).max(1);
-        (doc, target.saturating_sub(preceding) as f64 / doc_length as f64)
+        (doc, (target.saturating_sub(preceding) as f64 / doc_length as f64).min(1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nav(lengths: Vec<u64>, current_doc: usize) -> NavigationState {
+        NavigationState {
+            document_uris: lengths.iter().enumerate().map(|(index, _)| format!("doc{index}.html")).collect(),
+            document_text_lengths: lengths,
+            current_doc_index: current_doc,
+            nav_anchor_glyph: None,
+            pending_nav_anchor_update: false,
+            signals: Default::default(),
+            history: Default::default(),
+            toc_anchors: Default::default(),
+        }
+    }
+
+    #[test]
+    fn progress_accumulates_the_lengths_of_preceding_documents() {
+        let state = nav(vec![300, 300, 300], 1);
+
+        let (start, _, _) = state.progress_at(0.0);
+        let (end, _, _) = state.progress_at(1.0);
+        assert!((start - 1.0 / 3.0).abs() < 1e-6, "the second of three equal documents starts a third of the way in");
+        assert!((end - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn location_numbers_are_one_based_and_span_fixed_character_counts() {
+        let state = nav(vec![LOCATION_CHARS * 4], 0);
+
+        assert_eq!(state.progress_at(0.0).1, 1, "locations are numbered from one");
+        assert_eq!(state.progress_at(1.0).2, 4, "four locations of LOCATION_CHARS each");
+        assert_eq!(state.progress_at(0.5).1, 3, "halfway through is the third location");
+    }
+
+    #[test]
+    fn an_empty_publication_reports_one_location_rather_than_dividing_by_zero() {
+        let state = nav(vec![], 0);
+        let (fraction, location, total) = state.progress_at(0.0);
+        assert_eq!((location, total), (1, 1));
+        assert!(fraction.is_finite());
+    }
+
+    #[test]
+    fn document_at_fraction_inverts_progress_at() {
+        let lengths = vec![500, 1500, 250, 3000];
+        for (doc, _) in lengths.iter().enumerate() {
+            let state = nav(lengths.clone(), doc);
+            for step in 0..=10 {
+                let within = step as f64 / 10.0;
+                let (fraction, _, _) = state.progress_at(within);
+                let (round_tripped_doc, round_tripped_within) = state.document_at_fraction(fraction);
+
+                // The forward mapping truncates to whole characters, so a
+                // position at the very end of a document can land on the start
+                // of the next one. Both readings are the same place.
+                let same_place = round_tripped_doc == doc || (round_tripped_doc == doc + 1 && within > 0.99 && round_tripped_within < 0.01);
+                assert!(same_place, "doc {doc} at {within} round-tripped to doc {round_tripped_doc} at {round_tripped_within}");
+                if round_tripped_doc == doc {
+                    assert!((round_tripped_within - within).abs() < 0.01, "doc {doc} at {within} round-tripped to {round_tripped_within}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn document_at_fraction_clamps_out_of_range_input() {
+        let state = nav(vec![100, 100], 0);
+        assert_eq!(state.document_at_fraction(-5.0).0, 0);
+        assert_eq!(state.document_at_fraction(5.0).0, 1, "past the end lands in the last document");
+    }
+
+    #[test]
+    fn document_at_fraction_survives_an_empty_publication() {
+        let state = nav(vec![], 0);
+        let (doc, within) = state.document_at_fraction(0.5);
+        assert_eq!(doc, 0);
+        assert!(within.is_finite());
+    }
+
+    #[test]
+    fn fragment_part_treats_an_empty_fragment_as_absent() {
+        assert_eq!(NavigationState::fragment_part(""), None);
+        assert_eq!(NavigationState::fragment_part("section-1"), Some("section-1".to_owned()));
+    }
+
+    #[test]
+    fn spine_lookup_prefers_an_exact_uri_over_a_suffix_match() {
+        let state = nav(vec![1, 1, 1], 0);
+        let mut state = state;
+        state.document_uris = vec!["a/chapter.html".to_owned(), "chapter.html".to_owned(), "b/chapter.html".to_owned()];
+
+        assert_eq!(state.find_doc_index_by_uri_or_suffix("chapter.html"), Some(1), "an exact match wins over the earlier suffix match");
+        assert_eq!(state.find_doc_index_by_uri_or_suffix("b/chapter.html"), Some(2));
+        assert_eq!(state.find_doc_index_by_uri_or_suffix("missing.html"), None);
     }
 }

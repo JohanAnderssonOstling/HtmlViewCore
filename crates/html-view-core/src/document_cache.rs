@@ -96,3 +96,71 @@ impl DocumentCache {
         self.footnotes.contains_key(&doc_index)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(id: &str) -> FootnoteDocumentIndex {
+        FootnoteDocumentIndex::parse(&format!("<p id='{id}'>note</p>"))
+    }
+
+    fn cache(capacity: usize) -> DocumentCache {
+        DocumentCache::new(capacity, 0, index("doc0"))
+    }
+
+    #[test]
+    fn the_starting_document_is_indexed_for_footnotes() {
+        let cache = cache(3);
+        assert!(cache.has_footnotes(0));
+        assert!(!cache.has_footnotes(1));
+    }
+
+    #[test]
+    fn footnote_indexes_evict_oldest_first() {
+        let mut cache = cache(2);
+        cache.insert_footnotes(1, index("doc1"));
+        cache.insert_footnotes(2, index("doc2"));
+
+        assert!(!cache.has_footnotes(0), "the oldest index is evicted at capacity");
+        assert!(cache.has_footnotes(1));
+        assert!(cache.has_footnotes(2));
+    }
+
+    #[test]
+    fn reinserting_a_footnote_index_refreshes_its_position() {
+        let mut cache = cache(2);
+        cache.insert_footnotes(0, index("doc0-again"));
+        cache.insert_footnotes(1, index("doc1"));
+
+        assert!(cache.has_footnotes(0), "reinsertion moves an entry to the newest slot rather than duplicating it");
+        assert!(cache.has_footnotes(1));
+    }
+
+    #[test]
+    fn footnote_previews_survive_disabled_document_caching() {
+        // Capacity zero disables document caching, but footnote previews must
+        // keep working, so their bound floors at one rather than collapsing.
+        let mut cache = cache(0);
+        assert!(cache.is_disabled());
+        assert!(cache.has_footnotes(0));
+
+        cache.insert_footnotes(1, index("doc1"));
+        assert!(cache.has_footnotes(1), "the current document's notes stay available");
+        assert!(!cache.has_footnotes(0), "but only one at a time");
+    }
+
+    #[test]
+    fn a_disabled_cache_stores_no_documents() {
+        let mut cache = cache(0);
+        assert!(cache.take_document(0).is_none());
+    }
+
+    #[test]
+    fn footnote_lookup_returns_the_parsed_document() {
+        let cache = cache(2);
+        let indexed = cache.footnotes(0).expect("the starting document is indexed");
+        let selector = scraper::Selector::parse("#doc0").expect("static selector must parse");
+        assert!(indexed.document.select(&selector).next().is_some(), "the stored index must be the parsed source, not an empty document");
+    }
+}

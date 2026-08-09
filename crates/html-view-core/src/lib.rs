@@ -23,6 +23,8 @@ pub mod cfi;
 mod doc_query;
 mod document_cache;
 mod navigation;
+#[cfg(test)]
+mod test_support;
 
 #[path = "renderer/navigate.rs"]
 mod navigate;
