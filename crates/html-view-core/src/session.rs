@@ -39,8 +39,38 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// size the surface from its `content_height`.
     ///
     /// [`Painter`]: crate::Painter
-    pub fn note_scene(&self, note: &crate::LaidOutDocument) -> Option<html::render::RenderScene> {
-        self.core.note_scene(note)
+    pub fn note_scene(&self) -> Option<html::render::RenderScene> {
+        self.core.note_scene()
+    }
+
+    /// Starts a selection inside the open note. Positions are relative to the
+    /// note's own origin, as the host draws it.
+    pub fn note_pointer_down(&mut self, position: Point, semantic_selection: bool) -> bool {
+        self.core.note_view_mut().is_some_and(|note| note.begin_selection_at(position, semantic_selection))
+    }
+
+    pub fn note_pointer_move(&mut self, position: Point, semantic_selection: bool) -> bool {
+        self.core.note_view_mut().is_some_and(|note| note.update_selection_at(position, semantic_selection))
+    }
+
+    pub fn note_pointer_up(&mut self) -> bool {
+        self.core.note_view_mut().map(|note| note.finish_selection()).is_some()
+    }
+
+    /// Text currently selected inside the note, for the host to copy.
+    pub fn note_selection_text(&self) -> Option<String> {
+        self.core.note_view()?.selection_text()
+    }
+
+    /// Paints the note's selection highlight. The note's own content comes
+    /// from [`Self::note_scene`]; this goes over it.
+    pub fn paint_note_selection(&self, painter: &mut impl crate::Painter) {
+        self.core.paint_note_selection(painter);
+    }
+
+    /// Drops the open note, clearing anything selected in it.
+    pub fn close_note(&mut self) {
+        self.core.close_note();
     }
 
     /// Builds the preview a note reference would open, without waiting for the

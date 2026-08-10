@@ -39,10 +39,40 @@ impl RendererCore {
     /// decorations and images alike, content in paint order, and per-line
     /// overflow clipping. A note is an ordinary laid-out document, so it is
     /// drawn by the same machinery rather than by a second painter here.
-    pub(crate) fn note_scene(&self, note: &crate::LaidOutDocument) -> Option<html::render::RenderScene> {
+    pub(crate) fn note_scene(&self) -> Option<html::render::RenderScene> {
+        let note = &self.note.as_ref()?.document;
         let width = self.note_layout_width();
         let options = html::render::FragmentRenderOptions::new(width, None).ok()?.with_typography(self.root_font_size.max(1.0) as u32, self.root_font_size as f64).ok()?;
         Some(html::render::RenderScene::for_document(note, &options))
+    }
+
+    pub(crate) fn note_view(&self) -> Option<&crate::document_view::DocumentView> {
+        self.note.as_ref()
+    }
+
+    pub(crate) fn note_view_mut(&mut self) -> Option<&mut crate::document_view::DocumentView> {
+        self.note.as_mut()
+    }
+
+    pub(crate) fn close_note(&mut self) {
+        self.note = None;
+    }
+
+    /// Paints the open note's selection highlight over its content. The note
+    /// is framed whole, so the overlay walks every line it has.
+    pub(crate) fn paint_note_selection(&self, cx: &mut impl Painter) {
+        let Some(note) = self.note.as_ref() else { return };
+        PagePainter {
+            geo: note.geometry(),
+            images: &self.image_pipeline,
+            reader_palette: self.reader_palette,
+            interaction_palette: self.interaction_palette,
+            highlight: &Default::default(),
+            annotations: &Default::default(),
+            media_overlay: &Default::default(),
+            selection: note.selection_view(),
+        }
+        .paint_interaction_overlay(cx);
     }
 
     /// Width a note is laid out and shown at. The host decides; the reading

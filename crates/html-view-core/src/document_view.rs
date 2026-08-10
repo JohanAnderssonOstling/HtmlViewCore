@@ -51,11 +51,68 @@ impl DocumentView {
     /// displayed this way, and needs a frame for the same reasons the page
     /// does -- hit testing and selection are geometry, not painting.
     pub(crate) fn framed_whole(mut self) -> Self {
-        let line_count = self.doc().text().line_count();
+        let mut positions = crate::VisibleLinePositions::with_buffer(0, Vec::new());
+        let line_count = {
+            let text = self.doc().text();
+            for line_idx in 0..text.line_count() {
+                let Some(line) = text.line(line_idx) else { continue };
+                positions.push(crate::LineScreen { point: line.point(), col_index: 0 });
+            }
+            text.line_count()
+        };
         self.layout.col_count = 1.0;
         self.frame.current_page_start_line = Some(0);
         self.frame.current_page_end_line = Some(line_count);
         self.frame.paint_start_offset_y = 0.0;
+        // Selection and hit testing read line positions from the frame, so a
+        // document shown whole records every line at its own layout point.
+        self.frame.last_line_positions = positions;
         self
+    }
+
+    /// Starts a selection at `position`. The mechanics are the same wherever a
+    /// document is shown; what the page does *around* them -- emitting a CFI,
+    /// repainting an overlay -- stays with the page.
+    pub(crate) fn begin_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
+        let Some(glyph_idx) = self.hit_test_glyph(position) else {
+            return false;
+        };
+        self.selection.selection_anchor = Some(glyph_idx);
+        self.selection.selection_active = Some(glyph_idx);
+        self.selection.is_selecting = true;
+        self.selection.semantic_selection = semantic_selection;
+        self.selection.pending_link_glyph = Some(glyph_idx);
+        true
+    }
+
+    pub(crate) fn update_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
+        if !self.selection.is_selecting {
+            return false;
+        }
+        self.selection.semantic_selection |= semantic_selection;
+        let Some(glyph_idx) = self.hit_test_glyph(position) else {
+            return false;
+        };
+        self.selection.selection_active = Some(glyph_idx);
+        if self.selection.selection_anchor != self.selection.selection_active {
+            self.selection.pending_link_glyph = None;
+        }
+        true
+    }
+
+    /// Ends a selection and reports the glyph that still counts as a click.
+    pub(crate) fn finish_selection(&mut self) -> Option<u32> {
+        self.selection.is_selecting = false;
+        let click = match (self.selection.selection_anchor, self.selection.selection_active, self.selection.pending_link_glyph) {
+            (Some(anchor), Some(active), Some(pending)) if anchor == active && pending == anchor => Some(anchor),
+            _ => None,
+        };
+        self.selection.pending_link_glyph = None;
+        click
+    }
+
+    pub(crate) fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.selection_view().range()?;
+        self.selection_view().build_semantic_selection_text(start, end).0
     }
 }

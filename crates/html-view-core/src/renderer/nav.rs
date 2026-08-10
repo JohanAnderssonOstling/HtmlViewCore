@@ -299,6 +299,9 @@ impl RendererCore {
             None => self.document_cache.document_mut(doc)?.session.layout_note(fragment, constraints, glyph_shaper),
         }?;
         let blocks = Self::note_preview_blocks(&note);
+        // Held as a view of its own, so selecting and hit testing inside it go
+        // through the same code the page uses.
+        self.note = Some(crate::document_view::DocumentView::new(note.clone(), crate::ColumnLayout { col_width: width, base_col_width: width, ..self.page.layout }).framed_whole());
 
         if let Some(loaded) = freshly_loaded {
             self.document_cache.insert_document(doc, CachedDocument { session: loaded.session, inputs: loaded.inputs, document: loaded.document });
@@ -2355,7 +2358,7 @@ mod tests {
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
         let preview = core.footnote_preview(&mut shaper, "#note").expect("the note must preview");
 
-        let scene = core.note_scene(&preview.note).expect("a previewed note must form a scene");
+        let scene = core.note_scene().expect("a previewed note must form a scene");
         let mut painter = RecordingPainter::default();
         scene.paint(&mut painter);
 
@@ -2364,6 +2367,29 @@ mod tests {
         // glyphs for it at all.
         assert!(!painter.glyphs.is_empty(), "a previewed note must paint its own glyphs");
         assert!(scene.content_height() > 0.0, "a note's scene must have height");
+    }
+
+    #[test]
+    fn text_can_be_selected_inside_an_open_note() {
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Selectable note body</p></aside></body></html>";
+        let (mut core, mut shaper) = pagination_core(html, Size::new(300.0, 300.0), 1);
+        core.footnote_preview(&mut shaper, "#note").expect("the note must preview");
+
+        // A note is a document view, so selection is the page's code applied
+        // to it rather than a second implementation.
+        let note = core.note_view().expect("an open note is held as a view");
+        let last_line = note.doc().text().line_count().saturating_sub(1);
+        let bottom = note.doc().text().line(last_line).map(|line| line.point().y + line.height()).unwrap_or(10.0);
+
+        assert!(core.note_view_mut().expect("open note").begin_selection_at(Point::new(1.0, 1.0), false), "a press inside the note starts a selection");
+        assert!(core.note_view_mut().expect("open note").update_selection_at(Point::new(280.0, bottom - 1.0), false), "dragging extends it");
+        core.note_view_mut().expect("open note").finish_selection();
+
+        let selected = core.note_view().expect("open note").selection_text().expect("the note yields selected text");
+        assert!(selected.contains("Selectable"), "the note's own text is selected, not the page's: {selected:?}");
+
+        core.close_note();
+        assert!(core.note_view().is_none(), "closing the note drops what was selected in it");
     }
 
     #[test]

@@ -182,6 +182,9 @@ pub(crate) struct RendererCore {
     /// The document being read, with the geometry, frame and selection that
     /// belong to it. A note shown on its own is the same kind of thing.
     page: DocumentView,
+    /// The note currently shown beside the page, if any. Selecting and hit
+    /// testing work here through the same code the page uses.
+    note: Option<DocumentView>,
     pipeline_session: Engine,
     pipeline_inputs: PipelineInputs,
     image_pipeline: ImagePipeline,
@@ -346,6 +349,7 @@ impl RendererCore {
         Self {
             host,
             page: DocumentView::new(document, layout),
+            note: None,
             pipeline_session: loaded.session,
             pipeline_inputs: loaded.inputs,
             image_pipeline,
