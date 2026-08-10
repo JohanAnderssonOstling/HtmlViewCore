@@ -58,6 +58,13 @@ impl DocumentCache {
         self.documents.remove(&doc_index)
     }
 
+    /// Drops every cached document. Used when a setting changes what a laid-out
+    /// document contains, so cached ones no longer describe the same book.
+    pub(crate) fn clear(&mut self) {
+        self.documents.clear();
+        self.document_order.clear();
+    }
+
     /// Borrows a cached document without disturbing its position in the LRU.
     /// Note previews read through this: they consult a document the reader may
     /// still navigate to, and must not evict or claim it.

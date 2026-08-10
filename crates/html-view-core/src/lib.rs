@@ -514,6 +514,21 @@ impl RendererCore {
                     }
                 }
             }
+            RendererCommand::SetNoteDisplay(display) => {
+                if self.note_display != display {
+                    self.note_display = display;
+                    let mut inputs = self.pipeline_inputs.clone();
+                    inputs.note_flow = load::note_flow_for(display);
+                    // Note bodies are held back by suppressing their boxes, so
+                    // a switch has to rebuild the box tree, not just repaint.
+                    // Documents cached under the previous mode disagree with
+                    // the new one and cannot be navigated back into.
+                    self.document_cache.clear();
+                    if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
+                        self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
+                    }
+                }
+            }
             RendererCommand::SetImageSizingPolicy(policy) => {
                 let mut inputs = self.pipeline_inputs.clone();
                 if inputs.layout.image_sizing_policy != policy {

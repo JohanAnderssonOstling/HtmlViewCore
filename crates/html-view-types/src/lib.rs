@@ -171,6 +171,9 @@ pub enum RendererCommand {
     SetFontSize(f32),
     SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides),
     SetImageSizingPolicy(html::pipeline::ImageSizingPolicy),
+    /// Switches how notes are presented. This re-lays-out the document, since
+    /// whether a note occupies the reading flow decides what boxes exist.
+    SetNoteDisplay(NoteDisplay),
     SetTextCompositionPolicy(html::pipeline::TextCompositionPolicy),
     SetReaderPaintPalette(ReaderPaintPalette),
     SetScale(f64),

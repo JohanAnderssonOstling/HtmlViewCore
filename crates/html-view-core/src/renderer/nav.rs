@@ -2323,6 +2323,26 @@ mod tests {
     }
 
     #[test]
+    fn switching_note_display_relays_out_the_document() {
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside><p>Continues</p></body></html>";
+        let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
+
+        let flow_text = |core: &RendererCore| {
+            let text = core.document.render_view().text();
+            (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>()
+        };
+        assert!(!flow_text(&core).contains("zebra"), "the note starts held back for a popup");
+
+        core.apply(&mut shaper, crate::RendererCommand::SetNoteDisplay(crate::NoteDisplay::AsAuthored));
+
+        assert!(flow_text(&core).contains("zebra"), "switching to as-authored must rebuild the document with the note in flow");
+        assert_eq!(core.footnote_preview(&mut shaper, "#note"), None, "and the reference stops opening a popup");
+
+        core.apply(&mut shaper, crate::RendererCommand::SetNoteDisplay(crate::NoteDisplay::Popup));
+        assert!(!flow_text(&core).contains("zebra"), "switching back holds the note out of the flow again");
+    }
+
+    #[test]
     fn a_previewed_note_paints_its_own_content() {
         let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside></body></html>";
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);

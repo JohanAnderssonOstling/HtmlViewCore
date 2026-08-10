@@ -20,6 +20,16 @@ pub struct LoadedRenderDocument {
     pub source: String,
 }
 
+/// How a presentation choice reaches the pipeline. Popup mode holds notes back
+/// from the flow so the reader can show them itself; as-authored leaves them
+/// where they were written.
+pub fn note_flow_for(note_display: NoteDisplay) -> html::pipeline::NoteFlow {
+    match note_display {
+        NoteDisplay::Popup => html::pipeline::NoteFlow::Excluded,
+        NoteDisplay::AsAuthored => html::pipeline::NoteFlow::InFlow,
+    }
+}
+
 pub fn load_css_with_provider(provider: &dyn ResourceProvider, base_uri: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     for candidate in ["computer_style.css", "style.css"] {
@@ -70,11 +80,7 @@ fn load_document_with_dom_pipeline_impl(
         markup_syntax: MarkupSyntax::from_uri(uri),
         user_styles: Vec::new(),
         reader_overrides,
-        note_flow: match note_display {
-            // Held back from the flow so the reader can present them itself.
-            NoteDisplay::Popup => html::pipeline::NoteFlow::Excluded,
-            NoteDisplay::AsAuthored => html::pipeline::NoteFlow::InFlow,
-        },
+        note_flow: note_flow_for(note_display),
         source_revision: SourceRevision::INITIAL,
         base_uri: uri.to_string(),
         resource_revision: ResourceRevision::INITIAL,
