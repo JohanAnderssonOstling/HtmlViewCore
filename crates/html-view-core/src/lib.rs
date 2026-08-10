@@ -184,7 +184,11 @@ pub(crate) struct RendererCore {
     page: DocumentView,
     /// Spine items following the page, filling the columns it leaves empty.
     /// Only populated in continuous mode, and rebuilt whenever the page is.
-    following: Vec<DocumentView>,
+    following: Vec<crate::document_view::FollowingItem>,
+    /// The screen the items in `following` were built for. Loading and laying
+    /// out a document is far too costly to repeat on a frame that shows the
+    /// same thing.
+    following_key: Option<(FrameGeometryCacheKey, usize)>,
     continuous_spine: bool,
     /// The note currently shown beside the page, if any. Selecting and hit
     /// testing work here through the same code the page uses.
@@ -354,6 +358,7 @@ impl RendererCore {
             host,
             page: DocumentView::new(document, layout),
             following: Vec::new(),
+            following_key: None,
             continuous_spine: config.continuous_spine,
             note: None,
             pipeline_session: loaded.session,

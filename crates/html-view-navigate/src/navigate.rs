@@ -101,7 +101,7 @@ impl NavigationState {
 
     /// Anchors on the line covering `target_y`, for anchors recorded by
     /// position rather than by glyph.
-    fn restore_anchor_position(&mut self, cx: &mut NavContext<'_>, target_y: f64) -> bool {
+    pub fn restore_anchor_position(&mut self, cx: &mut NavContext<'_>, target_y: f64) -> bool {
         if cx.doc.text().lines().is_empty() {
             return false;
         }
@@ -147,24 +147,29 @@ impl NavigationState {
         true
     }
 
-    pub fn next_line(&mut self, cx: &mut NavContext<'_>) {
+    /// Scrolls one line further into this document, reporting whether there
+    /// was one. A caller that reads more than one document at a time takes
+    /// over when there was not.
+    pub fn next_line(&mut self, cx: &mut NavContext<'_>) -> bool {
         let lines = cx.doc.text().lines();
         if lines.is_empty() {
-            return;
+            return false;
         }
         let current_idx = cx.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line(cx.view()));
         let Some(current_line) = lines.get(current_idx) else {
-            return;
+            return false;
         };
         let search_y = current_line.point().y + current_line.height() + 0.1;
         let target_idx = cx.doc.start_line_at(search_y, 0.0);
         if target_idx >= lines.len() {
-            return;
+            return false;
         }
-        if let Some(target_line) = lines.get(target_idx) {
-            let y = target_line.point().y;
-            self.jump_to_forward_offset(cx, y, true);
-        }
+        let Some(target_line) = lines.get(target_idx) else {
+            return false;
+        };
+        let y = target_line.point().y;
+        self.jump_to_forward_offset(cx, y, true);
+        true
     }
 
     pub fn prev_line(&mut self, cx: &mut NavContext<'_>) {
@@ -207,10 +212,20 @@ impl NavigationState {
             DocAnchor::Glyph(glyph_idx) => {
                 self.restore_glyph_position(cx, glyph_idx);
             }
+            DocAnchor::Offset(offset_y) => {
+                // Anchored on the line there, not merely scrolled to it. The
+                // frame that arrives may still relayout, and relayout keeps
+                // an anchor, not an offset.
+                if !self.restore_anchor_position(cx, offset_y) {
+                    cx.viewport.direction = PaintDirection::Forward;
+                    cx.viewport.start_offset_y = offset_y;
+                    cx.viewport.end_offset_y = offset_y;
+                }
+            }
         }
 
         cx.host.request_repaint();
-        if matches!(anchor, DocAnchor::Glyph(_)) {
+        if matches!(anchor, DocAnchor::Glyph(_) | DocAnchor::Offset(_)) {
             self.update_nav_signal(cx);
         } else {
             // The anchor is only knowable once the page has been laid out.

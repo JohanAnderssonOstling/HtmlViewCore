@@ -170,7 +170,7 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn next_line(&mut self) {
-        self.core.next_line();
+        self.core.next_line(&mut self.glyph_shaper);
     }
 
     pub fn previous_line(&mut self) {

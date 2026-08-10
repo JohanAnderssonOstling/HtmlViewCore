@@ -35,6 +35,13 @@ impl RendererCore {
         nav.restore_glyph_position(&mut cx, glyph_idx);
     }
 
+    /// Settles on the line at `offset_y`, for a position known as a place in
+    /// the document rather than as a glyph.
+    pub fn restore_offset_position(&mut self, offset_y: f64) {
+        let (nav, mut cx) = self.nav_cx();
+        nav.restore_anchor_position(&mut cx, offset_y);
+    }
+
     pub fn restore_position_from_cfi(&mut self, cfi: &str) -> bool {
         let (nav, mut cx) = self.nav_cx();
         nav.restore_position_from_cfi(&mut cx, cfi)
@@ -45,9 +52,12 @@ impl RendererCore {
         nav.jump_to_id(&mut cx, id)
     }
 
-    pub fn next_line(&mut self) {
+    pub fn next_line(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         let (nav, mut cx) = self.nav_cx();
-        nav.next_line(&mut cx);
+        if nav.next_line(&mut cx) {
+            return;
+        }
+        self.continue_past_page(glyph_shaper);
     }
 
     pub fn prev_line(&mut self) {
@@ -459,10 +469,7 @@ impl RendererCore {
 
     pub fn next_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         if self.viewport.reached_end {
-            if self.nav.current_doc_index + 1 < self.nav.document_uris.len() {
-                self.load_document_at(glyph_shaper, self.nav.current_doc_index + 1, DocAnchor::Start);
-                return;
-            }
+            self.continue_past_page(glyph_shaper);
             return;
         }
 
@@ -477,6 +484,20 @@ impl RendererCore {
         }
         self.cache_current_prepared_page();
         self.jump_to_forward_offset(next_start_offset_y, true);
+    }
+
+    /// Moves on when the page has nothing further to show.
+    ///
+    /// A document at a time, that means opening the next spine item. Reading
+    /// continuously, the next items are already on screen beside the page, so
+    /// reading resumes where the screen ran out rather than at a start the
+    /// reader has passed.
+    fn continue_past_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
+        if let Some((doc_index, anchor)) = self.spine_continuation() {
+            self.load_document_at(glyph_shaper, doc_index, anchor);
+        } else if self.following.is_empty() && self.nav.current_doc_index + 1 < self.nav.document_uris.len() {
+            self.load_document_at(glyph_shaper, self.nav.current_doc_index + 1, DocAnchor::Start);
+        }
     }
 
     pub fn prev_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
@@ -591,9 +612,12 @@ impl RendererCore {
                 DocAnchor::Glyph(glyph_idx) => {
                     self.restore_glyph_position(glyph_idx);
                 }
+                DocAnchor::Offset(offset_y) => {
+                    self.restore_offset_position(offset_y);
+                }
             }
             self.host.request_repaint();
-            if matches!(anchor, DocAnchor::Glyph(_)) {
+            if matches!(anchor, DocAnchor::Glyph(_) | DocAnchor::Offset(_)) {
                 self.update_nav_signal();
             } else {
                 self.nav.pending_nav_anchor_update = true;
@@ -640,6 +664,7 @@ impl RendererCore {
 
     pub fn reset_view_state(&mut self) {
         self.viewport = ViewportState::default();
+        self.following_key = None;
         self.page.frame.clear();
         self.frame_scratch.clear_transient();
         self.page.selection = SelectionState::default();
@@ -2369,15 +2394,10 @@ mod tests {
         assert!(scene.content_height() > 0.0, "a note's scene must have height");
     }
 
-    #[test]
-    fn a_following_spine_item_starts_at_the_top_of_the_next_column() {
-        // The first document is short enough to leave a column free, so the
-        // second fills it -- from the top, because a spine boundary is always
-        // a column boundary.
-        let (provider, _) = CountingProvider::new(vec![
-            ("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"),
-            ("two.html", "<html><body style='margin:0'><p>Second document</p></body></html>"),
-        ]);
+    /// A two-column reader over a spine, showing it as one continuous run.
+    fn continuous_spine_core(documents: Vec<(&str, &str)>) -> (RendererCore, TestShaper) {
+        let uris = documents.iter().map(|(uri, _)| (*uri).to_owned()).collect::<Vec<_>>();
+        let (provider, _) = CountingProvider::new(documents);
         let host = Rc::new(TestHost::default());
         let mut shaper = TestShaper::default();
         let config = RendererInitialConfig {
@@ -2389,14 +2409,30 @@ mod tests {
             continuous_spine: true,
             ..RendererInitialConfig::default()
         };
-        let uris = vec!["one.html".to_owned(), "two.html".to_owned()];
         let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, uris, 0, Some("0:0"), config);
         core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+        (core, shaper)
+    }
+
+    fn long_document(label: &str) -> String {
+        let paragraphs = (0..40).map(|index| format!("<p>{label} paragraph {index}</p>")).collect::<String>();
+        format!("<html><body style='margin:0'>{paragraphs}</body></html>")
+    }
+
+    #[test]
+    fn a_following_spine_item_starts_at_the_top_of_the_next_column() {
+        // The first document is short enough to leave a column free, so the
+        // second fills it -- from the top, because a spine boundary is always
+        // a column boundary.
+        let (core, _shaper) = continuous_spine_core(vec![
+            ("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"),
+            ("two.html", "<html><body style='margin:0'><p>Second document</p></body></html>"),
+        ]);
 
         let following = core.following_views();
         assert_eq!(following.len(), 1, "the free column is filled by the next spine item");
 
-        let view = &following[0];
+        let view = &following[0].view;
         let first_line = view.frame.current_page_start_line.expect("the following item is paginated");
         let screen = view.frame.last_line_positions.get(first_line).expect("its first line is placed");
 
@@ -2406,6 +2442,94 @@ mod tests {
         // else -- rather than carried down by however far the page had run.
         let natural_y = view.doc().text().line(first_line).expect("its first line").point().y;
         assert_eq!(screen.point.y, natural_y, "a spine item begins at the top of its column");
+    }
+
+    #[test]
+    fn a_following_item_is_paginated_into_the_columns_it_is_given() {
+        // Paginating it against a whole screen and then shifting it would put
+        // its tail in columns that are not there.
+        let (core, _shaper) = continuous_spine_core(vec![("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"), ("two.html", &long_document("Second"))]);
+
+        let view = &core.following_views()[0].view;
+        let last_column = view.frame.last_line_positions.iter().map(|(_, screen)| screen.col_index).max().expect("the following item paints something");
+        assert_eq!(last_column, 1, "the item fills the one free column and stops there");
+
+        let item = &core.following_views()[0];
+        assert!(!item.reached_end, "a document this long does not fit in a single column");
+    }
+
+    #[test]
+    fn a_page_turn_resumes_inside_the_item_shown_beside_the_page() {
+        // The second document is already half read by the time the reader
+        // turns the page: starting it over would show them that half again.
+        let (mut core, mut shaper) = continuous_spine_core(vec![("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"), ("two.html", &long_document("Second"))]);
+
+        let resume_at = core.following_views()[0].next_start_offset_y;
+        assert!(resume_at > 0.0, "part of the second document was shown beside the first");
+
+        core.next_page(&mut shaper);
+        core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+
+        assert_eq!(core.nav.current_doc_index, 1, "the page turn moved into the second document");
+        assert_eq!(core.viewport.start_offset_y, resume_at, "it resumes below what the previous screen showed of it");
+    }
+
+    #[test]
+    fn a_page_turn_moves_past_the_items_the_screen_showed_whole() {
+        // Both following items fit, so neither is where reading continues --
+        // the item after them is.
+        let (mut core, mut shaper) = continuous_spine_core(vec![
+            ("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"),
+            ("two.html", "<html><body style='margin:0'><p>Second document</p></body></html>"),
+            ("three.html", &long_document("Third")),
+        ]);
+
+        assert!(core.following_views().iter().all(|item| item.reached_end), "the short items fit whole");
+
+        core.next_page(&mut shaper);
+        core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+
+        assert_eq!(core.nav.current_doc_index, 2, "reading continues after the items already shown");
+        assert_eq!(core.viewport.start_offset_y, 0.0, "and at that item's start, none of it having been shown");
+    }
+
+    #[test]
+    fn scrolling_off_the_end_of_a_document_enters_the_one_beside_it() {
+        // Line scrolling stops dead at the end of a document when the reader
+        // shows one at a time. Continuously, there is somewhere to go.
+        let (mut core, mut shaper) = continuous_spine_core(vec![("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"), ("two.html", &long_document("Second"))]);
+
+        let resume_at = core.following_views()[0].next_start_offset_y;
+        core.next_line(&mut shaper);
+        core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+
+        assert_eq!(core.nav.current_doc_index, 1, "the first document had no line left, so the next one takes over");
+        assert_eq!(core.viewport.start_offset_y, resume_at, "picking up where the screen left it");
+    }
+
+    #[test]
+    fn a_page_turn_still_opens_the_next_document_when_the_spine_is_not_continuous() {
+        let one = "<html><body style='margin:0'><p>First document</p></body></html>";
+        let (provider, _) = CountingProvider::new(vec![("one.html", one), ("two.html", one)]);
+        let host = Rc::new(TestHost::default());
+        let mut shaper = TestShaper::default();
+        let config = RendererInitialConfig {
+            font_size: 16.0,
+            column_width: 200.0,
+            max_column_count: Some(2),
+            image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
+            text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+            ..RendererInitialConfig::default()
+        };
+        let uris = vec!["one.html".to_owned(), "two.html".to_owned()];
+        let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, uris, 0, Some("0:0"), config);
+        core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+
+        core.next_page(&mut shaper);
+
+        assert!(core.following_views().is_empty(), "nothing follows the page when a document is shown at a time");
+        assert_eq!(core.nav.current_doc_index, 1);
+        assert_eq!(core.viewport.start_offset_y, 0.0, "and it opens at the start, none of it having been shown");
     }
 
     #[test]

@@ -83,6 +83,7 @@ impl RendererCore {
 
     pub(crate) fn paint_frame(&self, cx: &mut impl Painter) {
         self.painter().paint_frame(cx);
+        self.paint_following(cx);
     }
 
     pub(crate) fn paint_base_before_overlay(&self, cx: &mut impl Painter) {
@@ -94,7 +95,11 @@ impl RendererCore {
     }
 
     pub(crate) fn paint_base_after_overlay(&self, cx: &mut impl Painter) -> RenderState {
-        self.painter().paint_base_after_overlay(cx)
+        let state = self.painter().paint_base_after_overlay(cx);
+        // The following items belong to the base layer. They occupy columns
+        // the page does not, so painting them after its overlay hides nothing.
+        self.paint_following(cx);
+        state
     }
 
     #[cfg(test)]
@@ -109,7 +114,8 @@ impl RendererCore {
     /// after it and without the canvas fill, which the page has already laid
     /// down for the whole viewport.
     pub(crate) fn paint_following(&self, cx: &mut impl Painter) {
-        for view in &self.following {
+        for item in &self.following {
+            let view = &item.view;
             PagePainter {
                 geo: view.geometry(),
                 images: &self.image_pipeline,
@@ -158,11 +164,22 @@ impl RendererCore {
     /// boundary is a column boundary and each item can be paginated on its own
     /// and then shifted into the columns still free. Nothing has to flow
     /// across a boundary.
+    ///
+    /// Each item is paginated into the columns it will actually get, not into
+    /// a full screen's worth, so what it reports about running out -- where it
+    /// resumes, and whether there is anything left of it -- describes the
+    /// screen it is on. Continuous scrolling reads that back.
     pub(crate) fn fill_following_columns(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        self.following.clear();
         if !self.continuous_spine {
             return;
         }
+        let screen = (self.frame_geometry_cache_key(), self.nav.current_doc_index);
+        if self.following_key == Some(screen) {
+            return;
+        }
+        self.following_key = Some(screen);
+        self.following.clear();
+
         let columns = self.page.layout.col_count as i32;
         let mut used = self.columns_used(&self.page);
         let mut doc_index = self.nav.current_doc_index;
@@ -172,11 +189,14 @@ impl RendererCore {
             let loaded = self.load_document_for_index(glyph_shaper, doc_index);
             let mut view = crate::document_view::DocumentView::new(loaded.document, self.page.layout.clone());
 
-            let paginator = Paginator::new(DocQuery::new(&view.document), &view.layout, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm);
+            // Paginated against the free columns alone, then shifted into
+            // them: the item is laid out for the room it has, and the columns
+            // it would have spilled into are the next screen's business.
+            let mut free_columns = view.layout.clone();
+            free_columns.col_count = f64::from(columns - used);
+            let paginator = Paginator::new(DocQuery::new(&view.document), &free_columns, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm);
             let events = paginator.events();
             let mut page = paginator.page_at(&events, 0.0, Vec::new().into());
-            // The item was paginated from its own first column; shifting moves
-            // it into the ones the page left.
             page.positions.shift_columns(used);
 
             view.frame.current_page_start_line = Some(page.start_line);
@@ -187,12 +207,30 @@ impl RendererCore {
             view.frame.last_line_positions = page.positions;
 
             used = self.columns_used(&view).max(used + 1);
-            self.following.push(view);
+            self.following.push(crate::document_view::FollowingItem { view, doc_index, next_start_offset_y: page.next_start_offset_y, reached_end: page.reached_end });
         }
     }
 
+    /// Where reading continues past everything the screen is showing, for a
+    /// screen showing more than the page.
+    ///
+    /// Those items are already on screen, so starting one of them over would
+    /// show the reader what they just read. Reading resumes inside the last
+    /// one, below the part that fit -- or after it, when all of it fit.
+    ///
+    /// `None` when the page is the whole screen, which is every screen
+    /// outside continuous mode, and when the spine has nothing left.
+    pub(crate) fn spine_continuation(&self) -> Option<(usize, crate::DocAnchor)> {
+        let last = self.following.last()?;
+        if !last.reached_end {
+            return Some((last.doc_index, crate::DocAnchor::Offset(last.next_start_offset_y)));
+        }
+        let after = last.doc_index + 1;
+        (after < self.nav.document_uris.len()).then_some((after, crate::DocAnchor::Start))
+    }
+
     #[cfg(test)]
-    pub(crate) fn following_views(&self) -> &[crate::document_view::DocumentView] {
+    pub(crate) fn following_views(&self) -> &[crate::document_view::FollowingItem] {
         &self.following
     }
 

@@ -25,6 +25,22 @@ pub(crate) struct DocumentView {
     pub(crate) table_selection: TableSelectionState,
 }
 
+/// A spine item shown after the page, in the columns the page left empty.
+///
+/// It carries what the page keeps in the viewport: which document it is, and
+/// how far into it the screen got. Reading continues from there rather than
+/// from the item's start, since the reader has already seen its opening
+/// beside the page.
+pub(crate) struct FollowingItem {
+    pub(crate) view: DocumentView,
+    pub(crate) doc_index: usize,
+    /// Where this item resumes on the next screen, meaningful only while
+    /// `reached_end` is false.
+    pub(crate) next_start_offset_y: f64,
+    /// Whether the columns it was given held all of it.
+    pub(crate) reached_end: bool,
+}
+
 impl DocumentView {
     pub(crate) fn new(document: LaidOutDocument, layout: ColumnLayout) -> Self {
         Self { document, layout, frame: VisibleFrame::default(), selection: SelectionState::default(), table_selection: TableSelectionState::default() }
