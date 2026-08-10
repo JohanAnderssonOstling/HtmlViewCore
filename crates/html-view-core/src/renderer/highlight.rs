@@ -1,13 +1,7 @@
 
-use crate::{PaintDirection, RendererCore};
+use crate::RendererCore;
 
 impl RendererCore {
-    /// Scan document glyphs for all occurrences of `query` (case-insensitive).
-    /// Returns sorted (start_glyph, end_glyph) pairs.
-    pub fn find_matches(&self, query: &str) -> Vec<(u32, u32)> {
-        self.doc().find_matches_with_options(query, self.highlight.current_document_options())
-    }
-
     /// Scroll so that the current match is visible at the top of the viewport.
     pub fn navigate_to_current_match(&mut self) {
         let Some(start) = self.highlight.current_local_match_start() else {
@@ -17,19 +11,14 @@ impl RendererCore {
             return;
         };
         // Only scroll if the match is not already on screen
-        let is_visible = self.page.view.frame.last_line_positions.contains(line_idx);
+        let is_visible = self.page.view.frame.page().line_positions().contains(line_idx);
         if is_visible {
             self.request_overlay_repaint();
             return;
         }
         let line_y = self.doc().text().line(line_idx).map(|line| line.point().y).unwrap_or_default();
-        self.viewport.start_offset_y = (line_y - 40.0).max(0.0);
-        self.viewport.direction = PaintDirection::Forward;
+        self.viewport.begin_forward_at((line_y - 40.0).max(0.0));
         self.request_overlay_repaint();
-    }
-
-    pub fn update_match_signal(&self) {
-        self.highlight.emit_match_signal(self.host.as_ref());
     }
 
 }
@@ -51,4 +40,3 @@ mod tests {
         assert_eq!(find_text_matches("Café CAFE", "cafe", SearchOptions { match_diacritics: true, ..options() }).len(), 1);
     }
 }
-

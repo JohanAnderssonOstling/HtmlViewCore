@@ -80,12 +80,22 @@ impl<T: Clone + PartialEq> Debounced<T> {
 pub struct NavSignals {
     pub position: Debounced<(usize, Option<u32>)>,
     pub cfi: Debounced<Option<String>>,
-    pub progress: Debounced<(u64, u64, usize)>,
+    pub progress: Debounced<(f32, u64, u64, usize)>,
     pub anchor: Debounced<(usize, Option<String>)>,
 }
 
 /// A place the reader has been: a spine index and an optional anchor within it.
-pub type Location = (usize, Option<String>);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    pub doc: usize,
+    pub anchor: Option<String>,
+}
+
+impl Location {
+    pub fn new(doc: usize, anchor: Option<String>) -> Self {
+        Self { doc, anchor }
+    }
+}
 
 /// Back/forward stack for reader-initiated jumps.
 ///
@@ -113,6 +123,14 @@ impl LocationHistory {
         self.entries.get(self.index)
     }
 
+    /// Returns the location `step` entries away without moving the cursor.
+    /// Callers can validate or perform navigation before committing the step.
+    pub fn peek_step(&self, step: isize) -> Option<Location> {
+        let next = self.index as isize + step;
+        (next >= 0 && next < self.entries.len() as isize)
+            .then(|| self.entries[next as usize].clone())
+    }
+
     /// Records `location` unless it is already the current entry. Anything
     /// after the cursor is discarded.
     pub fn push(&mut self, location: Location, host: &dyn RendererHost) {
@@ -134,13 +152,12 @@ impl LocationHistory {
     /// Moves the cursor by `step` and returns the location to navigate to, or
     /// `None` if that would leave the stack.
     pub fn step(&mut self, step: isize, host: &dyn RendererHost) -> Option<Location> {
-        let next = self.index as isize + step;
-        if next < 0 || next >= self.entries.len() as isize {
+        let Some(location) = self.peek_step(step) else {
             self.emit_availability(host);
             return None;
-        }
-        self.index = next as usize;
-        Some(self.entries[self.index].clone())
+        };
+        self.index = (self.index as isize + step) as usize;
+        Some(location)
     }
 }
 
@@ -217,8 +234,27 @@ mod tests {
         assert_eq!(host.count(), 1, "invalidate forces the next value through");
     }
 
+    #[test]
+    fn progress_deduplication_includes_the_fraction() {
+        let host = RecordingHost::default();
+        let mut signal = Debounced::default();
+        let event = |(fraction, _, _, _): (f32, u64, u64, usize)| {
+            RendererEvent::ReadingProgress {
+                fraction,
+                location: 1,
+                total_locations: 2,
+                doc: 0,
+                doc_count: 1,
+            }
+        };
+
+        assert!(signal.emit_if_changed((0.1, 1, 2, 0), &host, event));
+        assert!(signal.emit_if_changed((0.2, 1, 2, 0), &host, event));
+        assert_eq!(host.count(), 2, "fraction changes inside one location must be reported");
+    }
+
     fn location(doc: usize) -> Location {
-        (doc, None)
+        Location::new(doc, None)
     }
 
     #[test]
@@ -282,6 +318,17 @@ mod tests {
     }
 
     #[test]
+    fn peeking_at_a_history_step_does_not_move_the_cursor() {
+        let host = RecordingHost::default();
+        let mut history = LocationHistory::default();
+        history.push(location(0), &host);
+        history.push(location(1), &host);
+
+        assert_eq!(history.peek_step(-1), Some(location(0)));
+        assert_eq!(history.current(), Some(&location(1)));
+    }
+
+    #[test]
     fn history_availability_is_deduplicated_across_repeated_queries() {
         let host = RecordingHost::default();
         let mut history = LocationHistory::default();
@@ -320,31 +367,120 @@ pub struct SpineAnchor {
     pub glyph: u32,
 }
 
-/// Where reading is: how far into a document, and which document.
-///
-/// The working form, in layout coordinates. It says exactly what the screen
-/// starts at, which an anchor cannot -- a document opens above its first
-/// glyph, not at it. It does not survive a relayout, so it travels with an
-/// anchor rather than instead of one.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct SpinePosition {
-    pub doc: usize,
-    pub offset_y: f64,
-}
-
 pub struct NavigationState {
-    pub document_uris: Vec<String>,
-    pub document_text_lengths: Vec<u64>,
-    pub current_doc_index: usize,
+    document_uris: Vec<String>,
+    document_text_lengths: Vec<u64>,
+    current_doc_index: usize,
     /// Where the reader is, durably: a glyph, and the document it indexes.
     ///
     /// A glyph index means nothing without its document -- the same number
     /// names a different place in the next spine item. Carrying the document
     /// with it is what makes an anchor from a document the reader has left
     /// simply not apply, rather than apply somewhere wrong.
-    pub nav_anchor: Option<SpineAnchor>,
-    pub pending_nav_anchor_update: bool,
+    nav_anchor: Option<SpineAnchor>,
+    pending_nav_anchor_update: bool,
     pub signals: NavSignals,
     pub history: LocationHistory,
     pub toc_anchors: TocAnchors,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NavigationDocuments<'a> {
+    uris: &'a [String],
+    text_lengths: &'a [u64],
+}
+
+impl<'a> NavigationDocuments<'a> {
+    pub fn uris(self) -> &'a [String] {
+        self.uris
+    }
+
+    pub fn text_lengths(self) -> &'a [u64] {
+        self.text_lengths
+    }
+
+    pub fn len(self) -> usize {
+        self.uris.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.uris.is_empty()
+    }
+
+    pub fn uri(self, index: usize) -> Option<&'a str> {
+        self.uris.get(index).map(String::as_str)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NavigationLocation {
+    document: usize,
+    anchor: Option<SpineAnchor>,
+    anchor_update_pending: bool,
+}
+
+impl NavigationLocation {
+    pub fn document(self) -> usize {
+        self.document
+    }
+
+    pub fn anchor(self) -> Option<SpineAnchor> {
+        self.anchor
+    }
+
+    pub fn anchor_update_pending(self) -> bool {
+        self.anchor_update_pending
+    }
+}
+
+impl NavigationState {
+    pub fn new(document_uris: Vec<String>, current_document: usize) -> Self {
+        let document_text_lengths = vec![1; document_uris.len()];
+        Self {
+            document_uris,
+            document_text_lengths,
+            current_doc_index: current_document,
+            nav_anchor: None,
+            pending_nav_anchor_update: false,
+            signals: NavSignals::default(),
+            history: LocationHistory::default(),
+            toc_anchors: TocAnchors::default(),
+        }
+    }
+
+    pub fn documents(&self) -> NavigationDocuments<'_> {
+        NavigationDocuments {
+            uris: &self.document_uris,
+            text_lengths: &self.document_text_lengths,
+        }
+    }
+
+    pub fn location(&self) -> NavigationLocation {
+        NavigationLocation {
+            document: self.current_doc_index,
+            anchor: self.nav_anchor,
+            anchor_update_pending: self.pending_nav_anchor_update,
+        }
+    }
+
+    pub fn activate_document(&mut self, document: usize) {
+        self.current_doc_index = document;
+    }
+
+    pub fn mark_anchor_dirty(&mut self) {
+        self.pending_nav_anchor_update = true;
+    }
+
+    pub fn mark_anchor_clean(&mut self) {
+        self.pending_nav_anchor_update = false;
+    }
+
+    pub fn install_document_text_lengths(&mut self, lengths: Vec<u64>) -> bool {
+        if lengths.len() != self.document_uris.len() || lengths.contains(&0) {
+            return false;
+        }
+        self.document_text_lengths = lengths;
+        self.signals.progress.invalidate();
+        true
+    }
 }

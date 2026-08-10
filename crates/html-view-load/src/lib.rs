@@ -20,6 +20,29 @@ pub struct LoadedRenderDocument {
     pub source: String,
 }
 
+#[derive(Clone)]
+pub struct DocumentLoadSettings {
+    pub root_font_size: f32,
+    pub column_width: f64,
+    pub reader_overrides: ReaderStyleOverrides,
+    pub image_sizing_policy: ImageSizingPolicy,
+    pub text_composition_policy: html::pipeline::TextCompositionPolicy,
+    pub note_display: NoteDisplay,
+}
+
+impl DocumentLoadSettings {
+    pub fn book(root_font_size: f32, column_width: f64) -> Self {
+        Self {
+            root_font_size,
+            column_width,
+            reader_overrides: ReaderStyleOverrides::default(),
+            image_sizing_policy: ImageSizingPolicy::SmartStandalone,
+            text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
+            note_display: NoteDisplay::default(),
+        }
+    }
+}
+
 /// How a presentation choice reaches the pipeline. Popup mode holds notes back
 /// from the flow so the reader can show them itself; as-authored leaves them
 /// where they were written.
@@ -44,26 +67,51 @@ pub fn load_css_with_provider(provider: &dyn ResourceProvider, base_uri: &str) -
 }
 
 pub fn load_document_with_dom_pipeline(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> LoadedRenderDocument {
-    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, NoteDisplay::default(), glyph_shaper, None)
+    load_document_with_dom_pipeline_impl(
+        provider,
+        uri,
+        DocumentLoadSettings::book(root_font_size, col_width),
+        glyph_shaper,
+        None,
+    )
 }
 
 pub fn load_document_with_dom_pipeline_timed(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> (LoadedRenderDocument, PipelineTimings) {
     let mut timings = PipelineTimings::default();
-    let loaded = load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, NoteDisplay::default(), glyph_shaper, Some(&mut timings));
+    let loaded = load_document_with_dom_pipeline_impl(
+        provider,
+        uri,
+        DocumentLoadSettings::book(root_font_size, col_width),
+        glyph_shaper,
+        Some(&mut timings),
+    );
     (loaded, timings)
 }
 
 pub fn load_document_with_settings(
-    provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, reader_overrides: ReaderStyleOverrides, image_sizing_policy: ImageSizingPolicy, text_composition_policy: html::pipeline::TextCompositionPolicy,
-    note_display: NoteDisplay, glyph_shaper: &mut impl GlyphShaper,
+    provider: Arc<dyn ResourceProvider>,
+    uri: &str,
+    settings: DocumentLoadSettings,
+    glyph_shaper: &mut impl GlyphShaper,
 ) -> LoadedRenderDocument {
-    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, reader_overrides, image_sizing_policy, text_composition_policy, note_display, glyph_shaper, None)
+    load_document_with_dom_pipeline_impl(provider, uri, settings, glyph_shaper, None)
 }
 
 fn load_document_with_dom_pipeline_impl(
-    provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, reader_overrides: ReaderStyleOverrides, image_sizing_policy: ImageSizingPolicy, text_composition_policy: html::pipeline::TextCompositionPolicy,
-    note_display: NoteDisplay, glyph_shaper: &mut impl GlyphShaper, mut timings: Option<&mut PipelineTimings>,
+    provider: Arc<dyn ResourceProvider>,
+    uri: &str,
+    settings: DocumentLoadSettings,
+    glyph_shaper: &mut impl GlyphShaper,
+    mut timings: Option<&mut PipelineTimings>,
 ) -> LoadedRenderDocument {
+    let DocumentLoadSettings {
+        root_font_size,
+        column_width,
+        reader_overrides,
+        image_sizing_policy,
+        text_composition_policy,
+        note_display,
+    } = settings;
     let load_started = Instant::now();
     let source_bytes = provider.read_bytes(uri).expect("Failed to load HTML");
     let transport_encoding = provider.metadata(uri).ok().and_then(|metadata| metadata.charset);
@@ -74,7 +122,7 @@ fn load_document_with_dom_pipeline_impl(
 
     let start = Instant::now();
     let mut session = Engine::new(provider.clone());
-    let layout_constraints = PipelineLayoutConstraints { viewport_width: col_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
+    let layout_constraints = PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
     let inputs = PipelineInputs {
         source: html.clone(),
         markup_syntax: MarkupSyntax::from_uri(uri),
@@ -85,7 +133,7 @@ fn load_document_with_dom_pipeline_impl(
         base_uri: uri.to_string(),
         resource_revision: ResourceRevision::INITIAL,
         stylesheet_revision: StylesheetRevision::INITIAL,
-        style_environment: StyleEnvironment { root_font_size: root_font_size.max(1.0).round() as u32, media: html::pipeline::MediaEnvironment::screen(col_width, None).expect("column width must be finite and positive"), direction: 0 },
+        style_environment: StyleEnvironment { root_font_size: root_font_size.max(1.0).round() as u32, media: html::pipeline::MediaEnvironment::screen(column_width, None).expect("column width must be finite and positive"), direction: 0 },
         font_environment: FontEnvironmentRevision::INITIAL,
         image_metrics_revision: ImageMetricsRevision::INITIAL,
         layout: layout_constraints,
@@ -202,6 +250,12 @@ mod tests {
     #[derive(Default)]
     struct TestGlyphShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+    }
+
+    struct DocumentMemoryProfile {
+        uri: String,
+        total: usize,
+        top_entries: Vec<(String, usize)>,
     }
 
     impl GlyphShaper for TestGlyphShaper {
@@ -446,7 +500,7 @@ mod tests {
         files.sort();
 
         let mut aggregate: HashMap<String, usize> = HashMap::new();
-        let mut heaviest: Option<(String, usize, Vec<(String, usize)>)> = None;
+        let mut heaviest: Option<DocumentMemoryProfile> = None;
         let mut processed = 0usize;
         let mut failed = 0usize;
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
@@ -474,8 +528,12 @@ mod tests {
             }
 
             let top_entries: Vec<(String, usize)> = report.entries.iter().take(10).map(|entry| (entry.label.clone(), entry.bytes)).collect();
-            if heaviest.as_ref().map(|(_, bytes, _)| total > *bytes).unwrap_or(true) {
-                heaviest = Some((uri.clone(), total, top_entries));
+            if heaviest.as_ref().is_none_or(|profile| total > profile.total) {
+                heaviest = Some(DocumentMemoryProfile {
+                    uri: uri.clone(),
+                    total,
+                    top_entries,
+                });
             }
         }
 
@@ -484,7 +542,12 @@ mod tests {
 
         println!("\n=== html-view-core memory summary ===");
         println!("files processed: {processed}   failed: {failed}");
-        if let Some((uri, total, top_entries)) = heaviest {
+        if let Some(DocumentMemoryProfile {
+            uri,
+            total,
+            top_entries,
+        }) = heaviest
+        {
             println!("heaviest document: {uri} ({:.2} KiB)", total as f64 / 1024.0);
             for (label, bytes) in top_entries {
                 println!("  {:>12}  {}", format!("{:.2} KiB", bytes as f64 / 1024.0), label);

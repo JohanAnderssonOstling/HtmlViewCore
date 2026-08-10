@@ -14,17 +14,181 @@ use peniko::Color;
 use std::collections::HashSet;
 use std::ops::Range;
 
-#[derive(Default)]
-pub struct SelectionState {
-    pub is_selecting: bool,
-    pub selection_anchor: Option<u32>,
-    pub selection_active: Option<u32>,
-    pub pending_link_glyph: Option<u32>,
-    pub selected_text: Option<String>,
-    pub selected_text_markdown: Option<String>,
-    pub link_cursor_active: bool,
-    pub semantic_selection: bool,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionMode {
+    #[default]
+    Plain,
+    Semantic,
 }
+
+impl SelectionMode {
+    pub fn is_semantic(self) -> bool {
+        matches!(self, Self::Semantic)
+    }
+
+    fn promote(self, requested: Self) -> Self {
+        if self.is_semantic() || requested.is_semantic() {
+            Self::Semantic
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SelectionState {
+    interaction: SelectionInteraction,
+    content: SelectionContent,
+    link_cursor_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectionInteraction {
+    selecting: bool,
+    anchor: Option<u32>,
+    active: Option<u32>,
+    pending_link_glyph: Option<u32>,
+    mode: SelectionMode,
+}
+
+impl SelectionInteraction {
+    pub fn is_selecting(self) -> bool {
+        self.selecting
+    }
+
+    pub fn anchor(self) -> Option<u32> {
+        self.anchor
+    }
+
+    pub fn active(self) -> Option<u32> {
+        self.active
+    }
+
+    pub fn is_semantic(self) -> bool {
+        self.mode.is_semantic()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectionContent {
+    plain: Option<String>,
+    markdown: Option<String>,
+}
+
+impl SelectionContent {
+    pub fn plain(&self) -> Option<&str> {
+        self.plain.as_deref()
+    }
+
+    pub fn markdown(&self) -> Option<&str> {
+        self.markdown.as_deref()
+    }
+}
+
+impl SelectionState {
+    pub fn interaction(&self) -> SelectionInteraction {
+        self.interaction
+    }
+
+    pub fn content(&self) -> &SelectionContent {
+        &self.content
+    }
+
+    pub fn link_cursor_active(&self) -> bool {
+        self.link_cursor_active
+    }
+
+    /// Starts a pointer selection. Until the active glyph moves, the gesture
+    /// may still resolve to a link click on the same glyph.
+    pub fn begin_at_glyph(&mut self, glyph: u32, mode: SelectionMode) {
+        self.interaction.anchor = Some(glyph);
+        self.interaction.active = Some(glyph);
+        self.interaction.selecting = true;
+        self.interaction.mode = mode;
+        self.interaction.pending_link_glyph = Some(glyph);
+    }
+
+    /// Updates the active gesture. A pointer outside the text still promotes
+    /// the selection mode, but cannot move the active glyph.
+    pub fn update_interaction(&mut self, glyph: Option<u32>, mode: SelectionMode) -> bool {
+        if !self.interaction.selecting {
+            return false;
+        }
+        self.interaction.mode = self.interaction.mode.promote(mode);
+        let Some(glyph) = glyph else {
+            return false;
+        };
+        self.interaction.active = Some(glyph);
+        if self.interaction.anchor != self.interaction.active {
+            self.interaction.pending_link_glyph = None;
+        }
+        true
+    }
+
+    /// Ends the active gesture and returns the glyph when it remained a click.
+    pub fn finish_interaction(&mut self) -> Option<u32> {
+        self.interaction.selecting = false;
+        let click = match (
+            self.interaction.anchor,
+            self.interaction.active,
+            self.interaction.pending_link_glyph,
+        ) {
+            (Some(anchor), Some(active), Some(pending))
+                if anchor == active && pending == anchor =>
+            {
+                Some(anchor)
+            }
+            _ => None,
+        };
+        self.interaction.pending_link_glyph = None;
+        click
+    }
+
+    /// Cancels only the in-progress gesture, preserving the selected range and
+    /// its derived copy payload.
+    pub fn cancel_interaction(&mut self) {
+        self.interaction.selecting = false;
+        self.interaction.pending_link_glyph = None;
+    }
+
+    /// Replaces the logical range outside a pointer gesture, for example when
+    /// search or another semantic command creates a selection.
+    pub fn select_range(&mut self, anchor: u32, active: u32, mode: SelectionMode) {
+        self.interaction.anchor = Some(anchor);
+        self.interaction.active = Some(active);
+        self.interaction.mode = mode;
+        self.interaction.selecting = false;
+        self.interaction.pending_link_glyph = None;
+        self.clear_text();
+    }
+
+    pub fn install_text(&mut self, plain: Option<String>, markdown: Option<String>) {
+        self.content.plain = plain;
+        self.content.markdown = markdown;
+    }
+
+    pub fn clear_text(&mut self) {
+        self.install_text(None, None);
+    }
+
+    /// Returns whether the cursor state changed and therefore needs restyling.
+    pub fn activate_link_cursor(&mut self) -> bool {
+        if self.link_cursor_active {
+            return false;
+        }
+        self.link_cursor_active = true;
+        true
+    }
+
+    pub fn deactivate_link_cursor(&mut self) -> bool {
+        if !self.link_cursor_active {
+            return false;
+        }
+        self.link_cursor_active = false;
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableCellRange {
     table_box: usize,
@@ -32,6 +196,18 @@ pub struct TableCellRange {
     row_end: usize,
     column_start: usize,
     column_end: usize,
+}
+
+#[derive(Clone, Copy)]
+enum TableRangePaint {
+    Fill,
+    FillWithBorder,
+}
+
+#[derive(Clone, Copy)]
+enum TableAnchorMode {
+    Anchored,
+    Dragging,
 }
 #[derive(Default)]
 pub struct TableSelectionState {
@@ -174,14 +350,14 @@ impl TableSelectionState {
         self.range.is_some_and(|range| range.table_box == hit.table_box)
     }
 
-    fn anchor_to(&mut self, hit: TableHit, dragging: bool) {
+    fn anchor_to(&mut self, hit: TableHit, mode: TableAnchorMode) {
         self.anchor = Some((hit.table_box, hit.row, hit.row_end, hit.column, hit.column_end));
         self.range = Some(TableCellRange { table_box: hit.table_box, row_start: hit.row, row_end: hit.row_end, column_start: hit.column, column_end: hit.column_end });
-        self.dragging = dragging;
+        self.dragging = matches!(mode, TableAnchorMode::Dragging);
     }
 
     pub fn begin(&mut self, hit: TableHit) {
-        self.anchor_to(hit, false);
+        self.anchor_to(hit, TableAnchorMode::Anchored);
     }
 
     /// Starts a drag from an existing selection. Returns whether `hit` was in
@@ -190,7 +366,7 @@ impl TableSelectionState {
         if !self.covers(hit) {
             return false;
         }
-        self.anchor_to(hit, true);
+        self.anchor_to(hit, TableAnchorMode::Dragging);
         true
     }
 
@@ -247,7 +423,8 @@ impl<'a> SelectionView<'a> {
 
     pub fn range(&self) -> Option<(u32, u32)> {
         // normalize selection anchor/active into a range
-        let (Some(a), Some(b)) = (self.state.selection_anchor, self.state.selection_active) else {
+        let interaction = self.state.interaction();
+        let (Some(a), Some(b)) = (interaction.anchor(), interaction.active()) else {
             return None;
         };
         if a == b {
@@ -266,7 +443,7 @@ impl<'a> SelectionView<'a> {
             return true;
         }
         let promoted = self.semantic_promoted_glyph_ranges(selection_start, selection_end);
-        for (line_idx, screen) in self.geo.frame.last_line_positions.iter() {
+        for (line_idx, screen) in self.geo.frame.page().line_positions().iter() {
             let Some(line) = self.geo.doc.text().line(line_idx) else {
                 continue;
             };
@@ -301,15 +478,15 @@ impl<'a> SelectionView<'a> {
         let mut segment_start = rect.y0;
         let mut break_index = 0;
         let mut offset = 0.0;
-        while break_index < self.geo.frame.offset_breaks.len() && self.geo.frame.offset_breaks[break_index].0 <= segment_start {
-            offset = self.geo.frame.offset_breaks[break_index].1;
+        while break_index < self.geo.frame.page().offset_breaks().len() && self.geo.frame.page().offset_breaks()[break_index].0 <= segment_start {
+            offset = self.geo.frame.page().offset_breaks()[break_index].1;
             break_index += 1;
         }
         while segment_start < rect.y1 {
-            let next_break = self.geo.frame.offset_breaks.get(break_index).map(|entry| entry.0).unwrap_or(rect.y1);
+            let next_break = self.geo.frame.page().offset_breaks().get(break_index).map(|entry| entry.0).unwrap_or(rect.y1);
             let segment_end = rect.y1.min(next_break);
-            let page_y0 = segment_start + offset - self.geo.frame.paint_start_offset_y;
-            let page_y1 = segment_end + offset - self.geo.frame.paint_start_offset_y;
+            let page_y0 = segment_start + offset - self.geo.frame.page().paint_start_offset_y();
+            let page_y1 = segment_end + offset - self.geo.frame.page().paint_start_offset_y();
             let height = self.geo.layout.size.height;
             let first_column = (page_y0 / height).floor().max(0.0) as i32;
             let last_column = ((page_y1 - 0.0001) / height).floor().min(self.geo.layout.col_count - 1.0) as i32;
@@ -323,15 +500,15 @@ impl<'a> SelectionView<'a> {
                 }
             }
             segment_start = segment_end;
-            if break_index < self.geo.frame.offset_breaks.len() && self.geo.frame.offset_breaks[break_index].0 <= segment_start {
-                offset = self.geo.frame.offset_breaks[break_index].1;
+            if break_index < self.geo.frame.page().offset_breaks().len() && self.geo.frame.page().offset_breaks()[break_index].0 <= segment_start {
+                offset = self.geo.frame.page().offset_breaks()[break_index].1;
                 break_index += 1;
             }
         }
     }
 
     fn semantic_text_units(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticMarkdownUnit> {
-        if !self.state.semantic_selection || selection_start >= selection_end {
+        if !self.state.interaction().is_semantic() || selection_start >= selection_end {
             return Vec::new();
         }
         let mut list_items = HashSet::new();
@@ -353,13 +530,13 @@ impl<'a> SelectionView<'a> {
 
         let mut units = Vec::new();
         for item in list_items {
-            let ranges = self.geo.doc.box_text_glyph_ranges(item, true);
+            let ranges = self.geo.doc.box_text_and_marker_glyph_ranges(item);
             if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
                 units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown: self.geo.doc.list_item_markdown(item, 0) });
             }
         }
         for block in code_blocks {
-            let ranges = self.geo.doc.box_text_glyph_ranges(block, false);
+            let ranges = self.geo.doc.box_text_glyph_ranges(block);
             if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
                 // Code remains character-selectable while both ends of the
                 // selection stay inside it. Promote only when the drag crosses
@@ -376,7 +553,7 @@ impl<'a> SelectionView<'a> {
     }
 
     fn semantic_table_selections(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticTableSelection> {
-        if !self.state.semantic_selection || selection_start >= selection_end {
+        if !self.state.interaction().is_semantic() || selection_start >= selection_end {
             return Vec::new();
         }
         let boxes = self.geo.doc.boxes();
@@ -530,16 +707,40 @@ impl<'a> SelectionView<'a> {
         if let Some(range) = self.table.range()
             && let Some(table) = self.geo.doc.boxes().table(range.table_box)
         {
-            self.paint_table_cell_range(painter, &table, range, true);
+            self.paint_bordered_table_cell_range(painter, &table, range);
         }
         if let Some((start, end)) = self.range() {
             for selection in self.semantic_table_selections(start, end) {
-                self.paint_table_cell_range(painter, &selection.table, selection.range, false);
+                self.paint_filled_table_cell_range(painter, &selection.table, selection.range);
             }
         }
     }
 
-    pub fn paint_table_cell_range(&self, painter: &mut impl Painter, table: &RenderTable, range: TableCellRange, bordered: bool) {
+    fn paint_bordered_table_cell_range(
+        &self,
+        painter: &mut impl Painter,
+        table: &RenderTable,
+        range: TableCellRange,
+    ) {
+        self.paint_table_cell_range(painter, table, range, TableRangePaint::FillWithBorder);
+    }
+
+    fn paint_filled_table_cell_range(
+        &self,
+        painter: &mut impl Painter,
+        table: &RenderTable,
+        range: TableCellRange,
+    ) {
+        self.paint_table_cell_range(painter, table, range, TableRangePaint::Fill);
+    }
+
+    fn paint_table_cell_range(
+        &self,
+        painter: &mut impl Painter,
+        table: &RenderTable,
+        range: TableCellRange,
+        paint: TableRangePaint,
+    ) {
         let fill = Color::rgba8(72, 133, 237, 54);
         let border = Color::rgba8(45, 102, 201, 210);
         for row in table.rows() {
@@ -549,7 +750,7 @@ impl<'a> SelectionView<'a> {
                 }
                 self.for_each_projected_box_rect(cell.box_idx(), |rect| {
                     painter.fill_rect(rect, fill);
-                    if bordered {
+                    if matches!(paint, TableRangePaint::FillWithBorder) {
                         let width = 1.5;
                         painter.fill_rect(Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + width), border);
                         painter.fill_rect(Rect::new(rect.x0, rect.y1 - width, rect.x1, rect.y1), border);
@@ -570,7 +771,10 @@ fn cell_intersects(cell: &RenderTableCell, range: TableCellRange) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TableCellRange, table_markdown, table_plain_text, table_unstyled_html};
+    use super::{
+        SelectionMode, SelectionState, TableCellRange, table_markdown, table_plain_text,
+        table_unstyled_html,
+    };
     use html::layout::LayoutConstraints;
     use html::pipeline::DocumentFactory;
     use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper};
@@ -596,6 +800,32 @@ mod tests {
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
+    }
+
+    #[test]
+    fn selection_interaction_distinguishes_a_click_from_a_drag() {
+        let mut selection = SelectionState::default();
+        selection.begin_at_glyph(12, SelectionMode::Plain);
+
+        assert_eq!(selection.finish_interaction(), Some(12));
+
+        selection.begin_at_glyph(12, SelectionMode::Plain);
+        assert!(selection.update_interaction(Some(18), SelectionMode::Semantic));
+        assert!(selection.interaction().is_semantic());
+        assert_eq!(selection.finish_interaction(), None);
+        assert_eq!(selection.interaction().anchor(), Some(12));
+        assert_eq!(selection.interaction().active(), Some(18));
+    }
+
+    #[test]
+    fn selection_update_outside_text_preserves_the_range_and_promotes_its_mode() {
+        let mut selection = SelectionState::default();
+        selection.begin_at_glyph(7, SelectionMode::Plain);
+
+        assert!(!selection.update_interaction(None, SelectionMode::Semantic));
+        assert!(selection.interaction().is_semantic());
+        assert_eq!(selection.interaction().active(), Some(7));
+        assert_eq!(selection.finish_interaction(), Some(7));
     }
 
     #[test]

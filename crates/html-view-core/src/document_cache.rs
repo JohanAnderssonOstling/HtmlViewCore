@@ -29,10 +29,14 @@ impl DocumentCache {
         self.capacity == 0
     }
 
-    pub(crate) fn insert_document(&mut self, doc_index: usize, cached: CachedDocument) {
+    pub(crate) fn insert_document(&mut self, doc_index: usize, mut cached: CachedDocument) {
         if self.capacity == 0 {
             return;
         }
+
+        // Cached documents retain layout and intrinsic image dimensions, but
+        // only visible documents pin decoded buffers in the shared service.
+        cached.images.deactivate();
 
         if self.documents.contains_key(&doc_index) {
             self.document_order.retain(|cached_index| *cached_index != doc_index);

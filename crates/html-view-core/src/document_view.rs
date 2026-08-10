@@ -12,7 +12,7 @@
 //! Displaying it is not particular, and is not reimplemented here.
 
 use html_view_doc::{DocQuery, TextGeometry};
-use html_view_select::{SelectionState, SelectionView, TableSelectionState};
+use html_view_select::{SelectionMode, SelectionState, SelectionView, TableSelectionState};
 use kurbo::Point;
 
 use crate::{ColumnLayout, LaidOutDocument, VisibleFrame};
@@ -25,25 +25,15 @@ pub(crate) struct DocumentView {
     pub(crate) table_selection: TableSelectionState,
 }
 
-/// A spine item shown after the page, in the columns the page left empty.
-///
-/// It carries what the page keeps in the viewport: which document it is, and
-/// how far into it the screen got. Reading continues from there rather than
-/// from the item's start, since the reader has already seen its opening
-/// beside the page.
-pub(crate) struct FollowingItem {
-    pub(crate) spine: crate::spine_item::SpineItem,
-    pub(crate) doc_index: usize,
-    /// Where this item resumes on the next screen, meaningful only while
-    /// `reached_end` is false.
-    pub(crate) next_start_offset_y: f64,
-    /// Whether the columns it was given held all of it.
-    pub(crate) reached_end: bool,
-}
-
 impl DocumentView {
     pub(crate) fn new(document: LaidOutDocument, layout: ColumnLayout) -> Self {
-        Self { document, layout, frame: VisibleFrame::default(), selection: SelectionState::default(), table_selection: TableSelectionState::default() }
+        Self {
+            document,
+            layout,
+            frame: VisibleFrame::default(),
+            selection: SelectionState::default(),
+            table_selection: TableSelectionState::default(),
+        }
     }
 
     pub(crate) fn doc(&self) -> DocQuery<'_> {
@@ -56,6 +46,14 @@ impl DocumentView {
 
     pub(crate) fn selection_view(&self) -> SelectionView<'_> {
         SelectionView::new(self.geometry(), &self.selection, &self.table_selection)
+    }
+
+    /// Clears every screen- and interaction-derived product while retaining
+    /// the document and reader-owned column layout.
+    pub(crate) fn reset_view_state(&mut self) {
+        self.frame.clear();
+        self.selection = SelectionState::default();
+        self.table_selection = TableSelectionState::default();
     }
 
     pub(crate) fn hit_test_glyph(&self, position: Point) -> Option<u32> {
@@ -71,64 +69,68 @@ impl DocumentView {
         let line_count = {
             let text = self.doc().text();
             for line_idx in 0..text.line_count() {
-                let Some(line) = text.line(line_idx) else { continue };
-                positions.push(crate::LineScreen { point: line.point(), col_index: 0 });
+                let Some(line) = text.line(line_idx) else {
+                    continue;
+                };
+                positions.push(crate::LineScreen {
+                    point: line.point(),
+                    col_index: 0,
+                });
             }
             text.line_count()
         };
-        self.layout.col_count = 1.0;
-        self.frame.current_page_start_line = Some(0);
-        self.frame.current_page_end_line = Some(line_count);
-        self.frame.paint_start_offset_y = 0.0;
+        self.layout = self.layout.for_column_count(1);
         // Selection and hit testing read line positions from the frame, so a
         // document shown whole records every line at its own layout point.
-        self.frame.last_line_positions = positions;
+        self.frame.install_whole_document(line_count, positions);
         self
     }
 
     /// Starts a selection at `position`. The mechanics are the same wherever a
     /// document is shown; what the page does *around* them -- emitting a CFI,
     /// repainting an overlay -- stays with the page.
-    pub(crate) fn begin_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
+    pub(crate) fn begin_selection_at(&mut self, position: Point, mode: SelectionMode) -> bool {
         let Some(glyph_idx) = self.hit_test_glyph(position) else {
             return false;
         };
-        self.selection.selection_anchor = Some(glyph_idx);
-        self.selection.selection_active = Some(glyph_idx);
-        self.selection.is_selecting = true;
-        self.selection.semantic_selection = semantic_selection;
-        self.selection.pending_link_glyph = Some(glyph_idx);
+        self.selection.begin_at_glyph(glyph_idx, mode);
         true
     }
 
-    pub(crate) fn update_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
-        if !self.selection.is_selecting {
-            return false;
-        }
-        self.selection.semantic_selection |= semantic_selection;
-        let Some(glyph_idx) = self.hit_test_glyph(position) else {
-            return false;
-        };
-        self.selection.selection_active = Some(glyph_idx);
-        if self.selection.selection_anchor != self.selection.selection_active {
-            self.selection.pending_link_glyph = None;
-        }
-        true
+    pub(crate) fn update_selection_at(
+        &mut self,
+        position: Point,
+        mode: SelectionMode,
+    ) -> bool {
+        let glyph_idx = self.hit_test_glyph(position);
+        self.selection.update_interaction(glyph_idx, mode)
     }
 
     /// Ends a selection and reports the glyph that still counts as a click.
     pub(crate) fn finish_selection(&mut self) -> Option<u32> {
-        self.selection.is_selecting = false;
-        let click = match (self.selection.selection_anchor, self.selection.selection_active, self.selection.pending_link_glyph) {
-            (Some(anchor), Some(active), Some(pending)) if anchor == active && pending == anchor => Some(anchor),
-            _ => None,
-        };
-        self.selection.pending_link_glyph = None;
-        click
+        self.selection.finish_interaction()
     }
 
     pub(crate) fn selection_text(&self) -> Option<String> {
         let (start, end) = self.selection_view().range()?;
-        self.selection_view().build_semantic_selection_text(start, end).0
+        self.selection_view()
+            .build_semantic_selection_text(start, end)
+            .0
+    }
+
+    pub(crate) fn update_selection_text(&mut self) {
+        let Some((start, end)) = self.selection_view().range() else {
+            self.selection.clear_text();
+            return;
+        };
+        let (plain, ordinary) = self.doc().build_selection_text(start, end);
+        let markdown = if self.selection.interaction().is_semantic() {
+            self.selection_view()
+                .build_semantic_selection_text(start, end)
+                .1
+        } else {
+            ordinary
+        };
+        self.selection.install_text(plain, markdown);
     }
 }

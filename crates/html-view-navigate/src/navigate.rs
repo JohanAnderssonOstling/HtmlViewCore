@@ -10,17 +10,13 @@
 
 use crate::{SpineAnchor, Location, NavContext, NavView};
 use crate::NavigationState;
-use html_view_types::{DocAnchor, PaintDirection, RendererEvent};
+use html_view_types::{DocAnchor, RendererEvent};
 
 /// Characters per reported reading location. Fixed-size spans keep location
 /// numbers stable as font size and column width change.
 const LOCATION_CHARS: u64 = 150;
 
 impl NavigationState {
-    pub fn find_doc_index_by_uri_or_suffix(&self, candidate: &str) -> Option<usize> {
-        self.document_uris.iter().position(|uri| uri == candidate).or_else(|| self.document_uris.iter().position(|uri| uri.ends_with(candidate)))
-    }
-
     pub fn fragment_part(fragment: &str) -> Option<String> {
         (!fragment.is_empty()).then(|| fragment.to_string())
     }
@@ -28,7 +24,7 @@ impl NavigationState {
     // -- position queries ---------------------------------------------------
 
     pub fn find_start_line(&self, cx: NavView<'_>) -> usize {
-        cx.doc.start_line_at(cx.viewport.start_offset_y, 0.1)
+        cx.doc.start_line_at(cx.viewport.composition().start_offset_y(), 0.1)
     }
 
     /// The glyph at the top of the page on screen, or at the scroll offset when
@@ -37,7 +33,7 @@ impl NavigationState {
         if cx.doc.text().lines().is_empty() {
             return None;
         }
-        let line_idx = cx.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line(cx));
+        let line_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx));
         cx.doc.text().line(line_idx).map(|line| line.start())
     }
 
@@ -45,7 +41,7 @@ impl NavigationState {
     /// when a filter is active. With a filter, no match means no anchor rather
     /// than falling back to an arbitrary id in the markup.
     pub fn current_anchor_id(&self, cx: NavView<'_>) -> Option<String> {
-        let current_y = cx.viewport.start_offset_y;
+        let current_y = cx.viewport.composition().start_offset_y();
         let filter = self.toc_anchors.filter();
 
         if let Some(current_glyph) = self.current_glyph_position(cx)
@@ -72,19 +68,24 @@ impl NavigationState {
     }
 
     pub fn current_location(&self, cx: NavView<'_>) -> Location {
-        (self.current_doc_index, self.current_anchor_id(cx))
+        Location::new(self.current_doc_index, self.current_anchor_id(cx))
     }
 
     // -- moving within the document -----------------------------------------
 
-    fn jump_to_forward_offset(&mut self, cx: &mut NavContext<'_>, start_offset_y: f64, pending_nav_anchor_update: bool) {
-        cx.viewport.direction = PaintDirection::Forward;
-        cx.viewport.reached_end = false;
-        cx.viewport.back_anchor_end_line = None;
-        cx.viewport.start_offset_y = start_offset_y;
-        cx.viewport.end_offset_y = cx.viewport.start_offset_y;
+    fn begin_forward_at(&mut self, cx: &mut NavContext<'_>, start_offset_y: f64) {
+        cx.viewport.begin_forward_at(start_offset_y);
         cx.host.request_repaint();
-        self.pending_nav_anchor_update = pending_nav_anchor_update;
+    }
+
+    pub fn restore_forward_offset(&mut self, cx: &mut NavContext<'_>, start_offset_y: f64) {
+        self.begin_forward_at(cx, start_offset_y);
+        self.pending_nav_anchor_update = false;
+    }
+
+    pub fn advance_to_forward_offset(&mut self, cx: &mut NavContext<'_>, start_offset_y: f64) {
+        self.begin_forward_at(cx, start_offset_y);
+        self.pending_nav_anchor_update = true;
     }
 
     pub fn restore_glyph_position(&mut self, cx: &mut NavContext<'_>, glyph_idx: u32) {
@@ -95,7 +96,7 @@ impl NavigationState {
             return;
         };
         let y = line.point().y;
-        self.jump_to_forward_offset(cx, y, false);
+        self.restore_forward_offset(cx, y);
         self.anchor_at(Some(glyph_idx));
     }
 
@@ -112,7 +113,7 @@ impl NavigationState {
         let line_y = line.point().y;
         let line_start = line.start();
         let line_end = line.end();
-        self.jump_to_forward_offset(cx, line_y, false);
+        self.restore_forward_offset(cx, line_y);
         self.anchor_at((line_start < line_end).then_some(line_start));
         true
     }
@@ -130,7 +131,6 @@ impl NavigationState {
 
     pub fn jump_to_id(&mut self, cx: &mut NavContext<'_>, id: &str) -> bool {
         let Some(id_idx) = cx.doc.view().lookup_string(id) else {
-            println!("jump_to_id: missing id '{}'", id);
             return false;
         };
         let addressing = cx.doc.view().addressing();
@@ -139,7 +139,6 @@ impl NavigationState {
                 let y = pos.y();
                 return self.restore_anchor_position(cx, y);
             }
-            println!("jump_to_id: no glyph for id '{}'", id);
             return false;
         };
         self.restore_glyph_position(cx, glyph_idx);
@@ -155,7 +154,7 @@ impl NavigationState {
         if lines.is_empty() {
             return false;
         }
-        let current_idx = cx.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line(cx.view()));
+        let current_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx.view()));
         let Some(current_line) = lines.get(current_idx) else {
             return false;
         };
@@ -168,46 +167,51 @@ impl NavigationState {
             return false;
         };
         let y = target_line.point().y;
-        self.jump_to_forward_offset(cx, y, true);
+        self.advance_to_forward_offset(cx, y);
         true
     }
 
-    pub fn prev_line(&mut self, cx: &mut NavContext<'_>) {
+    /// Scrolls one line toward the beginning of this document, reporting
+    /// whether there was one.
+    pub fn prev_line(&mut self, cx: &mut NavContext<'_>) -> bool {
         let lines = cx.doc.text().lines();
         if lines.is_empty() {
-            return;
+            return false;
         }
-        let current_idx = cx.frame.current_page_start_line.unwrap_or_else(|| self.find_start_line(cx.view()));
+        let current_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx.view()));
         let Some(current_line) = lines.get(current_idx) else {
-            return;
+            return false;
         };
         if current_line.point().y <= 0.0 && current_idx == 0 {
-            return;
+            return false;
         }
         let search_y = current_line.point().y.max(0.0);
         let Some(target_idx) = cx.doc.end_line_at(search_y, 0.1) else {
-            return;
+            return false;
         };
         if let Some(target_line) = lines.get(target_idx) {
             let y = target_line.point().y;
-            self.jump_to_forward_offset(cx, y, true);
+            self.advance_to_forward_offset(cx, y);
+            return true;
         }
+        false
     }
 
     /// Settles the viewport after arriving in a document.
     pub fn finish_document_navigation(&mut self, cx: &mut NavContext<'_>, anchor: DocAnchor) {
         match anchor {
             DocAnchor::Start => {
-                cx.viewport.direction = PaintDirection::Forward;
-                cx.viewport.start_offset_y = 0.0;
-                cx.viewport.end_offset_y = 0.0;
+                cx.viewport.begin_forward_at(0.0);
             }
             DocAnchor::End => {
-                cx.viewport.direction = PaintDirection::Backward;
-                if let Some(last) = cx.doc.text().lines().last() {
-                    cx.viewport.end_offset_y = last.point().y + last.height();
-                    cx.viewport.back_anchor_end_line = Some(cx.doc.text().line_count().saturating_sub(1));
-                }
+                let (end_offset_y, anchor_end_line) =
+                    cx.doc.text().lines().last().map_or((0.0, None), |last| {
+                        (
+                            last.point().y + last.height(),
+                            Some(cx.doc.text().line_count().saturating_sub(1)),
+                        )
+                    });
+                cx.viewport.begin_backward_at(end_offset_y, anchor_end_line);
             }
             DocAnchor::Glyph(glyph_idx) => {
                 self.restore_glyph_position(cx, glyph_idx);
@@ -246,19 +250,6 @@ impl NavigationState {
         self.toc_anchors.rebuild(cx.doc, current_doc);
     }
 
-    pub fn update_history_availability_signals(&mut self, host: &dyn html_view_types::RendererHost) {
-        self.history.emit_availability(host);
-    }
-
-    pub fn push_history_location(&mut self, location: Location, host: &dyn html_view_types::RendererHost) {
-        self.history.push(location, host);
-    }
-
-    pub fn push_current_location_if_missing(&mut self, cx: &mut NavContext<'_>) {
-        let current = self.current_location(cx.view());
-        self.push_history_location(current, cx.host);
-    }
-
     /// Emits every signal derived from the reading position. Each is
     /// deduplicated independently, so an unchanged one stays silent.
     pub fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
@@ -274,7 +265,7 @@ impl NavigationState {
 
         let (fraction, location, total_locations) = self.reading_progress(view, glyph);
         let doc_count = self.document_uris.len();
-        self.signals.progress.emit_if_changed((location, total_locations, current_doc), host, |(location, total_locations, doc)| RendererEvent::ReadingProgress {
+        self.signals.progress.emit_if_changed((fraction, location, total_locations, current_doc), host, |(fraction, location, total_locations, doc)| RendererEvent::ReadingProgress {
             fraction,
             location,
             total_locations,
@@ -419,14 +410,4 @@ mod tests {
         assert_eq!(NavigationState::fragment_part("section-1"), Some("section-1".to_owned()));
     }
 
-    #[test]
-    fn spine_lookup_prefers_an_exact_uri_over_a_suffix_match() {
-        let state = nav(vec![1, 1, 1], 0);
-        let mut state = state;
-        state.document_uris = vec!["a/chapter.html".to_owned(), "chapter.html".to_owned(), "b/chapter.html".to_owned()];
-
-        assert_eq!(state.find_doc_index_by_uri_or_suffix("chapter.html"), Some(1), "an exact match wins over the earlier suffix match");
-        assert_eq!(state.find_doc_index_by_uri_or_suffix("b/chapter.html"), Some(2));
-        assert_eq!(state.find_doc_index_by_uri_or_suffix("missing.html"), None);
-    }
 }

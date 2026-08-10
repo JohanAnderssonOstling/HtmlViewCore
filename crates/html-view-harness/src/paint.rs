@@ -17,11 +17,20 @@ pub struct BufferPainter<'a> {
     height: usize,
     shaper: &'a FontShaper,
     clips: Vec<Rect>,
+    offset: Point,
 }
 
 impl<'a> BufferPainter<'a> {
     pub fn new(buffer: &'a mut [u32], width: usize, height: usize, shaper: &'a FontShaper) -> Self {
-        Self { buffer, width, height, shaper, clips: Vec::new() }
+        Self { buffer, width, height, shaper, clips: Vec::new(), offset: Point::ZERO }
+    }
+
+    pub fn set_offset(&mut self, offset: Point) {
+        self.offset = offset;
+    }
+
+    fn translated_rect(&self, rect: Rect) -> Rect {
+        rect + self.offset.to_vec2()
     }
 
     pub fn clear(&mut self, color: Color) {
@@ -52,6 +61,7 @@ impl<'a> BufferPainter<'a> {
     }
 
     pub fn fill(&mut self, rect: Rect, color: Color) {
+        let rect = self.translated_rect(rect);
         let x0 = rect.x0.max(0.0).round() as usize;
         let y0 = rect.y0.max(0.0).round() as usize;
         let x1 = rect.x1.max(0.0).round().min(self.width as f64) as usize;
@@ -90,6 +100,7 @@ fn pack(red: u8, green: u8, blue: u8) -> u32 {
 
 impl Painter for BufferPainter<'_> {
     fn push_clip(&mut self, rect: Rect) {
+        let rect = self.translated_rect(rect);
         let clip = self.clips.last().map_or(rect, |current| current.intersect(rect));
         self.clips.push(clip);
     }
@@ -109,7 +120,7 @@ impl Painter for BufferPainter<'_> {
     fn draw_glyph_with_color(&mut self, glyph: html::layout::GlyphId, origin: Point, color: u32) {
         let Some(raster) = self.shaper.raster(glyph) else { return };
         let [red, green, blue, alpha] = color.to_be_bytes();
-        self.blit(&raster, origin, Color::rgba8(red, green, blue, alpha));
+        self.blit(&raster, origin + self.offset.to_vec2(), Color::rgba8(red, green, blue, alpha));
     }
 
     fn draw_image(&mut self, _image: &peniko::Image, _hash: &[u8], rect: Rect) {

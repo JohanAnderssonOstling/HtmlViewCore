@@ -1,11 +1,13 @@
 # Parse-level search index
 
-> **Not built.** Notes were addressed by moving flow exclusion and scoped note
-> layout into the engine instead, which removed `scraper` without an index.
-> This plan is kept for two findings that stand on their own: `SourcePosition`
-> is DOM-numbered rather than box-numbered, and whole-book search joins its
-> results to the laid-out document by a bare ordinal. The second is a live
-> defect and is still unfixed.
+> **Implemented compactly.** HtmlEngine builds a parse-only
+> `DocumentTextIndex` containing collapsed text plus one source record per
+> contiguous source run, not per character; DOM paths are interned across
+> those runs. Whole-book results turn positions into CFIs, and progress weights
+> count the same indexed text. Each document index is dropped after that search
+> or counting pass; no publication-
+> wide position map is retained. Semantic note subtrees are excluded by the
+> same predicate that holds them out of reader flow.
 
 Plan for the `html-engine` side of a document text index: what the engine
 builds, where it lives, and why it is not a stage of the layout pipeline.
@@ -16,14 +18,14 @@ expanded here.
 
 ## Why
 
-Three reader features need the text of spine documents that are **not laid
-out**, and each derives it separately:
+The original survey found three consumers of text from spine documents that
+were **not laid out**:
 
-| feature | site | derives text via |
-| --- | --- | --- |
-| footnote previews | `renderer/nav.rs:250-292` | `scraper`, its own parsed DOM |
-| whole-book search | `lib.rs:75-108` | `plain_text_from_fragment` per search |
-| progress weights | `lib.rs:110-112` | `plain_text_from_fragment`, second pass |
+| feature | derives text via |
+| --- | --- |
+| footnote previews | engine-scoped note layout; no second parser |
+| whole-book search | transient `DocumentTextIndex` |
+| progress weights | transient `DocumentTextIndex`, using the same text definition |
 
 The engine already answers this for the current document. It cannot answer it
 for the rest without laying them out, so the reader re-derives it — badly, and
@@ -39,26 +41,27 @@ A parse-level index, built from a source string without style or layout.
 
 ```rust
 pub struct DocumentTextIndex {
-    /// Plain text, whitespace-collapsed. Callers match against this.
     text: String,
-    /// Sorted by `text_start`. Maps offsets in `text` to source positions.
-    runs: Vec<TextRun>,
-    /// Element paths, deduped — consecutive runs usually share one.
-    paths: Vec<Box<[SourceElementStep]>>,
+    runs: Vec<SourceTextRun>,
+    path_count: usize,
 }
 
-struct TextRun {
-    text_start: u32,   // char offset into `text`
-    len: u32,
-    path: u32,         // index into `paths`
-    text_step: u32,    // text node within that element
-    utf16_base: u32,   // UTF-16 offset in the source node where the run starts
+struct SourceTextRun {
+    text_start: usize,
+    text_end: usize,
+    byte_start: usize,
+    byte_end: usize,
+    element_steps: Arc<[usize]>,
+    text_step: usize,
+    utf16_offset: usize,
 }
 ```
 
-Lookup is a binary search on `text_start`, then `utf16_base + (offset -
-text_start)`. That yields the `{ elements, text_step, utf16_offset }` triple
-`resolve_source_position` already consumes (`html-view-cfi/src/lib.rs:99`).
+Lookup binary-searches run ends, then counts UTF-16 units only in the matching
+run's text slice. That yields the `{ elements, text_step, utf16_offset }` triple
+the CFI resolver consumes. A 2,500-word fixture retains the necessary 2,500
+whitespace-delimited runs but only one shared DOM path. Direct tests pin both
+properties.
 
 ### Runs split at whitespace discontinuities
 
@@ -103,17 +106,11 @@ The layout pipeline runs per document, on documents that get laid out. Search
 needs the documents that never do. Making indexing a pipeline stage would force
 layout across the whole book — the cost the index exists to avoid.
 
-So the builder lives in `html-parse`, beside `plain_text_from_fragment`, with two
-entry points onto one implementation:
-
-1. **Standalone** — `DocumentTextIndex::build(source)`, parse only. The path
-   search uses, for nearly every document.
-2. **Pipeline byproduct** — the pipeline exposes the index for the document it
-   has just parsed. Free, since the parse already happened.
-
-Entry point 2 matters more than it looks. Navigating to a search hit loads that
-document through the pipeline anyway, so the position map for the target comes
-out of that same parse. No reparse on the interactive path.
+The builder therefore lives in `html-parse` and accepts an already parsed
+document through `DocumentTextIndex::from_parsed`. Reader-side
+`document_text_index(source, uri)` owns syntax selection and parsing. Search and
+progress both use that helper, process one document, retain only their small
+result (CFIs or a length), and drop the index before reading the next document.
 
 ## Engine changes
 
@@ -133,31 +130,28 @@ Mostly relocation. Nothing here touches layout.
 3. **Add the index builder** in `html-parse`: walk text nodes, emit `text` plus
    `runs`, sharing the lifted path construction.
 
-4. **Add note queries** on `ParsedHtml` (already public, already reachable as
-   `html::parse`): `is_note_target(id)`, `note_blocks(id)`. These retire the
-   `scraper` path; they use the predicate from step 2.
+4. **Exclude semantic note subtrees** from indexed reading-flow text using the
+   shared `html_dom::element_is_note_target` predicate. Note preview content is
+   supplied independently by scoped engine layout.
 
-## Open decisions
+## Decisions
 
-**Should note text be searchable?** Left open deliberately. Excluding it means
-users cannot find text the book plainly contains and the reader will happily
-show in a popup. The likely right answer is to index note text and mark the hit
-as belonging to a note, so activating it opens the popup rather than scrolling
-the flow. That changes what a run records, so it should be settled before the
-builder is written.
+**Searchable notes.** The implemented policy is that search and progress model
+reader flow, so semantic note targets are excluded. A future feature can index
+notes separately and attach popup navigation without changing flow search.
 
-**Memory.** Text is order 1–2 MB per book. Runs are the larger half and were
-estimated, not measured — plausibly tens of megabytes for a large book if held
-for every document. This is why text and positions are separate structures: text
-for every document, session-lived; runs built on demand for the one document
-being resolved. Measure before revisiting.
+**Memory.** Neither text nor source runs are session-lived. Search retains only
+the result CFI and excerpt; progress retains only one integer weight per
+document. Within a transient index, storage scales with collapsed text plus DOM
+text-run records and unique paths rather than characters multiplied by
+source-path objects.
 
 ## Non-goals
 
-- **Persistence.** Built per session, held in memory. No serialization, no
-  version stamps, no fingerprints. Consumers that later want persistence will
-  need an extraction-version stamp and a source fingerprint, since a change to
-  extraction rules silently invalidates stored indexes.
+- **Persistence.** Indexes are transient and are not serialized. Consumers that
+  later want persistence will need an extraction-version stamp and a source
+  fingerprint, since a change to extraction rules silently invalidates stored
+  indexes.
 - **Search semantics.** Case folding, diacritics and whole-word matching stay
   reader-side in `find_text_matches` (`html-view-doc/src/lib.rs:594`). The engine
   supplies text and positions; the reader decides what matches.
@@ -166,19 +160,12 @@ being resolved. Measure before revisiting.
 
 ## Sequencing
 
-The engine work is steps 1–4 above and gates the reader-side changes:
+The source-position index, reader search integration, progress-weight reuse,
+compact run storage, and note-flow exclusion are complete. Persistence remains
+out of scope unless a future consumer needs it.
 
-- reader search consumes the index; `BookSearchMatch` carries a text offset
-  instead of `occurrence`, and `navigate_to_book_match` (`lib.rs:682-690`)
-  resolves it structurally
-- progress weights read from the same text
-- footnote previews move to `note_blocks`; `scraper`, `FootnoteDocumentIndex`
-  and its LRU are deleted
-- `READER_FOOTNOTE_CSS` moves into the engine, last
-
-Two things stand independently of the engine and can land first: an in-memory
-text store using today's `plain_text_from_fragment`, and a test pinning the
-ordinal-join defect described in `scraper-usage.md`.
+The ordinal-join regression is pinned with styled-hidden text between visible
+matches, which previously selected the wrong later occurrence.
 
 **Constraint.** The `HtmlEngine` clone is on the pinned commit `7b97c5e` but
 carries uncommitted work across `html-layout` (flex/grid, block flow, absolute

@@ -234,15 +234,15 @@ fn pagination_boundary_anchors(doc: DocQuery<'_>) -> BoundaryAnchors {
     // Replaced content participates in a line but has no text glyph range.
     // Use its positive box geometry only as a fallback; zero-height empty
     // boxes must anchor to later content instead of stealing a coincident line.
-    for box_idx in 0..boxes.len() {
+    for (box_idx, first_line_for_box) in first_line.iter_mut().enumerate() {
         let (Some(point), Some(size)) = (boxes.point(box_idx), boxes.size(box_idx)) else {
             continue;
         };
-        if size.height <= 0.01 || first_line[box_idx].is_some() {
+        if size.height <= 0.01 || first_line_for_box.is_some() {
             continue;
         }
         let bottom = point.y + size.height;
-        first_line[box_idx] = doc.first_line_in_vertical_range(point.y, bottom);
+        *first_line_for_box = doc.first_line_in_vertical_range(point.y, bottom);
     }
 
     let mut subtree_end = (0..boxes.len()).collect::<Vec<_>>();
@@ -279,6 +279,13 @@ pub struct PaginationEvents {
 }
 
 /// Paginates a document into reader pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaginationMode {
+    Web,
+    Book,
+    BookWithVerticalRhythm,
+}
+
 #[derive(Clone, Copy)]
 pub struct Paginator<'a> {
     pub(crate) doc: DocQuery<'a>,
@@ -290,8 +297,13 @@ pub struct Paginator<'a> {
 }
 
 impl<'a> Paginator<'a> {
-    pub fn new(doc: DocQuery<'a>, layout: &'a ColumnLayout, book_optimized: bool, vertical_rhythm: bool) -> Self {
-        Self { doc, layout, book_optimized, vertical_rhythm }
+    pub fn new(doc: DocQuery<'a>, layout: &'a ColumnLayout, mode: PaginationMode) -> Self {
+        Self {
+            doc,
+            layout,
+            book_optimized: !matches!(mode, PaginationMode::Web),
+            vertical_rhythm: matches!(mode, PaginationMode::BookWithVerticalRhythm),
+        }
     }
 
     pub fn events(&self) -> PaginationEvents {
@@ -430,7 +442,7 @@ impl<'a> Paginator<'a> {
             children[parent_slot].push(box_idx);
         }
 
-        for box_idx in 0..boxes.len() {
+        for (box_idx, child_boxes) in children.iter().take(boxes.len()).enumerate() {
             let (Some(point), Some(size)) = (boxes.point(box_idx), boxes.size(box_idx)) else {
                 continue;
             };
@@ -446,7 +458,7 @@ impl<'a> Paginator<'a> {
                 events.push(event);
             }
 
-            let owns_line_flow = boxes.is_block_container(box_idx) && !children[box_idx].iter().any(|&child| boxes.is_block_container(child)) && !boxes.is_table(box_idx) && !boxes.ancestors(box_idx).any(|ancestor| boxes.is_table(ancestor));
+            let owns_line_flow = boxes.is_block_container(box_idx) && !child_boxes.iter().any(|&child| boxes.is_block_container(child)) && !boxes.is_table(box_idx) && !boxes.ancestors(box_idx).any(|ancestor| boxes.is_table(ancestor));
             if owns_line_flow && block_lines.len() > 1 {
                 for (count, from_end) in [(boxes.orphans(box_idx), false), (boxes.widows(box_idx), true)] {
                     let count = count.min(block_lines.len());
@@ -711,8 +723,8 @@ mod tests {
     }
 
     /// Paginates one page and returns (line index, column, screen y) per line.
-    fn paginate(document: &LaidOutDocument, layout: &ColumnLayout, book: bool) -> Vec<(usize, i32, f64)> {
-        let paginator = Paginator::new(DocQuery::new(document), layout, book, false);
+    fn paginate(document: &LaidOutDocument, layout: &ColumnLayout, mode: PaginationMode) -> Vec<(usize, i32, f64)> {
+        let paginator = Paginator::new(DocQuery::new(document), layout, mode);
         let events = paginator.events();
         let page = paginator.page_at(&events, 0.0, Vec::new());
         page.positions.iter().map(|(line, screen)| (line, screen.col_index, screen.point.y)).collect()
@@ -727,7 +739,7 @@ mod tests {
     #[test]
     fn lines_that_do_not_fit_move_to_the_next_column() {
         let document = layout(PARAGRAPHS, 200.0);
-        let placed = paginate(&document, &columns(200.0, 40.0, 2.0), true);
+        let placed = paginate(&document, &columns(200.0, 40.0, 2.0), PaginationMode::Book);
 
         assert!(!placed.is_empty(), "something must be laid out");
         let columns_used: Vec<i32> = placed.iter().map(|(_, col, _)| *col).collect();
@@ -739,7 +751,7 @@ mod tests {
     fn every_placed_line_sits_within_its_column() {
         let document = layout(PARAGRAPHS, 200.0);
         let geometry = columns(200.0, 40.0, 2.0);
-        for (line, _, y) in paginate(&document, &geometry, true) {
+        for (line, _, y) in paginate(&document, &geometry, PaginationMode::Book) {
             assert!(y >= 0.0, "line {line} was placed above its column");
             assert!(y < geometry.size.height, "line {line} at y={y} overflows the {}px column", geometry.size.height);
         }
@@ -748,7 +760,7 @@ mod tests {
     #[test]
     fn a_forced_break_before_moves_content_to_a_fresh_column() {
         let document = layout("<p>aaa</p><p style='break-before: column'>bbb</p>", 200.0);
-        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), true);
+        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), PaginationMode::Book);
 
         assert_eq!(column_of(&placed, 0), Some(0));
         assert_eq!(column_of(&placed, 1), Some(1), "an authored column break must move the paragraph even though the column has room");
@@ -760,7 +772,7 @@ mod tests {
         let document = layout(source, 200.0);
         let layout = columns(200.0, 200.0, 2.0);
 
-        let book = paginate(&document, &layout, true);
+        let book = paginate(&document, &layout, PaginationMode::Book);
         assert_eq!(column_of(&book, 0), Some(0));
         assert_ne!(column_of(&book, 1), Some(0), "a chapter section should not share a page with preceding content");
     }
@@ -771,7 +783,7 @@ mod tests {
         let document = layout(source, 200.0);
         let layout = columns(200.0, 200.0, 2.0);
 
-        let web = paginate(&document, &layout, false);
+        let web = paginate(&document, &layout, PaginationMode::Web);
         assert_eq!(column_of(&web, 0), Some(0));
         assert_eq!(column_of(&web, 1), Some(0), "web composition paginates on CSS alone, so the section stays in flow");
     }
@@ -784,7 +796,7 @@ mod tests {
         let document = layout(source, 60.0);
         let layout = columns(60.0, 60.0, 2.0);
 
-        let book = paginate(&document, &layout, true);
+        let book = paginate(&document, &layout, PaginationMode::Book);
         let item_lines: Vec<i32> = book.iter().skip(1).map(|(_, col, _)| *col).collect();
         assert!(item_lines.len() > 1, "the fixture must wrap onto several lines or the test proves nothing: {book:?}");
         assert!(item_lines.windows(2).all(|w| w[0] == w[1]), "a compact list item must not be split across columns: {book:?}");
@@ -794,7 +806,7 @@ mod tests {
     fn events_are_empty_under_web_composition() {
         let document = layout("<table><tr><td>aaa</td></tr></table><section epub:type='chapter'><p>bbb</p></section>", 200.0);
         let layout = columns(200.0, 200.0, 2.0);
-        let paginator = Paginator::new(DocQuery::new(&document), &layout, false, false);
+        let paginator = Paginator::new(DocQuery::new(&document), &layout, PaginationMode::Web);
         let events = paginator.events();
 
         assert!(events.tables.is_empty(), "table pagination is a book-composition rule");
@@ -805,14 +817,14 @@ mod tests {
     fn pagination_is_deterministic_for_the_same_inputs() {
         let document = layout(PARAGRAPHS, 200.0);
         let layout = columns(200.0, 40.0, 2.0);
-        assert_eq!(paginate(&document, &layout, true), paginate(&document, &layout, true));
+        assert_eq!(paginate(&document, &layout, PaginationMode::Book), paginate(&document, &layout, PaginationMode::Book));
     }
 
     #[test]
     fn a_later_start_offset_begins_at_a_later_line() {
         let document = layout(PARAGRAPHS, 200.0);
         let layout = columns(200.0, 40.0, 2.0);
-        let paginator = Paginator::new(DocQuery::new(&document), &layout, true, false);
+        let paginator = Paginator::new(DocQuery::new(&document), &layout, PaginationMode::Book);
         let events = paginator.events();
 
         let first = paginator.page_at(&events, 0.0, Vec::new());
@@ -823,7 +835,7 @@ mod tests {
     #[test]
     fn an_empty_document_paginates_to_nothing() {
         let document = layout("", 200.0);
-        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), true);
+        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), PaginationMode::Book);
         assert!(placed.is_empty());
     }
 }

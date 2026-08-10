@@ -23,7 +23,7 @@ pub fn write_builtin_spine() -> Result<PathBuf, String> {
 
     // Numbered so the provider's sorted listing is the reading order.
     let documents = [
-        ("01-preface.html", "<html><head><style>body{margin:0 8px;font-family:serif;} p{margin:0 0 0.8em;}</style></head><body><h1>Preface</h1><p>A short opening that does not fill its column, so what follows it has somewhere to go.</p></body></html>".to_owned()),
+        ("01-preface.html", "<html><head><style>body{margin:0 8px;font-family:serif;} p{margin:0 0 0.8em;} a{font-size:1.25em;font-weight:bold;}</style></head><body><h1>Footnote popup test</h1><p>Click the numbered reference to open a popup at the click point: <a epub:type='noteref' role='doc-noteref' href='#popup-note'>[1]</a></p><p>Resize the window or move through the columns to exercise different viewport quadrants. Escape closes the popup.</p><aside id='popup-note' epub:type='footnote' role='doc-footnote'><p>This note is an overlay. It does not consume space in the document flow, and the popup corner touching the reference is chosen from the available viewport space.</p></aside></body></html>".to_owned()),
         ("02-chapter-one.html", chapter("h1", "Chapter One", 14)),
         ("03-interlude.html", "<html><head><style>body{margin:0 8px;font-family:serif;}</style></head><body><h2>Interlude</h2><p>Brief.</p></body></html>".to_owned()),
         ("04-chapter-two.html", chapter("h1", "Chapter Two", 11)),

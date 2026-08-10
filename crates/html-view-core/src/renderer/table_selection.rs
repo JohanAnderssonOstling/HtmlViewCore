@@ -35,10 +35,6 @@ impl RendererCore {
         true
     }
 
-    pub(crate) fn finish_table_selection_drag(&mut self) -> bool {
-        self.page.view.table_selection.finish_drag()
-    }
-
     pub fn clear_table_selection(&mut self) -> bool {
         if !self.page.view.table_selection.clear() {
             return false;
@@ -68,39 +64,4 @@ impl RendererCore {
         Ok(true)
     }
 
-    pub(crate) fn table_selection_active(&self) -> bool {
-        self.page.view.table_selection.is_active()
-    }
-
-    pub fn table_at(&self, position: Point) -> bool {
-        self.selection_view().table_at(position)
-    }
-
-    pub fn table_selection_at(&self, position: Point) -> bool {
-        self.selection_view().table_selection_at(position)
-    }
-
-    pub fn selection_range(&self) -> Option<(u32, u32)> {
-        self.selection_view().range()
-    }
-
-    pub fn selection_contains_point(&self, position: Point) -> bool {
-        self.selection_view().contains_point(position)
-    }
-
-    pub fn update_selection_text(&mut self) {
-        let (plain, markdown) = {
-            let view = self.selection_view();
-            let Some((start, end)) = view.range() else {
-                self.page.view.selection.selected_text = None;
-                self.page.view.selection.selected_text_markdown = None;
-                return;
-            };
-            let (plain, ordinary) = view.geo.doc.build_selection_text(start, end);
-            let markdown = if self.page.view.selection.semantic_selection { view.build_semantic_selection_text(start, end).1 } else { ordinary };
-            (plain, markdown)
-        };
-        self.page.view.selection.selected_text = plain;
-        self.page.view.selection.selected_text_markdown = markdown;
-    }
 }

@@ -259,6 +259,14 @@ under their old paths, so the public API is unchanged.
 
 ## Final crate layout
 
+Cross-document orchestration is now split by responsibility instead of
+accumulating again in one `renderer/nav.rs`: href/history transactions live in
+`nav/href.rs`, note acquisition in `nav/notes.rs`, and spine residency plus
+document activation in `nav/spine.rs`. The facade retains only shared movement,
+signals, setup, and reader settings. Tests live in `nav/tests.rs` so production
+navigation is roughly 1,200 lines across small modules rather than one file of
+more than 4,000 lines.
+
 | crate | code | tests | depends on |
 | --- | ---: | ---: | --- |
 | `html-view-core` | 3880 | 2805 | all of the below |

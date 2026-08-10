@@ -21,3 +21,4 @@ peniko.workspace = true
 fontdue = "0.9"
 softbuffer = "0.4"
 winit = "0.30"
+arboard = "3.6.1"

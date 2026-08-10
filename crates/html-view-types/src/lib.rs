@@ -35,6 +35,21 @@ pub struct RendererAnnotation {
     pub color: [u8; 4],
 }
 
+/// A glyph together with the spine document whose glyph registry owns it.
+/// Raw glyph indices are deliberately not sufficient for screen-wide input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentGlyph {
+    pub doc: usize,
+    pub glyph: u32,
+}
+
+/// An image together with the spine document whose resource table owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentImage {
+    pub doc: usize,
+    pub image: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReaderPaintPalette {
     pub foreground: Option<u32>,
@@ -97,10 +112,6 @@ pub struct RendererInitialConfig {
     pub image_sizing_policy: html::pipeline::ImageSizingPolicy,
     pub text_composition_policy: html::pipeline::TextCompositionPolicy,
     pub note_display: NoteDisplay,
-    /// Shows the spine as one continuous run rather than a document at a time.
-    /// Each spine item still begins at the top of a column, so a document
-    /// boundary is always a column boundary.
-    pub continuous_spine: bool,
     /// Opt-in pagination-only spacing refinement. This never changes DOM/CSS
     /// layout; it only distributes bounded page slack over existing block gaps.
     pub vertical_rhythm: bool,
@@ -121,7 +132,6 @@ impl Default for RendererInitialConfig {
             image_sizing_policy: html::pipeline::ImageSizingPolicy::SmartStandalone,
             text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
             note_display: NoteDisplay::default(),
-            continuous_spine: false,
             vertical_rhythm: false,
             paint_palette: Default::default(),
             interaction_palette: Default::default(),
@@ -131,43 +141,66 @@ impl Default for RendererInitialConfig {
     }
 }
 
-/// A note the reader has asked its host to show.
-///
-/// `note` is the note laid out on its own, ready to paint through the same
-/// path as the page. `blocks` is its flattened text, kept for hosts that
-/// present notes as plain strings.
-///
-/// The laid-out note is shared rather than copied: a host holds a preview for
-/// as long as its popup is open and clones it freely while rendering.
-#[derive(Clone)]
+/// Metadata telling a host where to present the renderer-owned note surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupAnchorCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Viewport-local overlay placement for a footnote popup. `corner` names the
+/// popup corner that the host places exactly at `point`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FootnotePopupAnchor {
+    pub point: Point,
+    pub corner: PopupAnchorCorner,
+}
+
+impl FootnotePopupAnchor {
+    pub fn at_click(point: Point, viewport: Size) -> Self {
+        let opens_right = point.x <= viewport.width / 2.0;
+        let opens_down = point.y <= viewport.height / 2.0;
+        let corner = match (opens_right, opens_down) {
+            (true, true) => PopupAnchorCorner::TopLeft,
+            (false, true) => PopupAnchorCorner::TopRight,
+            (true, false) => PopupAnchorCorner::BottomLeft,
+            (false, false) => PopupAnchorCorner::BottomRight,
+        };
+        Self { point, corner }
+    }
+
+    /// Converts the touching-corner contract into the popup's top-left
+    /// viewport origin after the host knows the popup's final size.
+    pub fn popup_origin(self, popup: Size) -> Point {
+        match self.corner {
+            PopupAnchorCorner::TopLeft => self.point,
+            PopupAnchorCorner::TopRight => Point::new(self.point.x - popup.width, self.point.y),
+            PopupAnchorCorner::BottomLeft => Point::new(self.point.x, self.point.y - popup.height),
+            PopupAnchorCorner::BottomRight => {
+                Point::new(self.point.x - popup.width, self.point.y - popup.height)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FootnotePreview {
     pub href: String,
-    pub blocks: Vec<String>,
-    pub note: std::sync::Arc<html::layout::LaidOutDocument>,
+    /// Present for pointer activation and absent for programmatic previews.
+    pub anchor: Option<FootnotePopupAnchor>,
 }
-
-// A laid-out document is neither comparable nor printable, and neither is
-// useful here: a preview is identified by the reference it came from.
-impl fmt::Debug for FootnotePreview {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FootnotePreview").field("href", &self.href).field("blocks", &self.blocks).finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for FootnotePreview {
-    fn eq(&self, other: &Self) -> bool {
-        self.href == other.href && self.blocks == other.blocks
-    }
-}
-
-impl Eq for FootnotePreview {}
 
 #[derive(Clone, Debug)]
 pub enum RendererCommand {
     NavigateToHref(String),
     NavigateHistory(i8),
     NavigateDocument(i8),
-    SetPosition { doc: usize, glyph: Option<u32> },
+    SetPosition {
+        doc: usize,
+        glyph: Option<u32>,
+    },
     SetCfiPosition(Option<String>),
     SetProgressFraction(f32),
     SetDocumentTextLengths(Vec<u64>),
@@ -182,11 +215,23 @@ pub enum RendererCommand {
     SetTextCompositionPolicy(html::pipeline::TextCompositionPolicy),
     SetReaderPaintPalette(ReaderPaintPalette),
     SetScale(f64),
-    SetSearchActive(bool),
+    ActivateSearch,
+    DeactivateSearch,
     SetSearchQuery(String),
-    SetSearch { query: String, options: SearchOptions },
-    SetSearchResults { query: String, options: SearchOptions, results: Vec<BookSearchMatch> },
-    AppendSearchResults { query: String, options: SearchOptions, results: Vec<BookSearchMatch> },
+    SetSearch {
+        query: String,
+        options: SearchOptions,
+    },
+    SetSearchResults {
+        query: String,
+        options: SearchOptions,
+        results: Vec<BookSearchMatch>,
+    },
+    AppendSearchResults {
+        query: String,
+        options: SearchOptions,
+        results: Vec<BookSearchMatch>,
+    },
     NavigateSearch(i8),
     SetAnnotations(Vec<RendererAnnotation>),
     UpsertAnnotation(RendererAnnotation),
@@ -194,30 +239,65 @@ pub enum RendererCommand {
     SetMediaOverlayTarget(Option<String>),
     RequestVisibleText,
     CopySelection,
-    CopySelectionCitation { title: String, cfi: Option<String> },
+    CopySelectionCitation {
+        title: String,
+        cfi: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum RendererEvent {
-    PositionChanged { doc: usize, glyph: Option<u32> },
+    PositionChanged {
+        doc: usize,
+        glyph: Option<u32>,
+    },
     CfiChanged(Option<String>),
-    NavAnchorChanged { doc: usize, anchor: Option<String> },
+    NavAnchorChanged {
+        doc: usize,
+        anchor: Option<String>,
+    },
     TitleChanged(Option<String>),
     TocChanged(Vec<TocEntry>),
-    MatchInfo { current: usize, total: usize },
+    MatchInfo {
+        current: usize,
+        total: usize,
+    },
     SearchResults(Vec<BookSearchMatch>),
-    HistoryAvailability { back: bool, forward: bool },
+    HistoryAvailability {
+        back: bool,
+        forward: bool,
+    },
     SearchActiveChanged(bool),
     ColumnWidthChanged(f64),
     FontSizeChanged(f32),
     ScaleChanged(f64),
-    ReadingProgress { fraction: f32, location: u64, total_locations: u64, doc: usize, doc_count: usize },
-    SelectionFinished { doc: usize, cfi_range: String, exact_text: String, prefix: Option<String>, suffix: Option<String> },
-    AnnotationActivated { id: String },
+    ReadingProgress {
+        fraction: f32,
+        location: u64,
+        total_locations: u64,
+        doc: usize,
+        doc_count: usize,
+    },
+    SelectionFinished {
+        doc: usize,
+        cfi_range: String,
+        exact_text: String,
+        prefix: Option<String>,
+        suffix: Option<String>,
+    },
+    AnnotationActivated {
+        id: String,
+    },
     FootnoteOpened(FootnotePreview),
     SpeakableText(String),
-    ImageOpened { uri: String, bytes: Vec<u8> },
-    OperationFailed { operation: RendererOperation, message: String },
+    ImageOpened {
+        uri: String,
+        bytes: Vec<u8>,
+    },
+    OperationFailed {
+        operation: RendererOperation,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,10 +333,9 @@ pub trait RendererHost {
     ///
     /// A glyph id indexes the registry of the document it was shaped from, so
     /// ids only mean something alongside the document they came from. A host
-    /// that shows one document at a time never needs to know: there is only
-    /// ever one registry in play, and the default here ignores the call. A
-    /// host reading a continuous spine keeps a table per document and switches
-    /// to this one.
+    /// that shows one document at a time normally needs only one registry.
+    /// Popup notes may belong to another spine item, so hosts can still keep
+    /// document-qualified registries and switch to the requested one.
     ///
     /// Called before every stretch of work that belongs to a single document,
     /// so a host may treat it as the current one until told otherwise.
@@ -293,7 +372,15 @@ pub struct RendererRevisions {
 
 impl Default for RendererRevisions {
     fn default() -> Self {
-        Self { document: 1, style: 1, shape: 1, layout: 1, base_display: 1, overlay: 1, resources: 1 }
+        Self {
+            document: 1,
+            style: 1,
+            shape: 1,
+            layout: 1,
+            base_display: 1,
+            overlay: 1,
+            resources: 1,
+        }
     }
 }
 
@@ -443,7 +530,10 @@ pub struct VisibleLinePositions {
 impl VisibleLinePositions {
     pub fn with_buffer(first_line: usize, mut positions: Vec<LineScreen>) -> Self {
         positions.clear();
-        Self { first_line, positions }
+        Self {
+            first_line,
+            positions,
+        }
     }
 
     pub fn first_line(&self) -> usize {
@@ -477,20 +567,6 @@ impl VisibleLinePositions {
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, LineScreen)> + '_ {
         self.positions.iter().copied().enumerate().map(|(offset, screen)| (self.first_line + offset, screen))
-    }
-
-    /// Moves every line right by `columns`, for content paginated from its own
-    /// first column and then placed after something else.
-    ///
-    /// Painting reads the recorded point rather than recomputing it from the
-    /// column index, so a shift that moved only the index would leave the
-    /// content drawn over whatever it was meant to sit beside.
-    pub fn shift_columns(&mut self, columns: i32, layout: &ColumnLayout) {
-        let distance = f64::from(columns) * (layout.col_width + layout.col_gap);
-        for screen in &mut self.positions {
-            screen.col_index += columns;
-            screen.point.x += distance;
-        }
     }
 
     pub fn push(&mut self, screen: LineScreen) {
@@ -532,14 +608,114 @@ pub struct ColumnLayout {
     pub max_col_count: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnGeometry {
+    pub width: f64,
+    pub count: f64,
+    pub gap: f64,
+    pub viewport: Size,
+    pub scale: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnViewportPlan {
+    requested_column_width: f64,
+    column_width_changed: bool,
+}
+
+impl ColumnViewportPlan {
+    pub fn requested_column_width(self) -> f64 {
+        self.requested_column_width
+    }
+
+    pub fn column_width_changed(self) -> bool {
+        self.column_width_changed
+    }
+}
+
 impl ColumnLayout {
+    pub fn geometry(&self) -> ColumnGeometry {
+        ColumnGeometry {
+            width: self.col_width,
+            count: self.col_count,
+            gap: self.col_gap,
+            viewport: self.size,
+            scale: self.scale,
+        }
+    }
+
+    /// Starts a viewport reconfiguration in layout coordinates and reports
+    /// whether accepting its effective width requires a document relayout.
+    pub fn begin_viewport_reconfiguration(&mut self, viewport: Size) -> ColumnViewportPlan {
+        self.size = viewport;
+        self.size /= self.scale;
+        let effective = if self.size.width > 0.0 {
+            self.base_col_width.min(self.size.width)
+        } else {
+            self.base_col_width
+        };
+        let changed = (effective - self.col_width).abs() > 24.0;
+        ColumnViewportPlan {
+            requested_column_width: if changed { effective } else { self.col_width },
+            column_width_changed: changed,
+        }
+    }
+
+    /// Finishes viewport reconfiguration after the caller has accepted or
+    /// rejected the width-dependent document relayout.
+    pub fn finish_viewport_reconfiguration(&mut self, accepted_width: Option<f64>) {
+        const MIN_GAP: f64 = 20.0;
+        if let Some(width) = accepted_width {
+            self.col_width = width;
+        }
+        let raw_count = ((self.size.width + MIN_GAP) / (self.col_width + MIN_GAP)).floor();
+        self.col_count = self.max_col_count.map_or(raw_count.max(1.0), |maximum| {
+            raw_count.max(1.0).min(f64::from(maximum))
+        });
+        self.col_gap = ((self.size.width - self.col_count * self.col_width)
+            / (self.col_count + 1.0))
+            .max(0.0);
+    }
+
+    pub fn commit_column_width(&mut self, base_width: Option<f64>, effective_width: Option<f64>) {
+        if let Some(width) = base_width {
+            self.base_col_width = width;
+        }
+        if let Some(width) = effective_width {
+            self.col_width = width;
+        }
+    }
+
+    pub fn update_scale(&mut self, requested: f64) -> Option<f64> {
+        let scale = requested.clamp(0.5, 3.0);
+        if (scale - self.scale).abs() < f64::EPSILON {
+            return None;
+        }
+        self.scale = scale;
+        Some(scale)
+    }
+
+    /// Produces geometry for a temporary document slice without changing the
+    /// reader's persistent column preference.
+    pub fn for_column_count(&self, count: usize) -> Self {
+        let mut layout = self.clone();
+        layout.col_count = count.max(1) as f64;
+        layout
+    }
+
     /// Compute x-coordinate for a column given a local x offset
     #[inline]
     pub fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
         self.col_gap + col_index * (self.col_width + self.col_gap) + local_x
     }
 
-    pub fn resolve_point_at(&self, point: Point, elem_height: f64, mut render_state: RenderState, start_offset_y: f64) -> (Option<Point>, RenderState) {
+    pub fn resolve_point_at(
+        &self,
+        point: Point,
+        elem_height: f64,
+        mut render_state: RenderState,
+        start_offset_y: f64,
+    ) -> (Option<Point>, RenderState) {
         // map document point to screen columns
         let mut y = point.y + render_state.y_offset - start_offset_y;
         let mut col_index = (y / self.size.height).floor(); // initial column based on vertical position
@@ -570,63 +746,371 @@ impl ColumnLayout {
         const MIN_GAP: f64 = 20.0;
         let effective_gap = (self.col_gap - MIN_GAP).max(0.0);
         let half_gap = effective_gap / 2.0;
-        crate::InlineMetrics { offset: half_gap / 2.0 }
+        crate::InlineMetrics {
+            offset: half_gap / 2.0,
+        }
     }
-
 }
 
 impl Default for ColumnLayout {
     fn default() -> Self {
-        Self { col_width: 600.0, base_col_width: 600.0, col_count: 0.0, col_gap: 0.0, size: Size::ZERO, scale: 1.0, max_col_count: None }
+        Self {
+            col_width: 600.0,
+            base_col_width: 600.0,
+            col_count: 0.0,
+            col_gap: 0.0,
+            size: Size::ZERO,
+            scale: 1.0,
+            max_col_count: None,
+        }
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ViewportState {
-    pub direction: PaintDirection,
-    pub start_offset_y: f64,
-    pub end_offset_y: f64,
-    pub back_start_offset_y: f64,
-    pub back_anchor_end_line: Option<usize>,
-    pub reached_end: bool,
-    pub next_start_offset_y: f64,
+    composition: ViewportComposition,
+    backward: BackwardComposition,
+    continuation: ViewportContinuation,
+}
+
+#[derive(Clone, Copy)]
+pub struct ViewportComposition {
+    direction: PaintDirection,
+    start_offset_y: f64,
+    end_offset_y: f64,
+}
+
+impl ViewportComposition {
+    pub fn direction(self) -> PaintDirection {
+        self.direction
+    }
+
+    pub fn start_offset_y(self) -> f64 {
+        self.start_offset_y
+    }
+
+    pub fn end_offset_y(self) -> f64 {
+        self.end_offset_y
+    }
+
+    pub fn active_offset_y(self) -> f64 {
+        match self.direction {
+            PaintDirection::Forward => self.start_offset_y,
+            PaintDirection::Backward => self.end_offset_y,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViewportContinuation {
+    MoreAt(f64),
+    EndedAt(f64),
+}
+
+impl ViewportContinuation {
+    pub fn reached_end(self) -> bool {
+        matches!(self, Self::EndedAt(_))
+    }
+
+    pub fn next_start_offset_y(self) -> f64 {
+        match self {
+            Self::MoreAt(offset_y) | Self::EndedAt(offset_y) => offset_y,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct BackwardComposition {
+    start_offset_y: f64,
+    anchor_end_line: Option<usize>,
+}
+
+impl BackwardComposition {
+    pub fn start_offset_y(self) -> f64 {
+        self.start_offset_y
+    }
+
+    pub fn anchor_end_line(self) -> Option<usize> {
+        self.anchor_end_line
+    }
+}
+
+impl ViewportState {
+    pub fn composition(&self) -> ViewportComposition {
+        self.composition
+    }
+
+    pub fn continuation(&self) -> ViewportContinuation {
+        self.continuation
+    }
+
+    pub fn backward_composition(&self) -> BackwardComposition {
+        self.backward
+    }
+
+    /// Starts a fresh forward composition whose screen begins at `offset_y`.
+    pub fn begin_forward_at(&mut self, offset_y: f64) {
+        self.composition = ViewportComposition {
+            direction: PaintDirection::Forward,
+            start_offset_y: offset_y,
+            end_offset_y: offset_y,
+        };
+        self.backward = BackwardComposition {
+            start_offset_y: 0.0,
+            anchor_end_line: None,
+        };
+        self.continuation = ViewportContinuation::MoreAt(offset_y);
+    }
+
+    /// Starts a fresh backward composition ending at the supplied document
+    /// offset and, when known, line.
+    pub fn begin_backward_at(&mut self, end_offset_y: f64, anchor_end_line: Option<usize>) {
+        self.composition.direction = PaintDirection::Backward;
+        self.composition.end_offset_y = end_offset_y;
+        self.backward = BackwardComposition {
+            start_offset_y: 0.0,
+            anchor_end_line,
+        };
+        self.continuation = ViewportContinuation::MoreAt(
+            self.continuation.next_start_offset_y(),
+        );
+    }
+
+    /// Installs the viewport metadata carried by a cached forward page.
+    pub fn install_forward_page(
+        &mut self,
+        start_offset_y: f64,
+        continuation: ViewportContinuation,
+    ) {
+        self.begin_forward_at(start_offset_y);
+        self.continuation = continuation;
+    }
+
+    /// Publishes the continuation returned by forward pagination.
+    pub fn update_forward_result(&mut self, continuation: ViewportContinuation) {
+        self.continuation = continuation;
+    }
+
+    /// Publishes the visible start found while composing backward. A later
+    /// forward page begins where that backward composition ended.
+    pub fn finish_backward_composition(&mut self, start_offset_y: f64) {
+        self.composition.start_offset_y = start_offset_y;
+        self.continuation = ViewportContinuation::MoreAt(self.composition.end_offset_y);
+    }
+
+    /// Resets transient output before resolving a backward page.
+    pub fn begin_backward_preparation(&mut self) {
+        debug_assert!(matches!(self.composition.direction, PaintDirection::Backward));
+        self.continuation = ViewportContinuation::MoreAt(
+            self.continuation.next_start_offset_y(),
+        );
+    }
+
+    /// Updates the candidate document offset used to compose backward.
+    pub fn set_backward_composition_start(&mut self, start_offset_y: f64) {
+        debug_assert!(matches!(self.composition.direction, PaintDirection::Backward));
+        self.backward.start_offset_y = start_offset_y;
+    }
 }
 
 impl Default for ViewportState {
     fn default() -> Self {
-        Self { direction: PaintDirection::Forward, start_offset_y: 0.0, end_offset_y: 0.0, back_start_offset_y: 0.0, back_anchor_end_line: None, reached_end: false, next_start_offset_y: 0.0 }
+        Self {
+            composition: ViewportComposition {
+                direction: PaintDirection::Forward,
+                start_offset_y: 0.0,
+                end_offset_y: 0.0,
+            },
+            backward: BackwardComposition {
+                start_offset_y: 0.0,
+                anchor_end_line: None,
+            },
+            continuation: ViewportContinuation::MoreAt(0.0),
+        }
     }
 }
 
 #[derive(Default)]
 pub struct VisibleFrame {
-    pub current_page_start_line: Option<usize>,
-    pub current_page_end_line: Option<usize>,
-    pub last_line_positions: VisibleLinePositions,
-    pub paint_start_offset_y: f64,
-    pub use_cached_inline_positions: bool,
-    pub offset_breaks: Vec<(f64, f64)>,
-    pub repeated_table_headers: Vec<RepeatedTableHeader>,
-    pub geometry_key: Option<FrameGeometryCacheKey>,
-    pub shaped_lines: Vec<VisibleShapedLineFragment>,
-    pub native_shape_failures: HashSet<usize>,
-    pub line_shape_key: Option<LineShapeFrameKey>,
+    page: VisiblePageGeometry,
+    geometry_key: Option<FrameGeometryCacheKey>,
+    shaping: VisibleShapeCache,
+}
+
+#[derive(Default)]
+pub struct VisiblePageGeometry {
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    line_positions: VisibleLinePositions,
+    paint_start_offset_y: f64,
+    uses_cached_inline_positions: bool,
+    offset_breaks: Vec<(f64, f64)>,
+    repeated_table_headers: Vec<RepeatedTableHeader>,
+}
+
+impl VisiblePageGeometry {
+    pub fn start_line(&self) -> Option<usize> {
+        self.start_line
+    }
+
+    pub fn end_line(&self) -> Option<usize> {
+        self.end_line
+    }
+
+    pub fn line_positions(&self) -> &VisibleLinePositions {
+        &self.line_positions
+    }
+
+    pub fn paint_start_offset_y(&self) -> f64 {
+        self.paint_start_offset_y
+    }
+
+    pub fn uses_cached_inline_positions(&self) -> bool {
+        self.uses_cached_inline_positions
+    }
+
+    pub fn offset_breaks(&self) -> &[(f64, f64)] {
+        &self.offset_breaks
+    }
+
+    pub fn repeated_table_headers(&self) -> &[RepeatedTableHeader] {
+        &self.repeated_table_headers
+    }
+}
+
+#[derive(Default)]
+pub struct VisibleShapeCache {
+    shaped_lines: Vec<VisibleShapedLineFragment>,
+    native_failures: HashSet<usize>,
+    key: Option<LineShapeFrameKey>,
+}
+
+impl VisibleShapeCache {
+    pub fn shaped_lines(&self) -> &[VisibleShapedLineFragment] {
+        &self.shaped_lines
+    }
+
+    pub fn native_failures(&self) -> &HashSet<usize> {
+        &self.native_failures
+    }
+
+    pub fn key(&self) -> Option<LineShapeFrameKey> {
+        self.key
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InlinePositionMode {
+    Flow,
+    Recorded,
 }
 
 impl VisibleFrame {
+    pub fn page(&self) -> &VisiblePageGeometry {
+        &self.page
+    }
+
+    pub fn shaping(&self) -> &VisibleShapeCache {
+        &self.shaping
+    }
+
+    pub fn geometry_key(&self) -> Option<FrameGeometryCacheKey> {
+        self.geometry_key
+    }
+
+    pub fn set_geometry_key(&mut self, key: FrameGeometryCacheKey) {
+        self.geometry_key = Some(key);
+    }
+
+    pub fn take_line_positions(&mut self) -> VisibleLinePositions {
+        std::mem::take(&mut self.page.line_positions)
+    }
+
+    /// Frames a document whose complete line geometry is visible at once.
+    pub fn install_whole_document(
+        &mut self,
+        line_count: usize,
+        positions: VisibleLinePositions,
+    ) -> VisibleLinePositions {
+        let previous = std::mem::replace(&mut self.page.line_positions, positions);
+        self.page.start_line = Some(0);
+        self.page.end_line = Some(line_count);
+        self.page.paint_start_offset_y = 0.0;
+        self.page.uses_cached_inline_positions = false;
+        self.page.offset_breaks.clear();
+        self.page.repeated_table_headers.clear();
+        previous
+    }
+
+    /// Installs an ordinary forward page whose inline geometry is resolved
+    /// from document flow during painting.
+    pub fn install_flow_page(
+        &mut self,
+        page: PagePositions,
+        paint_start_offset_y: f64,
+        paint_end_line: Option<usize>,
+    ) -> VisibleLinePositions {
+        self.install_page(page, paint_start_offset_y, paint_end_line, InlinePositionMode::Flow)
+    }
+
+    /// Installs a page that has already been positioned, such as backward
+    /// composition.
+    pub fn install_positioned_page(
+        &mut self,
+        page: PagePositions,
+        paint_start_offset_y: f64,
+        paint_end_line: Option<usize>,
+    ) -> VisibleLinePositions {
+        self.install_page(
+            page,
+            paint_start_offset_y,
+            paint_end_line,
+            InlinePositionMode::Recorded,
+        )
+    }
+
+    fn install_page(
+        &mut self,
+        page: PagePositions,
+        paint_start_offset_y: f64,
+        paint_end_line: Option<usize>,
+        inline_positions: InlinePositionMode,
+    ) -> VisibleLinePositions {
+        let PagePositions {
+            start_line,
+            positions,
+            offset_breaks,
+            repeated_table_headers,
+            ..
+        } = page;
+        let previous_positions = std::mem::replace(&mut self.page.line_positions, positions);
+        self.page.start_line = Some(start_line);
+        self.page.end_line = paint_end_line;
+        self.page.paint_start_offset_y = paint_start_offset_y;
+        self.page.uses_cached_inline_positions = matches!(inline_positions, InlinePositionMode::Recorded);
+        self.page.offset_breaks = offset_breaks;
+        self.page.repeated_table_headers = repeated_table_headers;
+        previous_positions
+    }
+
     pub fn clear_backend_shaping(&mut self) {
-        self.shaped_lines.clear();
-        self.native_shape_failures.clear();
-        self.line_shape_key = None;
+        self.shaping.shaped_lines.clear();
+        self.shaping.native_failures.clear();
+        self.shaping.key = None;
+    }
+
+    pub fn record_native_shape_failure(&mut self, line: usize) {
+        self.shaping.native_failures.insert(line);
     }
 
     pub fn clear(&mut self) {
-        self.current_page_start_line = None;
-        self.current_page_end_line = None;
-        self.last_line_positions.clear();
-        self.paint_start_offset_y = 0.0;
-        self.use_cached_inline_positions = false;
-        self.offset_breaks.clear();
-        self.repeated_table_headers.clear();
+        self.page.start_line = None;
+        self.page.end_line = None;
+        self.page.line_positions.clear();
+        self.page.paint_start_offset_y = 0.0;
+        self.page.uses_cached_inline_positions = false;
+        self.page.offset_breaks.clear();
+        self.page.repeated_table_headers.clear();
         self.geometry_key = None;
         self.clear_backend_shaping();
     }
@@ -649,20 +1133,146 @@ pub struct SearchOptions {
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self { match_case: false, whole_word: false, match_diacritics: false, scope: SearchScope::WholeBook }
+        Self {
+            match_case: false,
+            whole_word: false,
+            match_diacritics: false,
+            scope: SearchScope::WholeBook,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BookSearchMatch {
     pub doc: usize,
-    pub occurrence: usize,
+    pub target: BookSearchTarget,
     pub excerpt: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum BookSearchTarget {
+    /// A durable source address produced without laying out the document.
+    SourceCfi(String),
+    /// Current-document search already owns its glyph matches.
+    LocalOccurrence(usize),
 }
 
 #[cfg(test)]
 mod renderer_revision_tests {
     use super::*;
+
+    #[test]
+    fn popup_anchor_corner_opens_into_the_roomiest_viewport_quadrant() {
+        let viewport = Size::new(800.0, 600.0);
+        let top_left = FootnotePopupAnchor::at_click(Point::new(100.0, 100.0), viewport);
+        assert_eq!(top_left.corner, PopupAnchorCorner::TopLeft);
+        assert_eq!(top_left.popup_origin(Size::new(240.0, 160.0)), top_left.point);
+        assert_eq!(
+            FootnotePopupAnchor::at_click(Point::new(700.0, 100.0), viewport).corner,
+            PopupAnchorCorner::TopRight
+        );
+        assert_eq!(
+            FootnotePopupAnchor::at_click(Point::new(100.0, 500.0), viewport).corner,
+            PopupAnchorCorner::BottomLeft
+        );
+        assert_eq!(
+            FootnotePopupAnchor::at_click(Point::new(700.0, 500.0), viewport).corner,
+            PopupAnchorCorner::BottomRight
+        );
+    }
+
+    #[test]
+    fn forward_composition_clears_transient_backward_and_continuation_state() {
+        let mut viewport = ViewportState::default();
+        viewport.begin_backward_at(2.0, Some(4));
+        viewport.set_backward_composition_start(3.0);
+        viewport.update_forward_result(ViewportContinuation::EndedAt(5.0));
+
+        viewport.begin_forward_at(12.0);
+
+        let composition = viewport.composition();
+        let backward = viewport.backward_composition();
+        let continuation = viewport.continuation();
+        assert!(matches!(composition.direction(), PaintDirection::Forward));
+        assert_eq!(composition.start_offset_y(), 12.0);
+        assert_eq!(composition.end_offset_y(), 12.0);
+        assert_eq!(backward.start_offset_y(), 0.0);
+        assert_eq!(backward.anchor_end_line(), None);
+        assert!(!continuation.reached_end());
+        assert_eq!(continuation.next_start_offset_y(), 12.0);
+    }
+
+    #[test]
+    fn backward_composition_installs_its_end_anchor() {
+        let mut viewport = ViewportState::default();
+
+        viewport.begin_backward_at(24.0, Some(7));
+
+        assert!(matches!(viewport.composition().direction(), PaintDirection::Backward));
+        assert_eq!(viewport.composition().end_offset_y(), 24.0);
+        assert_eq!(viewport.backward_composition().start_offset_y(), 0.0);
+        assert_eq!(viewport.backward_composition().anchor_end_line(), Some(7));
+        assert!(!viewport.continuation().reached_end());
+
+        viewport.finish_backward_composition(8.0);
+        assert_eq!(viewport.composition().start_offset_y(), 8.0);
+        assert_eq!(viewport.continuation().next_start_offset_y(), 24.0);
+    }
+
+    #[test]
+    fn cached_forward_page_installs_its_continuation() {
+        let mut viewport = ViewportState::default();
+
+        viewport.install_forward_page(10.0, ViewportContinuation::EndedAt(30.0));
+
+        assert!(matches!(viewport.composition().direction(), PaintDirection::Forward));
+        assert_eq!(viewport.composition().start_offset_y(), 10.0);
+        assert_eq!(viewport.composition().end_offset_y(), 10.0);
+        assert!(viewport.continuation().reached_end());
+        assert_eq!(viewport.continuation().next_start_offset_y(), 30.0);
+    }
+
+    #[test]
+    fn visible_frame_installs_page_positions_as_one_transition() {
+        let mut frame = VisibleFrame::default();
+        let mut previous_positions = VisibleLinePositions::default();
+        previous_positions.push(LineScreen {
+            point: Point::new(1.0, 2.0),
+            col_index: 0,
+        });
+        frame.install_whole_document(1, previous_positions);
+        let mut positions = VisibleLinePositions::with_buffer(4, Vec::new());
+        positions.push(LineScreen {
+            point: Point::new(3.0, 4.0),
+            col_index: 1,
+        });
+        let page = PagePositions {
+            start_line: 4,
+            last_line: Some(8),
+            positions,
+            offset_breaks: vec![(10.0, 20.0)],
+            repeated_table_headers: vec![RepeatedTableHeader {
+                source_left: 1.0,
+                source_right: 2.0,
+                source_top: 3.0,
+                source_bottom: 4.0,
+                col_index: 1,
+            }],
+            reached_end: false,
+            next_start_offset_y: 50.0,
+        };
+
+        let previous = frame.install_positioned_page(page, 12.0, Some(7));
+
+        assert_eq!(previous.len(), 1);
+        assert_eq!(frame.page().start_line(), Some(4));
+        assert_eq!(frame.page().end_line(), Some(7));
+        assert_eq!(frame.page().paint_start_offset_y(), 12.0);
+        assert!(frame.page().uses_cached_inline_positions());
+        assert_eq!(frame.page().line_positions().first_line(), 4);
+        assert_eq!(frame.page().offset_breaks(), vec![(10.0, 20.0)]);
+        assert_eq!(frame.page().repeated_table_headers().len(), 1);
+    }
 
     #[test]
     fn overlay_invalidation_does_not_expire_base_display() {
@@ -697,4 +1307,3 @@ mod renderer_revision_tests {
         assert_eq!(revisions.overlay, overlay);
     }
 }
-

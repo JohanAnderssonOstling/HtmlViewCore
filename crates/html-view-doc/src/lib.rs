@@ -9,6 +9,12 @@ use kurbo::Point;
 use std::collections::HashSet;
 use std::ops::Range;
 
+#[derive(Clone, Copy)]
+enum GlyphAffinity {
+    Leading,
+    Trailing,
+}
+
 use html::layout::{LaidOutDocument, RenderTableCell};
 use html_view_types::{ColumnLayout, FormatState, RendererAnnotation, SearchOptions, VisibleFrame};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -85,10 +91,15 @@ impl<'a> DocQuery<'a> {
         let tag = self.box_tag(box_idx);
         let style = self.boxes().text_format(box_idx);
 
-        let mut state = FormatState::default();
-        state.italic = matches!(style.font_style, html::layout::FontStyle::Italic | html::layout::FontStyle::Oblique);
-        state.bold = style.font_weight >= 600;
-        state.strike = style.text_decoration.line_through();
+        let mut state = FormatState {
+            italic: matches!(
+                style.font_style,
+                html::layout::FontStyle::Italic | html::layout::FontStyle::Oblique
+            ),
+            bold: style.font_weight >= 600,
+            strike: style.text_decoration.line_through(),
+            ..FormatState::default()
+        };
 
         if tag_is_one_of(&tag, &["em", "i"]) {
             state.italic = true;
@@ -235,10 +246,17 @@ impl<'a> DocQuery<'a> {
         }
     }
 
-    pub fn box_text_glyph_ranges(self, box_idx: usize, include_marker: bool) -> Vec<Range<u32>> {
+    pub fn box_text_glyph_ranges(self, box_idx: usize) -> Vec<Range<u32>> {
         let text = self.text();
         let mut ranges = text.text_runs().filter(|run| self.box_descends_from(run.box_idx(), box_idx)).map(|run| run.glyphs()).collect::<Vec<_>>();
-        if include_marker && let Some(marker) = self.boxes().list_marker(box_idx) {
+        ranges.sort_by_key(|range| range.start);
+        ranges
+    }
+
+    pub fn box_text_and_marker_glyph_ranges(self, box_idx: usize) -> Vec<Range<u32>> {
+        let mut ranges = self.box_text_glyph_ranges(box_idx);
+        if let Some(marker) = self.boxes().list_marker(box_idx) {
+            let text = self.text();
             ranges.extend(text.marker_runs().only_box(marker.marker_box()).map(|run| run.glyphs()));
         }
         ranges.sort_by_key(|range| range.start);
@@ -410,9 +428,7 @@ impl<'a> DocQuery<'a> {
 
     pub fn end_line_at(self, offset_y: f64, epsilon: f64) -> Option<usize> {
         let lines = self.text().lines();
-        let Some(first_line) = lines.first() else {
-            return None;
-        };
+        let first_line = lines.first()?;
         if first_line.point().y + first_line.height() > offset_y + epsilon {
             return None;
         }
@@ -639,25 +655,28 @@ impl<'a> TextGeometry<'a> {
     }
 
     pub fn shaped_line_fragments(&self, line_idx: usize) -> impl Iterator<Item = (f64, &html::layout::ShapedLine)> {
-        self.frame.shaped_lines.iter().filter(move |fragment| fragment.shaped.line_index == line_idx).map(|fragment| (fragment.offset_x, &fragment.shaped))
+        self.frame.shaping().shaped_lines().iter().filter(move |fragment| fragment.shaped.line_index == line_idx).map(|fragment| (fragment.offset_x, &fragment.shaped))
     }
 
     pub fn glyph_x_in_line(&self, line: &html::layout::RenderLine, glyph_idx: u32) -> f64 {
-        self.glyph_x_in_line_with_affinity(line, glyph_idx, false)
+        self.glyph_x_in_line_with_affinity(line, glyph_idx, GlyphAffinity::Leading)
     }
 
     pub fn glyph_x_in_line_trailing(&self, line: &html::layout::RenderLine, glyph_idx: u32) -> f64 {
-        self.glyph_x_in_line_with_affinity(line, glyph_idx, true)
+        self.glyph_x_in_line_with_affinity(line, glyph_idx, GlyphAffinity::Trailing)
     }
 
-    fn glyph_x_in_line_with_affinity(&self, line: &html::layout::RenderLine, glyph_idx: u32, trailing: bool) -> f64 {
+    fn glyph_x_in_line_with_affinity(&self, line: &html::layout::RenderLine, glyph_idx: u32, affinity: GlyphAffinity) -> f64 {
         // measure x offset of glyph within line
         let line_idx = Some(line.index());
         let position = glyph_idx.clamp(line.start(), line.end());
         if let Some(line_idx) = line_idx {
             let leading = || self.shaped_line_fragments(line_idx).find(|(_, shaped)| shaped.text_range.start == position);
             let trailing_fragment = || self.shaped_line_fragments(line_idx).find(|(_, shaped)| shaped.text_range.start < position && position <= shaped.text_range.end);
-            let containing = if trailing { trailing_fragment().or_else(leading) } else { leading().or_else(trailing_fragment) };
+            let containing = match affinity {
+                GlyphAffinity::Leading => leading().or_else(trailing_fragment),
+                GlyphAffinity::Trailing => trailing_fragment().or_else(leading),
+            };
             if let Some((offset_x, shaped)) = containing
                 && let Some(x) = shaped.x_for_text_position(position)
             {
@@ -673,7 +692,10 @@ impl<'a> TextGeometry<'a> {
                     range.start < position && position <= range.end
                 })
             };
-            if trailing { trailing_fragment().or_else(leading) } else { leading().or_else(trailing_fragment) }
+            match affinity {
+                GlyphAffinity::Leading => leading().or_else(trailing_fragment),
+                GlyphAffinity::Trailing => trailing_fragment().or_else(leading),
+            }
         });
         let (glyphs, mut x) = fallback_fragment.map_or_else(|| (line.glyphs(), line.optical_offset_x()), |fragment| (fragment.glyphs(), line.optical_offset_x() + fragment.offset_x()));
         for i in glyphs.start..glyphs.end {
@@ -705,7 +727,7 @@ impl<'a> TextGeometry<'a> {
     pub fn hit_test_glyph(&self, pos: Point) -> Option<u32> {
         // find nearest glyph index for a screen position
         let lines = self.doc.text().lines();
-        if self.frame.last_line_positions.is_empty() || lines.is_empty() || self.layout.col_count <= 0.0 {
+        if self.frame.page().line_positions().is_empty() || lines.is_empty() || self.layout.col_count <= 0.0 {
             return None;
         }
 
@@ -715,7 +737,7 @@ impl<'a> TextGeometry<'a> {
         let mut best_idx: Option<usize> = None;
         let mut best_vertical_dist = f64::INFINITY;
         let mut best_horizontal_dist = f64::INFINITY;
-        for (idx, screen) in self.frame.last_line_positions.iter() {
+        for (idx, screen) in self.frame.page().line_positions().iter() {
             if screen.col_index != target_col {
                 continue;
             }
@@ -758,7 +780,7 @@ impl<'a> TextGeometry<'a> {
 
         let line_idx = best_idx?;
         let line = lines.get(line_idx)?;
-        let screen = self.frame.last_line_positions.get(line_idx)?;
+        let screen = self.frame.page().line_positions().get(line_idx)?;
         let rel_x = pos.x - screen.point.x;
         let mut native_hit = None;
         let mut native_distance = f64::INFINITY;
@@ -809,7 +831,7 @@ impl<'a> TextGeometry<'a> {
     }
 
     pub fn hit_test_image(&self, pos: Point) -> Option<u32> {
-        if self.frame.last_line_positions.is_empty() || self.layout.col_count <= 0.0 {
+        if self.frame.page().line_positions().is_empty() || self.layout.col_count <= 0.0 {
             return None;
         }
 
@@ -817,7 +839,7 @@ impl<'a> TextGeometry<'a> {
         let target_col = (((pos.x - self.layout.col_gap) / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col);
 
         let fragments = self.doc.view().fragments();
-        for (line_idx, screen) in self.frame.last_line_positions.iter() {
+        for (line_idx, screen) in self.frame.page().line_positions().iter() {
             if screen.col_index != target_col || fragments.images_for_line(line_idx).is_empty() {
                 continue;
             }
@@ -1021,7 +1043,11 @@ mod tests {
         assert_eq!(matches.len(), 2, "both occurrences are found");
         for (start, end) in matches {
             assert_eq!(end - start, 5, "each match spans the query length");
-            assert_eq!(doc.glyph_text(&[start..end]).to_lowercase(), "alpha");
+            let range = start..end;
+            assert_eq!(
+                doc.glyph_text(std::slice::from_ref(&range)).to_lowercase(),
+                "alpha"
+            );
         }
     }
 

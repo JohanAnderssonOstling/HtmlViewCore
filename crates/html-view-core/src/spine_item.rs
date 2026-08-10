@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use html::engine::Engine;
 use html::pipeline::PipelineInputs;
-use html::resources::{ImagePipeline, ResourceProvider};
+use html::resources::{ImagePipeline, ImageService};
 
 use crate::document_view::DocumentView;
 use crate::{ColumnLayout, LaidOutDocument, load};
@@ -38,18 +38,48 @@ pub(crate) struct SpineItem {
 }
 
 impl SpineItem {
-    pub(crate) fn new(loaded: load::LoadedRenderDocument, layout: ColumnLayout, provider: Arc<dyn ResourceProvider>) -> Self {
-        let images = Self::image_pipeline_for(&loaded.document, provider);
-        Self { session: loaded.session, inputs: loaded.inputs, images, view: DocumentView::new(loaded.document, layout) }
+    pub(crate) fn new(
+        loaded: load::LoadedRenderDocument,
+        layout: ColumnLayout,
+        image_service: ImageService,
+    ) -> Self {
+        let images = Self::image_pipeline_for(&loaded.document, image_service);
+        Self {
+            session: loaded.session,
+            inputs: loaded.inputs,
+            images,
+            view: DocumentView::new(loaded.document, layout),
+        }
     }
 
-    pub(crate) fn image_pipeline_for(document: &LaidOutDocument, provider: Arc<dyn ResourceProvider>) -> ImagePipeline {
-        ImagePipeline::new(Arc::new(document.render_view().images().to_vec()), provider)
+    pub(crate) fn image_pipeline_for(
+        document: &LaidOutDocument,
+        image_service: ImageService,
+    ) -> ImagePipeline {
+        ImagePipeline::with_service(
+            Arc::new(document.render_view().images().to_vec()),
+            image_service,
+        )
     }
 
     /// Replaces the document while keeping the item's identity, for a relayout
     /// that produced a new one from the same source.
     pub(crate) fn replace_document(&mut self, document: LaidOutDocument) {
         self.view.document = document;
+    }
+
+    /// Installs the inseparable products of one successful pipeline update.
+    pub(crate) fn install_pipeline_result(
+        &mut self,
+        document: LaidOutDocument,
+        inputs: PipelineInputs,
+    ) -> f32 {
+        self.view.document = document;
+        self.inputs = inputs;
+        self.root_font_size()
+    }
+
+    pub(crate) fn root_font_size(&self) -> f32 {
+        self.inputs.style_environment.root_font_size as f32
     }
 }

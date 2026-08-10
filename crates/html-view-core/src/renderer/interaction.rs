@@ -7,15 +7,34 @@ use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
 use html::pipeline::PipelineInputs;
 
 impl RendererCore {
+    fn visible_view_for_doc(&self, doc: usize) -> Option<&crate::document_view::DocumentView> {
+        (doc == self.nav.location().document()).then_some(&self.page.view)
+    }
+
+    fn visible_view_mut_for_doc(
+        &mut self,
+        doc: usize,
+    ) -> Option<&mut crate::document_view::DocumentView> {
+        (doc == self.nav.location().document()).then_some(&mut self.page.view)
+    }
+
+    /// Hit-tests the current spine item.
+    pub fn hit_test_document_glyph(&self, pos: Point) -> Option<crate::DocumentGlyph> {
+        self.page.view.hit_test_glyph(pos).map(|glyph| crate::DocumentGlyph {
+            doc: self.nav.location().document(),
+            glyph,
+        })
+    }
+
+    pub fn hit_test_document_image(&self, pos: Point) -> Option<crate::DocumentImage> {
+        self.page.view.geometry().hit_test_image(pos).map(|image| crate::DocumentImage {
+            doc: self.nav.location().document(),
+            image,
+        })
+    }
+
     fn install_prepared_page(&mut self, prepared: PreparedPage) {
-        self.viewport.direction = PaintDirection::Forward;
-        self.viewport.start_offset_y = prepared.frame.paint_start_offset_y;
-        self.viewport.end_offset_y = prepared.frame.paint_start_offset_y;
-        self.viewport.back_start_offset_y = 0.0;
-        self.viewport.back_anchor_end_line = None;
-        self.viewport.reached_end = prepared.reached_end;
-        self.viewport.next_start_offset_y = prepared.next_start_offset_y;
-        self.page.view.frame = prepared.frame;
+        prepared.install(&mut self.page.view, &mut self.viewport);
     }
 
     fn restore_prepared_page(&mut self, key: FrameGeometryCacheKey) -> bool {
@@ -27,11 +46,16 @@ impl RendererCore {
     }
 
     pub(crate) fn cache_current_prepared_page(&mut self) {
-        let Some(key) = self.page.view.frame.geometry_key else {
+        let Some(key) = self.page.view.frame.geometry_key() else {
             return;
         };
         let frame = std::mem::take(&mut self.page.view.frame);
-        self.prepared_pages.insert(PreparedPage { key, frame, reached_end: self.viewport.reached_end, next_start_offset_y: self.viewport.next_start_offset_y });
+        let continuation = self.viewport.continuation();
+        self.prepared_pages.insert(PreparedPage {
+            key,
+            frame,
+            continuation,
+        });
     }
 
     pub(crate) fn restore_prepared_page_ending_at(&mut self, end_line: usize) -> bool {
@@ -44,49 +68,47 @@ impl RendererCore {
     }
 
     fn prefetch_next_prepared_page(&mut self) {
-        if self.viewport.direction != PaintDirection::Forward || self.viewport.reached_end {
+        let composition = self.viewport.composition();
+        let continuation = self.viewport.continuation();
+        if composition.direction() != PaintDirection::Forward || continuation.reached_end() {
             return;
         }
 
-        let mut next_start_offset_y = self.viewport.next_start_offset_y;
-        if let Some(end_idx) = self.page.view.frame.current_page_end_line {
+        let mut next_start_offset_y = continuation.next_start_offset_y();
+        if let Some(end_idx) = self.page.view.frame.page().end_line() {
             let next_idx = end_idx + 1;
             if let Some(line) = self.page.view.document.render_view().text().line(next_idx) {
                 next_start_offset_y = line.point().y;
             }
         }
-        if next_start_offset_y <= self.viewport.start_offset_y {
+        if next_start_offset_y <= composition.start_offset_y() {
             return;
         }
 
-        let saved_viewport =
-            (self.viewport.direction, self.viewport.start_offset_y, self.viewport.end_offset_y, self.viewport.back_start_offset_y, self.viewport.back_anchor_end_line, self.viewport.reached_end, self.viewport.next_start_offset_y);
-        self.viewport.direction = PaintDirection::Forward;
-        self.viewport.start_offset_y = next_start_offset_y;
-        self.viewport.end_offset_y = next_start_offset_y;
-        self.viewport.back_start_offset_y = 0.0;
-        self.viewport.back_anchor_end_line = None;
-        self.viewport.reached_end = false;
-        self.viewport.next_start_offset_y = next_start_offset_y;
+        let saved_viewport = self.viewport;
+        self.viewport.begin_forward_at(next_start_offset_y);
         let key = self.frame_geometry_cache_key();
         if self.prepared_pages.contains(key) {
-            (self.viewport.direction, self.viewport.start_offset_y, self.viewport.end_offset_y, self.viewport.back_start_offset_y, self.viewport.back_anchor_end_line, self.viewport.reached_end, self.viewport.next_start_offset_y) =
-                saved_viewport;
+            self.viewport = saved_viewport;
             return;
         }
 
         let current_frame = std::mem::take(&mut self.page.view.frame);
         self.prepare_forward();
-        self.page.view.frame.geometry_key = Some(key);
-        let prepared = PreparedPage { key, frame: std::mem::take(&mut self.page.view.frame), reached_end: self.viewport.reached_end, next_start_offset_y: self.viewport.next_start_offset_y };
+        self.page.view.frame.set_geometry_key(key);
+        let continuation = self.viewport.continuation();
+        let prepared = PreparedPage {
+            key,
+            frame: std::mem::take(&mut self.page.view.frame),
+            continuation,
+        };
         self.page.view.frame = current_frame;
-        (self.viewport.direction, self.viewport.start_offset_y, self.viewport.end_offset_y, self.viewport.back_start_offset_y, self.viewport.back_anchor_end_line, self.viewport.reached_end, self.viewport.next_start_offset_y) =
-            saved_viewport;
+        self.viewport = saved_viewport;
         self.prepared_pages.insert(prepared);
     }
 
     fn schedule_or_prefetch_adjacent_page(&mut self) {
-        let Some(current_key) = self.page.view.frame.geometry_key else {
+        let Some(current_key) = self.page.view.frame.geometry_key() else {
             return;
         };
         if self.prepared_pages.claim_scheduled(current_key) {
@@ -98,10 +120,22 @@ impl RendererCore {
     }
 
     pub(crate) fn open_image_at(&self, position: Point) -> bool {
-        let Some(image_idx) = self.hit_test_image(position) else { return false };
-        let Some(uri) = self.page.view.document.render_view().image_uri(image_idx) else { return false };
-        let Ok(bytes) = self.provider.read_bytes(uri) else { return false };
-        self.host.emit(crate::RendererEvent::ImageOpened { uri: uri.to_owned(), bytes });
+        let Some(hit) = self.hit_test_document_image(position) else {
+            return false;
+        };
+        let Some(view) = self.visible_view_for_doc(hit.doc) else {
+            return false;
+        };
+        let Some(uri) = view.document.render_view().image_uri(hit.image) else {
+            return false;
+        };
+        let Ok(bytes) = self.provider.read_bytes(uri) else {
+            return false;
+        };
+        self.host.emit(crate::RendererEvent::ImageOpened {
+            uri: uri.to_owned(),
+            bytes,
+        });
         true
     }
 
@@ -113,10 +147,16 @@ impl RendererCore {
     }
 
     pub(crate) fn visible_text(&self) -> String {
-        let text_view = self.page.view.document.render_view().text();
+        Self::visible_text_for_view(&self.page.view)
+    }
+
+    fn visible_text_for_view(view: &crate::document_view::DocumentView) -> String {
+        let text_view = view.document.render_view().text();
         let mut visible_glyphs = Vec::new();
-        for (line_index, _) in self.page.view.frame.last_line_positions.iter() {
-            let Some(fragments) = text_view.line_text_fragments(line_index) else { continue };
+        for (line_index, _) in view.frame.page().line_positions().iter() {
+            let Some(fragments) = text_view.line_text_fragments(line_index) else {
+                continue;
+            };
             for fragment in fragments {
                 visible_glyphs.extend(fragment.glyphs());
             }
@@ -133,8 +173,16 @@ impl RendererCore {
                 if previous_line != current_line {
                     let lines_overlap = previous_line
                         .zip(current_line)
-                        .and_then(|(previous_line, current_line)| Some((text_view.line(previous_line)?, text_view.line(current_line)?)))
-                        .is_some_and(|(previous_line, current_line)| previous_line.start() < current_line.end() && current_line.start() < previous_line.end());
+                        .and_then(|(previous_line, current_line)| {
+                            Some((
+                                text_view.line(previous_line)?,
+                                text_view.line(current_line)?,
+                            ))
+                        })
+                        .is_some_and(|(previous_line, current_line)| {
+                            previous_line.start() < current_line.end()
+                                && current_line.start() < previous_line.end()
+                        });
                     if !lines_overlap {
                         text.push('\n');
                     }
@@ -150,20 +198,11 @@ impl RendererCore {
         text.trim().to_owned()
     }
 
-    /// Collects what the items beside the page have decoded.
-    ///
-    /// Only the page's images can change layout from here. An image whose size
-    /// was unknown until it decoded moves the text around it, and that means
-    /// laying the document out again under new inputs -- which the reader only
-    /// does for the document it is reading.
-    fn poll_following_images(&mut self) {
-        let decoded = self.following.iter_mut().fold(false, |decoded, item| decoded | item.spine.images.poll().decoded);
-        if decoded {
-            self.request_resource_repaint();
-        }
-    }
-
-    fn apply_image_poll(&mut self, glyph_shaper: &mut impl GlyphShaper, image_poll: crate::resources::ImagePipelinePoll) {
+    fn apply_image_poll(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        image_poll: crate::resources::ImagePipelinePoll,
+    ) {
         if image_poll.decoded {
             self.request_resource_repaint();
         }
@@ -176,8 +215,22 @@ impl RendererCore {
         let (next_inputs, layout_needed) = apply_image_poll_updates(
             &self.page.inputs,
             &image_poll.dimensions_changed,
-            |image_idx| images.get(image_idx as usize).map(|resource| (resource.width, resource.height, resource.width_attr, resource.height_attr)),
-            |image_idx| self.page.images.get_decoded(image_idx).map(html::resources::DecodedImage::dimensions),
+            |image_idx| {
+                images.get(image_idx as usize).map(|resource| {
+                    (
+                        resource.width,
+                        resource.height,
+                        resource.width_attr,
+                        resource.height_attr,
+                    )
+                })
+            },
+            |image_idx| {
+                self.page
+                    .images
+                    .get_decoded(image_idx)
+                    .map(html::resources::DecodedImage::dimensions)
+            },
         );
 
         if !layout_needed {
@@ -197,141 +250,237 @@ impl RendererCore {
         self.apply_image_poll(glyph_shaper, image_poll);
         self.configure_layout_for_viewport(glyph_shaper, viewport_size);
         let requested_geometry = self.frame_geometry_cache_key();
-        if self.page.view.frame.geometry_key != Some(requested_geometry) {
-            if !self.restore_prepared_page(requested_geometry) {
-                match self.viewport.direction {
-                    PaintDirection::Forward => self.prepare_forward(),
-                    PaintDirection::Backward => self.prepare_backward(),
-                }
-                self.page.view.frame.geometry_key = Some(self.frame_geometry_cache_key());
+        if self.page.view.frame.geometry_key() != Some(requested_geometry)
+            && !self.restore_prepared_page(requested_geometry)
+        {
+            match self.viewport.composition().direction() {
+                PaintDirection::Forward => self.prepare_forward(),
+                PaintDirection::Backward => self.prepare_backward(),
             }
+            self.page
+                .view
+                .frame
+                .set_geometry_key(self.frame_geometry_cache_key());
         }
-        self.fill_following_columns(glyph_shaper);
-        self.poll_following_images();
         self.prefetch_images_for_current_page();
-        self.prefetch_images_for_following();
-        if self.nav.pending_nav_anchor_update {
-            self.update_nav_anchor_from_layout();
+        if self.nav.location().anchor_update_pending() {
+            let view = html_view_navigate::NavView {
+                doc: html_view_doc::DocQuery::new(&self.page.view.document),
+                viewport: &self.viewport,
+                frame: &self.page.view.frame,
+            };
+            self.nav.update_nav_anchor_from_layout(view);
             self.update_nav_signal();
-            self.nav.pending_nav_anchor_update = false;
+            self.nav.mark_anchor_clean();
         }
         self.update_nav_signal();
         self.schedule_or_prefetch_adjacent_page();
     }
 
-    pub(crate) fn configure_layout_for_viewport(&mut self, glyph_shaper: &mut impl GlyphShaper, viewport_size: Size) {
-        const MIN_GAP: f64 = 20.0;
-        self.page.view.layout.size = viewport_size;
-        self.page.view.layout.size /= self.page.view.layout.scale;
-        let effective_col_width = if self.page.view.layout.size.width > 0.0 { self.page.view.layout.base_col_width.min(self.page.view.layout.size.width) } else { self.page.view.layout.base_col_width };
-        let column_width_changed = (effective_col_width - self.page.view.layout.col_width).abs() > 24.0;
-        let requested_col_width = if column_width_changed { effective_col_width } else { self.page.view.layout.col_width };
+    pub(crate) fn configure_layout_for_viewport(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        viewport_size: Size,
+    ) {
+        let plan = self
+            .page
+            .view
+            .layout
+            .begin_viewport_reconfiguration(viewport_size);
+        let requested_col_width = plan.requested_column_width();
         let viewport_height = (self.page.view.layout.size.height.is_finite() && self.page.view.layout.size.height > 0.0).then_some(self.page.view.layout.size.height);
         let media_environment = html::pipeline::MediaEnvironment::screen(requested_col_width, viewport_height).expect("effective viewport dimensions must be finite and positive");
         let media_environment_changed = self.page.inputs.style_environment.media != media_environment;
-        if column_width_changed || media_environment_changed {
+        let accepted_width = if plan.column_width_changed() || media_environment_changed {
             match self.relayout_for_column_width(glyph_shaper, requested_col_width) {
-                Ok(()) => self.page.view.layout.col_width = requested_col_width,
-                Err(error) => self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string()),
+                Ok(()) => Some(requested_col_width),
+                Err(error) => {
+                    self.emit_operation_failed(
+                        crate::RendererOperation::UpdateDocument,
+                        error.to_string(),
+                    );
+                    None
+                }
             }
-        }
-        let raw_col_count = ((self.page.view.layout.size.width + MIN_GAP) / (self.page.view.layout.col_width + MIN_GAP)).floor();
-        self.page.view.layout.col_count = self.page.view.layout.max_col_count.map_or(raw_col_count.max(1.0), |maximum| raw_col_count.max(1.0).min(f64::from(maximum)));
-        self.page.view.layout.col_gap = ((self.page.view.layout.size.width - self.page.view.layout.col_count * self.page.view.layout.col_width) / (self.page.view.layout.col_count + 1.0)).max(0.0);
+        } else {
+            None
+        };
+        self.page
+            .view
+            .layout
+            .finish_viewport_reconfiguration(accepted_width);
     }
 
     /// Returns whether a point in renderer-layout coordinates is over the
     /// painted bounds of a linked glyph.
     pub fn link_at(&self, position: Point) -> bool {
-        let Some(glyph_idx) = self.hit_test_glyph(position) else {
+        let Some(hit) = self.hit_test_document_glyph(position) else {
             return false;
         };
-        if self.page.view.document.render_view().addressing().link_for_glyph(glyph_idx).is_none() {
+        let Some(view) = self.visible_view_for_doc(hit.doc) else {
+            return false;
+        };
+        if view
+            .document
+            .render_view()
+            .addressing()
+            .link_for_glyph(hit.glyph)
+            .is_none()
+        {
             return false;
         }
-        let Some(line_idx) = self.doc().find_line_for_glyph(glyph_idx) else {
+        let geometry = view.geometry();
+        let Some(line_idx) = view.doc().find_line_for_glyph(hit.glyph) else {
             return false;
         };
-        let Some(screen) = self.page.view.frame.last_line_positions.get(line_idx) else {
+        let Some(screen) = view.frame.page().line_positions().get(line_idx) else {
             return false;
         };
-        let Some(line) = self.page.view.document.render_view().text().line(line_idx) else {
+        let Some(line) = view.document.render_view().text().line(line_idx) else {
             return false;
         };
-        let (x0, x1) = self.glyph_x_span_in_line(&line, glyph_idx, glyph_idx.saturating_add(1).min(line.end()));
+        let (x0, x1) = geometry.glyph_x_span_in_line(
+            &line,
+            hit.glyph,
+            hit.glyph.saturating_add(1).min(line.end()),
+        );
         let (x0, x1) = (screen.point.x + x0, screen.point.x + x1);
         position.x >= x0 && position.x <= x1
     }
 
-    pub fn begin_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
-        let Some(glyph_idx) = self.hit_test_glyph(position) else {
+    pub fn begin_selection_at(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
+        let Some(hit) = self.hit_test_document_glyph(position) else {
             return false;
         };
-        self.page.view.selection.selection_anchor = Some(glyph_idx);
-        self.page.view.selection.selection_active = Some(glyph_idx);
-        self.page.view.selection.is_selecting = true;
-        self.page.view.selection.semantic_selection = semantic_selection;
-        self.page.view.selection.pending_link_glyph = Some(glyph_idx);
-        self.update_selection_text();
+        self.page.view.selection.cancel_interaction();
+        let Some(view) = self.visible_view_mut_for_doc(hit.doc) else {
+            return false;
+        };
+        if !view.begin_selection_at(position, mode) {
+            return false;
+        }
+        view.update_selection_text();
         self.request_overlay_repaint();
         true
     }
 
-    pub fn update_selection_at(&mut self, position: Point, semantic_selection: bool) -> bool {
-        if !self.page.view.selection.is_selecting {
+    pub fn update_selection_at(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
+        let active_doc = self
+            .page
+            .view
+            .selection
+            .interaction()
+            .is_selecting()
+            .then(|| self.nav.location().document());
+        let Some(doc) = active_doc else { return false };
+        if self
+            .hit_test_document_glyph(position)
+            .is_none_or(|hit| hit.doc != doc)
+        {
             return false;
         }
-        self.page.view.selection.semantic_selection |= semantic_selection;
-        let Some(glyph_idx) = self.hit_test_glyph(position) else {
+        let Some(view) = self.visible_view_mut_for_doc(doc) else {
             return false;
         };
-        self.page.view.selection.selection_active = Some(glyph_idx);
-        if self.page.view.selection.selection_anchor != self.page.view.selection.selection_active {
-            self.page.view.selection.pending_link_glyph = None;
+        if !view.update_selection_at(position, mode) {
+            return false;
         }
-        self.update_selection_text();
+        view.update_selection_text();
         self.request_overlay_repaint();
         true
     }
 
-    /// Completes selection and returns the glyph that still qualifies as a
-    /// click. The UI backend decides whether and how that click is activated.
-    pub fn finish_selection(&mut self) -> Option<u32> {
-        self.page.view.selection.is_selecting = false;
-        self.update_selection_text();
-        if let (Some((start, end)), Some(exact_text)) = (self.selection_range(), self.page.view.selection.selected_text.clone())
-            && let Some(cfi_range) = crate::cfi::generate_cfi_range(&self.page.view.document, self.nav.current_doc_index, start, end)
+    pub(crate) fn finish_document_selection(&mut self) -> Option<crate::DocumentGlyph> {
+        if !self.page.view.selection.interaction().is_selecting() {
+            return None;
+        }
+        let doc = self.nav.location().document();
+
+        let click = {
+            let view = self.visible_view_mut_for_doc(doc)?;
+            let click = view.finish_selection();
+            view.update_selection_text();
+            click
+        };
+
+        let view = self.visible_view_for_doc(doc)?;
+        if let (Some((start, end)), Some(exact_text)) = (
+            view.selection_view().range(),
+            view.selection.content().plain().map(str::to_owned),
+        ) && let Some(cfi_range) =
+            crate::cfi::generate_cfi_range(&view.document, doc, start, end)
         {
             let prefix_start = start.saturating_sub(48);
-            let glyph_count = self.page.view.document.render_view().text().glyph_count() as u32;
+            let glyph_count = view.document.render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
-            let prefix = self.doc().build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
-            let suffix = self.doc().build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
-            self.host.emit(crate::RendererEvent::SelectionFinished { doc: self.nav.current_doc_index, cfi_range, exact_text, prefix, suffix });
+            let prefix = view
+                .doc()
+                .build_selection_text(prefix_start, start)
+                .0
+                .filter(|value| !value.is_empty());
+            let suffix = view
+                .doc()
+                .build_selection_text(end, suffix_end)
+                .0
+                .filter(|value| !value.is_empty());
+            self.host.emit(crate::RendererEvent::SelectionFinished {
+                doc,
+                cfi_range,
+                exact_text,
+                prefix,
+                suffix,
+            });
         }
-        let click = match (self.page.view.selection.selection_anchor, self.page.view.selection.selection_active, self.page.view.selection.pending_link_glyph) {
-            (Some(anchor), Some(active), Some(pending)) if anchor == active && pending == anchor => Some(anchor),
-            _ => None,
-        };
-        self.page.view.selection.pending_link_glyph = None;
-        click
+        click.map(|glyph| crate::DocumentGlyph { doc, glyph })
     }
 
     pub fn copy_selection_to_clipboard(&self) -> Result<bool, String> {
-        let Some(text) = self.page.view.selection.selected_text_markdown.as_deref() else {
+        if let Some(text) = self
+            .note
+            .as_ref()
+            .and_then(|note| note.selection.content().markdown())
+        {
+            self.host.set_clipboard(text)?;
+            return Ok(true);
+        }
+        if self.page.view.table_selection.is_active() {
+            return self.copy_table_selection();
+        }
+        let text = self
+            .page
+            .view
+            .selection
+            .content()
+            .markdown();
+        let Some(text) = text else {
             return Ok(false);
         };
         self.host.set_clipboard(text)?;
         Ok(true)
     }
 
-    pub fn copy_image_to_clipboard(&self, image_idx: u32) -> Result<(), String> {
-        let decoded = self.page.images.get_decoded(image_idx).ok_or_else(|| format!("image {image_idx} is not decoded yet"))?;
+    pub(crate) fn copy_document_image_to_clipboard(
+        &self,
+        hit: crate::DocumentImage,
+    ) -> Result<(), String> {
+        if hit.doc != self.nav.location().document() {
+            return Err(format!("document {} is not visible", hit.doc));
+        }
+        let decoded = self.page.images
+            .get_decoded(hit.image)
+            .ok_or_else(|| format!("image {} is not decoded yet", hit.image))?;
         match decoded {
-            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(image.width as usize, image.height as usize, image.data.data().to_vec()),
-            html::resources::DecodedImage::Svg { bytes, .. } => self.host.set_clipboard_svg(bytes.to_vec()),
+            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(
+                image.width as usize,
+                image.height as usize,
+                image.data.data().to_vec(),
+            ),
+            html::resources::DecodedImage::Svg { bytes, .. } => {
+                self.host.set_clipboard_svg(bytes.to_vec())
+            }
         }
     }
+
 }
 
 fn apply_image_poll_updates(
@@ -341,10 +490,13 @@ fn apply_image_poll_updates(
     let mut layout_needed = false;
 
     for image_idx in dimensions_changed {
-        let (resource_width, resource_height, width_attr, height_attr) = match image_metadata(*image_idx) {
-            Some((resource_width, resource_height, width_attr, height_attr)) => (resource_width, resource_height, width_attr, height_attr),
-            None => continue,
-        };
+        let (resource_width, resource_height, width_attr, height_attr) =
+            match image_metadata(*image_idx) {
+                Some((resource_width, resource_height, width_attr, height_attr)) => {
+                    (resource_width, resource_height, width_attr, height_attr)
+                }
+                None => continue,
+            };
         let Some((decoded_width, decoded_height)) = decode_sizes(*image_idx) else {
             continue;
         };
@@ -364,33 +516,13 @@ fn apply_image_poll_updates(
 #[cfg(test)]
 mod tests {
     use super::apply_image_poll_updates;
-    use crate::text_backend::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper};
-    use std::collections::HashMap;
-
-    #[derive(Default)]
-    struct TestShaper {
-        glyphs: HashMap<(char, u32), GlyphId>,
-    }
-
-    impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-        }
-
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, crate::layout::ShapeError> {
-            let key = (ch, font_size.to_bits());
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(glyph);
-            }
-            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).unwrap();
-            let glyph = glyph_metrics.register(metric).unwrap();
-            self.glyphs.insert(key, glyph);
-            Ok(glyph)
-        }
-    }
 
     fn test_resources() -> Vec<(u32, u32, Option<u32>, Option<u32>)> {
-        vec![(64, 32, None, None), (12, 12, Some(12), Some(12)), (40, 80, Some(40), None)]
+        vec![
+            (64, 32, None, None),
+            (12, 12, Some(12), Some(12)),
+            (40, 80, Some(40), None),
+        ]
     }
 
     fn base_inputs() -> html::pipeline::PipelineInputs {

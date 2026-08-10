@@ -8,15 +8,27 @@
 
 use std::collections::VecDeque;
 
-use crate::{FrameGeometryCacheKey, VisibleFrame};
+use crate::document_view::DocumentView;
+use crate::{FrameGeometryCacheKey, ViewportContinuation, ViewportState, VisibleFrame};
+#[cfg(test)]
+use crate::{PagePositions, VisibleLinePositions};
 
 const CAPACITY: usize = 3;
 
 pub(crate) struct PreparedPage {
     pub(crate) key: FrameGeometryCacheKey,
     pub(crate) frame: VisibleFrame,
-    pub(crate) reached_end: bool,
-    pub(crate) next_start_offset_y: f64,
+    pub(crate) continuation: ViewportContinuation,
+}
+
+impl PreparedPage {
+    pub(crate) fn install(self, view: &mut DocumentView, viewport: &mut ViewportState) {
+        viewport.install_forward_page(
+            self.frame.page().paint_start_offset_y(),
+            self.continuation,
+        );
+        view.frame = self.frame;
+    }
 }
 
 #[derive(Default)]
@@ -58,7 +70,7 @@ impl PreparedPageCache {
     /// knows which line it wants to land on, not the offset that produces it.
     pub(crate) fn take_ending_at(&mut self, end_line: usize, current: FrameGeometryCacheKey) -> Option<PreparedPage> {
         let index = self.pages.iter().position(|candidate| {
-            candidate.frame.current_page_end_line == Some(end_line)
+            candidate.frame.page().end_line() == Some(end_line)
                 && candidate.key.layout_revision == current.layout_revision
                 && candidate.key.viewport_width_bits == current.viewport_width_bits
                 && candidate.key.viewport_height_bits == current.viewport_height_bits
@@ -125,8 +137,24 @@ mod tests {
 
     fn page(key: FrameGeometryCacheKey, end_line: Option<usize>) -> PreparedPage {
         let mut frame = VisibleFrame::default();
-        frame.current_page_end_line = end_line;
-        PreparedPage { key, frame, reached_end: false, next_start_offset_y: 0.0 }
+        frame.install_flow_page(
+            PagePositions {
+                start_line: 0,
+                last_line: end_line,
+                positions: VisibleLinePositions::default(),
+                offset_breaks: Vec::new(),
+                repeated_table_headers: Vec::new(),
+                reached_end: false,
+                next_start_offset_y: 0.0,
+            },
+            0.0,
+            end_line,
+        );
+        PreparedPage {
+            key,
+            frame,
+            continuation: ViewportContinuation::MoreAt(0.0),
+        }
     }
 
     #[test]
@@ -171,7 +199,7 @@ mod tests {
         cache.insert(page(key(1), Some(20)));
 
         let restored = cache.take(key(1)).expect("the page is cached");
-        assert_eq!(restored.frame.current_page_end_line, Some(20), "the newer page wins");
+        assert_eq!(restored.frame.page().end_line(), Some(20), "the newer page wins");
         assert!(cache.take(key(1)).is_none(), "no duplicate is left behind");
     }
 
@@ -179,14 +207,14 @@ mod tests {
     fn insertion_discards_backend_shaping_handles() {
         let mut cache = PreparedPageCache::new();
         let mut prepared = page(key(1), None);
-        prepared.frame.native_shape_failures.insert(3);
+        prepared.frame.record_native_shape_failure(3);
 
         cache.insert(prepared);
 
         let restored = cache.take(key(1)).expect("the page is cached");
-        assert!(restored.frame.shaped_lines.is_empty(), "shaped lines index backend-owned storage that a cached page outlives");
-        assert!(restored.frame.native_shape_failures.is_empty());
-        assert!(restored.frame.line_shape_key.is_none());
+        assert!(restored.frame.shaping().shaped_lines().is_empty(), "shaped lines index backend-owned storage that a cached page outlives");
+        assert!(restored.frame.shaping().native_failures().is_empty());
+        assert!(restored.frame.shaping().key().is_none());
     }
 
     #[test]

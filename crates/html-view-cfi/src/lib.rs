@@ -5,6 +5,18 @@
 
 use html::layout::LaidOutDocument;
 
+#[derive(Clone, Copy)]
+enum GlyphBoundary {
+    Before,
+    After,
+}
+
+#[derive(Clone, Copy)]
+enum ParseBoundary {
+    Glyph,
+    GlyphOrDocumentEnd,
+}
+
 pub fn parse_cfi_spine_only(cfi: &str) -> Option<usize> {
     let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
     let (spine_part, _) = inner.split_once('!')?;
@@ -17,12 +29,26 @@ fn escape_assertion(value: &str) -> String {
 }
 
 pub fn generate_cfi(doc: &LaidOutDocument, doc_index: usize, glyph_idx: u32) -> Option<String> {
-    let position = generate_document_position(doc, glyph_idx, false)?;
+    let position = generate_document_position(doc, glyph_idx, GlyphBoundary::Before)?;
     Some(format!("epubcfi(/6/{}!{position})", (doc_index + 1) * 2))
 }
 
-fn generate_document_position(doc: &LaidOutDocument, glyph_idx: u32, after_glyph: bool) -> Option<String> {
-    let position = doc.render_view().addressing().source_position_for_glyph(glyph_idx, after_glyph)?;
+/// Builds an EPUB CFI from a parse-level source address. Whole-book search
+/// later resolves this same DOM path to a laid-out glyph.
+pub fn generate_cfi_from_source_position(doc_index: usize, position: &html::parse::SourceTextPosition) -> String {
+    let mut document_position = String::new();
+    for step in position.element_steps() {
+        document_position.push_str(&format!("/{step}"));
+    }
+    document_position.push_str(&format!("/{}:{}", position.text_step(), position.utf16_offset()));
+    format!("epubcfi(/6/{}!{document_position})", (doc_index + 1) * 2)
+}
+
+fn generate_document_position(doc: &LaidOutDocument, glyph_idx: u32, boundary: GlyphBoundary) -> Option<String> {
+    let position = doc
+        .render_view()
+        .addressing()
+        .source_position_for_glyph(glyph_idx, matches!(boundary, GlyphBoundary::After))?;
     let mut result = String::new();
     for element in position.elements() {
         result.push_str(&format!("/{}", element.step()));
@@ -39,8 +65,8 @@ pub fn generate_cfi_range(doc: &LaidOutDocument, doc_index: usize, start: u32, e
     if start >= end {
         return None;
     }
-    let start_path = generate_document_position(doc, start, false)?;
-    let end_path = generate_document_position(doc, end - 1, true)?;
+    let start_path = generate_document_position(doc, start, GlyphBoundary::Before)?;
+    let end_path = generate_document_position(doc, end - 1, GlyphBoundary::After)?;
     let start_segments: Vec<&str> = start_path.split('/').filter(|segment| !segment.is_empty()).collect();
     let end_segments: Vec<&str> = end_path.split('/').filter(|segment| !segment.is_empty()).collect();
     let common_len = start_segments.iter().zip(&end_segments).take_while(|(left, right)| left == right).count();
@@ -54,7 +80,7 @@ pub fn parse_cfi(doc: &LaidOutDocument, cfi: &str) -> Option<(usize, u32)> {
     let doc_index = parse_cfi_spine_only(cfi)?;
     let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
     let (_, document_part) = inner.split_once('!')?;
-    Some((doc_index, parse_document_position(doc, document_part, false)?))
+    Some((doc_index, parse_document_position(doc, document_part, ParseBoundary::Glyph)?))
 }
 
 /// Resolves a standard range CFI to an exclusive glyph interval.
@@ -67,12 +93,12 @@ pub fn parse_cfi_range(doc: &LaidOutDocument, cfi: &str) -> Option<(usize, u32, 
         return None;
     }
     let combine = |relative: &str| format!("{}/{}", parts[0].trim_end_matches('/'), relative.trim_start_matches('/'));
-    let start = parse_document_position(doc, &combine(&parts[1]), true)?;
-    let end = parse_document_position(doc, &combine(&parts[2]), true)?;
+    let start = parse_document_position(doc, &combine(&parts[1]), ParseBoundary::GlyphOrDocumentEnd)?;
+    let end = parse_document_position(doc, &combine(&parts[2]), ParseBoundary::GlyphOrDocumentEnd)?;
     (start < end).then_some((doc_index, start, end))
 }
 
-fn parse_document_position(doc: &LaidOutDocument, document_part: &str, allow_end: bool) -> Option<u32> {
+fn parse_document_position(doc: &LaidOutDocument, document_part: &str, boundary: ParseBoundary) -> Option<u32> {
     if document_part.is_empty() {
         return Some(0);
     }
@@ -96,7 +122,12 @@ fn parse_document_position(doc: &LaidOutDocument, document_part: &str, allow_end
         Some(last) if !last.is_multiple_of(2) => (&steps[..steps.len() - 1], Some(last)),
         _ => (&steps[..], None),
     };
-    doc.render_view().addressing().resolve_source_position(elements, text_step, character_offset, allow_end)
+    doc.render_view().addressing().resolve_source_position(
+        elements,
+        text_step,
+        character_offset,
+        matches!(boundary, ParseBoundary::GlyphOrDocumentEnd),
+    )
 }
 
 fn split_range_components(value: &str) -> Vec<String> {

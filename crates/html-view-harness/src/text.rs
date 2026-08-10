@@ -8,10 +8,9 @@
 //! the shaper: drawing a glyph the first time is a cache fill, not a change to
 //! what the shaper says about any document.
 //!
-//! An id indexes the registry of the document it was shaped from, and a
-//! continuous spine puts more than one document on a screen. So there is a
-//! table per document, and the renderer says which one is in play before every
-//! stretch of shaping or painting that belongs to it.
+//! An id indexes the registry of the document it was shaped from. Popup notes
+//! may come from a different spine item, so there is a table per document and
+//! the renderer says which one is in play before shaping or painting it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
