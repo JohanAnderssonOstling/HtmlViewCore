@@ -193,6 +193,7 @@ impl RendererCore {
                 self.page.frame.geometry_key = Some(self.frame_geometry_cache_key());
             }
         }
+        self.fill_following_columns(glyph_shaper);
         self.prefetch_images_for_current_page();
         if self.nav.pending_nav_anchor_update {
             self.update_nav_anchor_from_layout();

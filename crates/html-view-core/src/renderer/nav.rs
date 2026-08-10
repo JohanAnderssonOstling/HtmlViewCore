@@ -211,7 +211,7 @@ impl RendererCore {
         next_inputs
     }
 
-    fn load_document_for_index(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize) -> load::LoadedRenderDocument {
+    pub(crate) fn load_document_for_index(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize) -> load::LoadedRenderDocument {
         let uri = self.nav.document_uris[doc_index].clone();
         load::load_document_with_settings(
             self.provider.clone(),
@@ -2367,6 +2367,45 @@ mod tests {
         // glyphs for it at all.
         assert!(!painter.glyphs.is_empty(), "a previewed note must paint its own glyphs");
         assert!(scene.content_height() > 0.0, "a note's scene must have height");
+    }
+
+    #[test]
+    fn a_following_spine_item_starts_at_the_top_of_the_next_column() {
+        // The first document is short enough to leave a column free, so the
+        // second fills it -- from the top, because a spine boundary is always
+        // a column boundary.
+        let (provider, _) = CountingProvider::new(vec![
+            ("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"),
+            ("two.html", "<html><body style='margin:0'><p>Second document</p></body></html>"),
+        ]);
+        let host = Rc::new(TestHost::default());
+        let mut shaper = TestShaper::default();
+        let config = RendererInitialConfig {
+            font_size: 16.0,
+            column_width: 200.0,
+            max_column_count: Some(2),
+            image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
+            text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+            continuous_spine: true,
+            ..RendererInitialConfig::default()
+        };
+        let uris = vec!["one.html".to_owned(), "two.html".to_owned()];
+        let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, uris, 0, Some("0:0"), config);
+        core.prepare_frame(&mut shaper, Size::new(420.0, 300.0));
+
+        let following = core.following_views();
+        assert_eq!(following.len(), 1, "the free column is filled by the next spine item");
+
+        let view = &following[0];
+        let first_line = view.frame.current_page_start_line.expect("the following item is paginated");
+        let screen = view.frame.last_line_positions.get(first_line).expect("its first line is placed");
+
+        assert!(screen.col_index >= 1, "it starts in a column after the page's, not on top of it");
+
+        // Placed at its own layout position -- its leading margin and nothing
+        // else -- rather than carried down by however far the page had run.
+        let natural_y = view.doc().text().line(first_line).expect("its first line").point().y;
+        assert_eq!(screen.point.y, natural_y, "a spine item begins at the top of its column");
     }
 
     #[test]

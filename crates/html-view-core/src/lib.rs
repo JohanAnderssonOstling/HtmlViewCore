@@ -182,6 +182,10 @@ pub(crate) struct RendererCore {
     /// The document being read, with the geometry, frame and selection that
     /// belong to it. A note shown on its own is the same kind of thing.
     page: DocumentView,
+    /// Spine items following the page, filling the columns it leaves empty.
+    /// Only populated in continuous mode, and rebuilt whenever the page is.
+    following: Vec<DocumentView>,
+    continuous_spine: bool,
     /// The note currently shown beside the page, if any. Selecting and hit
     /// testing work here through the same code the page uses.
     note: Option<DocumentView>,
@@ -349,6 +353,8 @@ impl RendererCore {
         Self {
             host,
             page: DocumentView::new(document, layout),
+            following: Vec::new(),
+            continuous_spine: config.continuous_spine,
             note: None,
             pipeline_session: loaded.session,
             pipeline_inputs: loaded.inputs,

@@ -3,7 +3,7 @@ use std::time::Duration;
 use html_view_doc::DocQuery;
 use html_view_paginate::Paginator;
 use html_view_paint::PagePainter;
-use crate::{PagePositions, PaintDirection, Painter, RenderState, RendererCore};
+use crate::{GlyphShaper, PagePositions, PaintDirection, Painter, RenderState, RendererCore};
 
 impl RendererCore {
     pub(crate) fn painter(&self) -> PagePainter<'_> {
@@ -101,7 +101,27 @@ impl RendererCore {
     pub(crate) fn paint_forward(&mut self, cx: &mut impl Painter) -> RenderState {
         self.prepare_forward();
         self.painter().paint_frame(cx);
+        self.paint_following(cx);
         html_view_paginate::initial_render_state()
+    }
+
+    /// Paints the spine items sharing the screen with the page. They are drawn
+    /// after it and without the canvas fill, which the page has already laid
+    /// down for the whole viewport.
+    pub(crate) fn paint_following(&self, cx: &mut impl Painter) {
+        for view in &self.following {
+            PagePainter {
+                geo: view.geometry(),
+                images: &self.image_pipeline,
+                reader_palette: self.reader_palette,
+                interaction_palette: self.interaction_palette,
+                highlight: &Default::default(),
+                annotations: &Default::default(),
+                media_overlay: &Default::default(),
+                selection: view.selection_view(),
+            }
+            .paint_remaining_base(cx);
+        }
     }
 
     pub(crate) fn paginator(&self) -> Paginator<'_> {
@@ -129,6 +149,58 @@ impl RendererCore {
         self.viewport.reached_end = page.reached_end;
         let paint_end = page.last_line;
         self.install_positioned_page(page, self.viewport.start_offset_y, paint_end, false);
+    }
+
+    /// Fills the columns the page leaves empty with the spine items that
+    /// follow it.
+    ///
+    /// A spine item always begins at the top of a column, so a document
+    /// boundary is a column boundary and each item can be paginated on its own
+    /// and then shifted into the columns still free. Nothing has to flow
+    /// across a boundary.
+    pub(crate) fn fill_following_columns(&mut self, glyph_shaper: &mut impl GlyphShaper) {
+        self.following.clear();
+        if !self.continuous_spine {
+            return;
+        }
+        let columns = self.page.layout.col_count as i32;
+        let mut used = self.columns_used(&self.page);
+        let mut doc_index = self.nav.current_doc_index;
+
+        while used < columns && doc_index + 1 < self.nav.document_uris.len() {
+            doc_index += 1;
+            let loaded = self.load_document_for_index(glyph_shaper, doc_index);
+            let mut view = crate::document_view::DocumentView::new(loaded.document, self.page.layout.clone());
+
+            let paginator = Paginator::new(DocQuery::new(&view.document), &view.layout, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm);
+            let events = paginator.events();
+            let mut page = paginator.page_at(&events, 0.0, Vec::new().into());
+            // The item was paginated from its own first column; shifting moves
+            // it into the ones the page left.
+            page.positions.shift_columns(used);
+
+            view.frame.current_page_start_line = Some(page.start_line);
+            view.frame.current_page_end_line = page.last_line;
+            view.frame.paint_start_offset_y = 0.0;
+            view.frame.offset_breaks = page.offset_breaks;
+            view.frame.repeated_table_headers = page.repeated_table_headers;
+            view.frame.last_line_positions = page.positions;
+
+            used = self.columns_used(&view).max(used + 1);
+            self.following.push(view);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn following_views(&self) -> &[crate::document_view::DocumentView] {
+        &self.following
+    }
+
+    /// Columns a view's painted lines occupy, which is where the next spine
+    /// item may start.
+    fn columns_used(&self, view: &crate::document_view::DocumentView) -> i32 {
+        let (Some(start), Some(end)) = (view.frame.current_page_start_line, view.frame.current_page_end_line) else { return 0 };
+        (start..=end).filter_map(|line| view.frame.last_line_positions.get(line)).map(|screen| screen.col_index + 1).max().unwrap_or(0)
     }
 
     pub(crate) fn prefetch_images_for_current_page(&mut self) {

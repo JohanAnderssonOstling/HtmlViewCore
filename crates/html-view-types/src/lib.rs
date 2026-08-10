@@ -97,6 +97,10 @@ pub struct RendererInitialConfig {
     pub image_sizing_policy: html::pipeline::ImageSizingPolicy,
     pub text_composition_policy: html::pipeline::TextCompositionPolicy,
     pub note_display: NoteDisplay,
+    /// Shows the spine as one continuous run rather than a document at a time.
+    /// Each spine item still begins at the top of a column, so a document
+    /// boundary is always a column boundary.
+    pub continuous_spine: bool,
     /// Opt-in pagination-only spacing refinement. This never changes DOM/CSS
     /// layout; it only distributes bounded page slack over existing block gaps.
     pub vertical_rhythm: bool,
@@ -117,6 +121,7 @@ impl Default for RendererInitialConfig {
             image_sizing_policy: html::pipeline::ImageSizingPolicy::SmartStandalone,
             text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
             note_display: NoteDisplay::default(),
+            continuous_spine: false,
             vertical_rhythm: false,
             paint_palette: Default::default(),
             interaction_palette: Default::default(),
@@ -461,6 +466,14 @@ impl VisibleLinePositions {
         self.positions.iter().copied().enumerate().map(|(offset, screen)| (self.first_line + offset, screen))
     }
 
+    /// Moves every line right by `columns`, for content paginated from its own
+    /// first column and then placed after something else.
+    pub fn shift_columns(&mut self, columns: i32) {
+        for screen in &mut self.positions {
+            screen.col_index += columns;
+        }
+    }
+
     pub fn push(&mut self, screen: LineScreen) {
         self.positions.push(screen);
     }
@@ -489,6 +502,7 @@ pub struct FormatState {
     pub code: bool,
 }
 
+#[derive(Clone)]
 pub struct ColumnLayout {
     pub col_width: f64,
     pub base_col_width: f64,
