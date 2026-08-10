@@ -35,6 +35,17 @@ impl<S: GlyphShaper> RendererSession<S> {
         Self { core, glyph_shaper }
     }
 
+    /// Paints a note from a [`FootnotePreview`] for a host showing it in a
+    /// popup. The note was laid out to the width the host reported through
+    /// [`RendererHost::note_popup_width`], so it is drawn at its own layout
+    /// positions with no viewport or pagination applied.
+    ///
+    /// [`FootnotePreview`]: crate::FootnotePreview
+    /// [`RendererHost::note_popup_width`]: crate::RendererHost::note_popup_width
+    pub fn paint_note(&self, note: &crate::LaidOutDocument, painter: &mut impl crate::Painter) {
+        self.core.paint_note(note, painter);
+    }
+
     pub fn from_provider_with_nav(host: Rc<dyn RendererHost>, mut glyph_shaper: S, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, start_index: usize, nav_state: Option<&str>, config: crate::RendererInitialConfig) -> Self {
         let started = Instant::now();
         let core = RendererCore::from_provider_with_nav(host, &mut glyph_shaper, provider, document_uris, start_index, nav_state, config);

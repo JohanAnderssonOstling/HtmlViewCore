@@ -19,6 +19,33 @@ impl RendererCore {
         }
     }
 
+    /// Paints a note handed out with a [`FootnotePreview`], whole and at its
+    /// own layout positions, for a host showing it in a popup.
+    ///
+    /// The note carries no selection, search or annotation state, so those
+    /// overlays are empty. Images inside a note are not painted: the note was
+    /// held out of the reading flow, so its image resources never entered this
+    /// document's pipeline.
+    ///
+    /// [`FootnotePreview`]: crate::FootnotePreview
+    pub(crate) fn paint_note(&self, note: &crate::LaidOutDocument, cx: &mut impl Painter) {
+        let frame = crate::VisibleFrame::default();
+        let layout = crate::ColumnLayout { col_count: 1.0, ..self.layout };
+        let geo = html_view_doc::TextGeometry::new(DocQuery::new(note), &frame, &layout);
+        let (selection_state, table_state) = (crate::SelectionState::default(), crate::TableSelectionState::default());
+        PagePainter {
+            geo,
+            images: &self.image_pipeline,
+            reader_palette: self.reader_palette,
+            interaction_palette: self.interaction_palette,
+            highlight: &Default::default(),
+            annotations: &Default::default(),
+            media_overlay: &Default::default(),
+            selection: html_view_select::SelectionView::new(geo, &selection_state, &table_state),
+        }
+        .paint_whole_document(cx);
+    }
+
     pub(crate) fn paint_frame(&self, cx: &mut impl Painter) {
         self.painter().paint_frame(cx);
     }

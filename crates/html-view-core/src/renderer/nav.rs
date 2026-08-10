@@ -2323,6 +2323,20 @@ mod tests {
     }
 
     #[test]
+    fn a_previewed_note_paints_its_own_content() {
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside></body></html>";
+        let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
+        let preview = core.footnote_preview(&mut shaper, "#note").expect("the note must preview");
+
+        let mut painter = RecordingPainter::default();
+        core.paint_note(&preview.note, &mut painter);
+
+        // The note is drawn whole from its own layout, rather than through the
+        // page's viewport, which holds no glyphs for it at all.
+        assert!(!painter.glyphs.is_empty(), "a previewed note must paint its own glyphs");
+    }
+
+    #[test]
     fn a_note_is_laid_out_to_the_width_its_host_will_show_it_at() {
         // The reader hands back a note ready to paint, so the host's popup
         // width has to shape it here -- a note laid out to the page and shown
