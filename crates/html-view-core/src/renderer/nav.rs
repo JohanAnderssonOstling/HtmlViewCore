@@ -286,14 +286,17 @@ impl RendererCore {
             return None;
         }
 
-        let constraints = html::layout::LayoutConstraints::new(self.layout.col_width, self.root_font_size as f64).ok()?;
+        // The host decides how wide a note is shown, so it is laid out to that
+        // width here rather than to the page's and stretched on arrival.
+        let width = self.host.note_popup_width().filter(|width| width.is_finite() && *width > 0.0).unwrap_or(self.layout.col_width);
+        let constraints = html::layout::LayoutConstraints::new(width, self.root_font_size as f64).ok()?;
         let note = session.layout_note(fragment, constraints, glyph_shaper)?;
         let blocks = Self::note_preview_blocks(&note);
 
         if let Some(loaded) = freshly_loaded {
             self.document_cache.insert_document(doc, CachedDocument { session: loaded.session, inputs: loaded.inputs, document: loaded.document });
         }
-        (!blocks.is_empty()).then(|| crate::FootnotePreview { href: href.to_owned(), blocks })
+        (!blocks.is_empty()).then(|| crate::FootnotePreview { href: href.to_owned(), blocks, note: std::sync::Arc::new(note) })
     }
 
     /// Flattens a laid-out note into the block-per-line shape the host renders.
@@ -703,9 +706,13 @@ mod tests {
         events: RefCell<Vec<RendererEvent>>,
         repaint_requests: Cell<usize>,
         clipboard_text: RefCell<Option<String>>,
+        note_width: Cell<Option<f64>>,
     }
 
     impl RendererHost for TestHost {
+        fn note_popup_width(&self) -> Option<f64> {
+            self.note_width.get()
+        }
         fn request_repaint(&self) {
             self.repaint_requests.set(self.repaint_requests.get() + 1);
         }
@@ -2313,6 +2320,31 @@ mod tests {
         // The engine's note semantics are untouched by the display mode: the
         // target is still a note, which is what a later mode switch relies on.
         assert!(core.document.render_view().addressing().is_note_target("note"));
+    }
+
+    #[test]
+    fn a_note_is_laid_out_to_the_width_its_host_will_show_it_at() {
+        // The reader hands back a note ready to paint, so the host's popup
+        // width has to shape it here -- a note laid out to the page and shown
+        // in a narrow panel would break its lines in the wrong places.
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>a note long enough that the width it is laid out to decides how many lines it occupies</p></aside></body></html>";
+
+        let lines_at = |width: Option<f64>| {
+            let (provider, _) = CountingProvider::new(vec![("document.html", html)]);
+            let host = Rc::new(TestHost::default());
+            host.note_width.set(width);
+            let mut shaper = TestShaper::default();
+            let config = RendererInitialConfig { font_size: 16.0, column_width: 600.0, max_column_count: Some(1), ..RendererInitialConfig::default() };
+            let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), config);
+            core.configure_layout_for_viewport(&mut shaper, Size::new(600.0, 400.0));
+            let preview = core.footnote_preview(&mut shaper, "#note").expect("the note must preview");
+            preview.note.render_view().text().line_count()
+        };
+
+        let wide = lines_at(None);
+        let narrow = lines_at(Some(120.0));
+
+        assert!(narrow > wide, "a narrower popup must wrap the note into more lines ({narrow} at 120px vs {wide} at the column width)");
     }
 
     #[test]

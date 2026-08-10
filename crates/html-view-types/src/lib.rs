@@ -126,11 +126,36 @@ impl Default for RendererInitialConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A note the reader has asked its host to show.
+///
+/// `note` is the note laid out on its own, ready to paint through the same
+/// path as the page. `blocks` is its flattened text, kept for hosts that
+/// present notes as plain strings.
+///
+/// The laid-out note is shared rather than copied: a host holds a preview for
+/// as long as its popup is open and clones it freely while rendering.
+#[derive(Clone)]
 pub struct FootnotePreview {
     pub href: String,
     pub blocks: Vec<String>,
+    pub note: std::sync::Arc<html::layout::LaidOutDocument>,
 }
+
+// A laid-out document is neither comparable nor printable, and neither is
+// useful here: a preview is identified by the reference it came from.
+impl fmt::Debug for FootnotePreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("FootnotePreview").field("href", &self.href).field("blocks", &self.blocks).finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for FootnotePreview {
+    fn eq(&self, other: &Self) -> bool {
+        self.href == other.href && self.blocks == other.blocks
+    }
+}
+
+impl Eq for FootnotePreview {}
 
 #[derive(Clone, Debug)]
 pub enum RendererCommand {
@@ -215,6 +240,13 @@ pub trait RendererHost {
         Err("copying SVG images is not supported by this renderer host".to_owned())
     }
     fn emit(&self, event: RendererEvent);
+
+    /// Width to lay a note out at before the reader hands it back to be shown.
+    /// A host that presents notes in a panel narrower than the page should
+    /// answer with that width; `None` lays the note out at the column width.
+    fn note_popup_width(&self) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
