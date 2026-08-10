@@ -32,7 +32,7 @@ pub(crate) struct DocumentView {
 /// from the item's start, since the reader has already seen its opening
 /// beside the page.
 pub(crate) struct FollowingItem {
-    pub(crate) view: DocumentView,
+    pub(crate) spine: crate::spine_item::SpineItem,
     pub(crate) doc_index: usize,
     /// Where this item resumes on the next screen, meaningful only while
     /// `reached_end` is false.

@@ -608,26 +608,26 @@ mod tests {
         let mut renderer = RendererSession::from_provider_with_nav(host.clone(), TestShaper::default(), provider, uris, 0, Some("0:0"), crate::RendererInitialConfig::default());
 
         renderer.prepare_frame(Size::new(600.0, 800.0)).paint(&mut RecordingPainter::default());
-        let root = renderer.core.page.document.render_view();
+        let root = renderer.core.page.view.document.render_view();
         let text = root.text();
         let addressing = root.addressing();
         let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
         let line_idx = renderer.core.doc().find_line_for_glyph(linked_glyph).unwrap();
-        let screen = renderer.core.page.frame.last_line_positions.get(line_idx).unwrap();
-        let line = renderer.core.page.document.render_view().text().line(line_idx).expect("linked line should be present");
+        let screen = renderer.core.page.view.frame.last_line_positions.get(line_idx).unwrap();
+        let line = renderer.core.page.view.document.render_view().text().line(line_idx).expect("linked line should be present");
         let position = Point::new(screen.point.x + renderer.core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
 
         let hover = renderer.pointer_move(position, false);
         assert!(hover.over_link);
         assert!(hover.link_hover_changed);
         assert!(renderer.pointer_down(position, PointerDownOptions::default()));
-        renderer.core.page.selection.selection_active = Some(linked_glyph + 1);
+        renderer.core.page.view.selection.selection_active = Some(linked_glyph + 1);
         renderer.core.update_selection_text();
         assert!(renderer.selection_contains_point(position));
         assert!(!renderer.selection_contains_point(Point::new(position.x, position.y + line.height() * 2.0)));
-        renderer.core.page.selection.selection_active = Some(linked_glyph);
+        renderer.core.page.view.selection.selection_active = Some(linked_glyph);
         renderer.core.update_selection_text();
-        renderer.core.page.selection.selected_text_markdown = Some("Next".to_owned());
+        renderer.core.page.view.selection.selected_text_markdown = Some("Next".to_owned());
         host.fail_clipboard.set(true);
         assert!(renderer.copy_selection());
         assert!(host.events.borrow().iter().any(|event| matches!(
@@ -796,10 +796,10 @@ mod tests {
 
         renderer.prepare_frame(viewport);
         assert!(!renderer.core.viewport.reached_end, "the fixture must span multiple prepared pages");
-        let first_page_start = renderer.core.page.frame.current_page_start_line;
+        let first_page_start = renderer.core.page.view.frame.current_page_start_line;
         let active_shape_calls = renderer.glyph_shaper.line_shape_calls;
         assert_eq!(active_shape_calls, 0, "prepared pages consume document-authoritative shaping");
-        for fragment in &renderer.core.page.frame.shaped_lines {
+        for fragment in &renderer.core.page.view.frame.shaped_lines {
             assert_eq!(renderer.glyph_shaper.active_line_runs.get(&fragment.shaped.run), Some(&fragment.shaped.line_index));
         }
 
@@ -807,18 +807,18 @@ mod tests {
         // prefetch. It must not clear or replace the active page's run store.
         renderer.prepare_frame(viewport);
         assert_eq!(renderer.glyph_shaper.line_shape_calls, active_shape_calls, "geometry prefetch must not shape the adjacent page");
-        assert_eq!(renderer.core.page.frame.current_page_start_line, first_page_start);
+        assert_eq!(renderer.core.page.view.frame.current_page_start_line, first_page_start);
         assert!(!renderer.core.prepared_pages.is_empty(), "the adjacent page should still be prepared geometrically");
         assert!(renderer.core.prepared_pages.iter().all(|page| page.frame.shaped_lines.is_empty() && page.frame.native_shape_failures.is_empty() && page.frame.line_shape_key.is_none()));
-        for fragment in &renderer.core.page.frame.shaped_lines {
+        for fragment in &renderer.core.page.view.frame.shaped_lines {
             assert_eq!(renderer.glyph_shaper.active_line_runs.get(&fragment.shaped.run), Some(&fragment.shaped.line_index), "the active frame must retain handles into the active run store");
         }
 
         renderer.next_page();
         renderer.prepare_frame(viewport);
-        assert_ne!(renderer.core.page.frame.current_page_start_line, first_page_start);
+        assert_ne!(renderer.core.page.view.frame.current_page_start_line, first_page_start);
         assert_eq!(renderer.glyph_shaper.line_shape_calls, active_shape_calls, "restoring a geometry-only page must not invoke view-owned shaping");
-        for fragment in &renderer.core.page.frame.shaped_lines {
+        for fragment in &renderer.core.page.view.frame.shaped_lines {
             assert_eq!(renderer.glyph_shaper.active_line_runs.get(&fragment.shaped.run), Some(&fragment.shaped.line_index));
         }
 
@@ -838,7 +838,7 @@ mod tests {
         let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
-        let view = renderer.core.page.document.render_view().text();
+        let view = renderer.core.page.view.document.render_view().text();
         let (line_idx, before_range, after_range) = (0..view.line_count())
             .find_map(|line_idx| {
                 let fragments = view.line_text_fragments(line_idx)?.collect::<Vec<_>>();
@@ -872,7 +872,7 @@ mod tests {
         let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
-        let view = renderer.core.page.document.render_view().text();
+        let view = renderer.core.page.view.document.render_view().text();
         let glyph_for = |target| (0..view.glyph_count() as u32).find(|index| view.glyph_at(*index as usize).and_then(|glyph| view.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == target)).expect("fixture character must exist");
         let outer_line = renderer.core.doc().find_line_for_glyph(glyph_for('A')).unwrap();
         let nested = glyph_for('I');

@@ -4,7 +4,7 @@ use kurbo::Point;
 
 impl RendererCore {
     pub(crate) fn text_geometry(&self) -> TextGeometry<'_> {
-        TextGeometry::new(self.doc(), &self.page.frame, &self.page.layout)
+        TextGeometry::new(self.doc(), &self.page.view.frame, &self.page.view.layout)
     }
 
     pub fn glyph_x_span_in_line(&self, line: &html::layout::RenderLine, start: u32, end: u32) -> (f64, f64) {

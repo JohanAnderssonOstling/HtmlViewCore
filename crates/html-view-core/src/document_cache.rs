@@ -8,16 +8,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use html::engine::Engine;
-use html::pipeline::PipelineInputs;
+use crate::spine_item::SpineItem;
 
-use crate::LaidOutDocument;
-
-pub(crate) struct CachedDocument {
-    pub(crate) session: Engine,
-    pub(crate) inputs: PipelineInputs,
-    pub(crate) document: LaidOutDocument,
-}
+/// A document the reader may come back to is the same thing as the one being
+/// read, so the cache holds that and not a second shape of its own.
+pub(crate) type CachedDocument = SpineItem;
 
 pub(crate) struct DocumentCache {
     documents: HashMap<usize, CachedDocument>,

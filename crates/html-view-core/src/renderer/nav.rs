@@ -4,18 +4,19 @@ use std::sync::Arc;
 
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
-use crate::document_cache::CachedDocument;
-use crate::{NavigationState,  DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
+use crate::document_view::DocumentView;
+use crate::spine_item::SpineItem;
+use crate::{NavigationState,  DocAnchor, GlyphShaper, ColumnLayout, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
 
 impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
-        NavView { doc: DocQuery::new(&self.page.document), viewport: &self.viewport, frame: &self.page.frame }
+        NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame }
     }
 
     fn nav_cx(&mut self) -> (&mut NavigationState, NavContext<'_>) {
         // Disjoint field borrows: navigation state is mutated through the
         // first, everything it reads or writes through the second.
-        (&mut self.nav, NavContext { doc: DocQuery::new(&self.page.document), viewport: &mut self.viewport, frame: &self.page.frame, host: self.host.as_ref() })
+        (&mut self.nav, NavContext { doc: DocQuery::new(&self.page.view.document), viewport: &mut self.viewport, frame: &self.page.view.frame, host: self.host.as_ref() })
     }
 
     pub fn current_glyph_position(&self) -> Option<u32> {
@@ -76,12 +77,12 @@ impl RendererCore {
     }
 
     pub(crate) fn update_nav_anchor_from_layout(&mut self) {
-        let view = NavView { doc: DocQuery::new(&self.page.document), viewport: &self.viewport, frame: &self.page.frame };
+        let view = NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_nav_anchor_from_layout(view);
     }
 
     pub fn update_toc_anchor_filter(&mut self) {
-        let view = NavView { doc: DocQuery::new(&self.page.document), viewport: &self.viewport, frame: &self.page.frame };
+        let view = NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
     }
 
@@ -119,7 +120,7 @@ impl RendererCore {
     pub(crate) fn set_progress_fraction(&mut self, glyph_shaper: &mut impl GlyphShaper, fraction: f32) {
         let (doc, in_doc_fraction) = self.nav.document_at_fraction(fraction);
         self.set_position(glyph_shaper, doc, None);
-        let glyph_count = self.page.document.render_view().text().glyph_count();
+        let glyph_count = self.page.view.document.render_view().text().glyph_count();
         let glyph = (in_doc_fraction * glyph_count as f64) as u32;
         self.restore_glyph_position(glyph.min(glyph_count.saturating_sub(1) as u32));
         self.update_nav_signal();
@@ -169,25 +170,33 @@ impl RendererCore {
         convert_nodes(view, view.document_toc_entries())
     }
 
-    fn replace_document_state(&mut self, loaded: load::LoadedRenderDocument, sync_doc_title: bool) {
-        self.page.document = loaded.document;
+    /// Builds a spine item out of a freshly loaded document, at the column
+    /// layout the reader is using.
+    fn spine_item(&self, loaded: load::LoadedRenderDocument) -> SpineItem {
+        SpineItem::new(loaded, self.page.view.layout.clone(), self.provider.clone())
+    }
+
+    /// Makes `item` the page. Everything addressed by a document -- its
+    /// pipeline, its images, its glyph registry -- arrives with it, which is
+    /// the whole point of their being one thing.
+    fn replace_document_state(&mut self, mut item: SpineItem, sync_doc_title: bool) {
+        // The column layout belongs to the reader rather than to the document
+        // arriving, so it stays behind.
+        item.view.layout = std::mem::replace(&mut self.page.view.layout, ColumnLayout::default());
+        self.page = item;
         // A glyph index addresses the document it was taken from. Carrying one
         // into a different document does not merely lose the position, it
         // names a place in the new one -- and the relayout that often follows
         // arriving will honour it.
         self.nav.nav_anchor_glyph = None;
-        self.pipeline_session = loaded.session;
-        self.pipeline_inputs = loaded.inputs;
-        self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
+        self.root_font_size = self.page.inputs.style_environment.root_font_size as f32;
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
         if sync_doc_title {
-            self.host.emit(RendererEvent::TitleChanged(self.page.document.render_view().title().map(str::to_owned)));
+            self.host.emit(RendererEvent::TitleChanged(self.page.view.document.render_view().title().map(str::to_owned)));
         }
-        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.document)));
+        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.view.document)));
         self.update_toc_anchor_filter();
-        let image_resources = self.page.document.render_view().images().to_vec();
-        self.image_pipeline = ImagePipeline::new(Arc::new(image_resources), self.provider.clone());
         self.resolve_visible_annotations();
         self.resolve_media_overlay_highlight();
     }
@@ -197,9 +206,16 @@ impl RendererCore {
             return;
         }
 
+        // The page keeps reading until something replaces it, so what goes to
+        // the cache is a copy of the document with the session that produced
+        // it. The session cannot be copied, and the page has no use for it
+        // once it is being put away.
         let current_index = self.nav.current_doc_index;
-        let cached = CachedDocument { session: mem::replace(&mut self.pipeline_session, html::engine::Engine::new(self.provider.clone())), inputs: self.pipeline_inputs.clone(), document: self.page.document.clone() };
-        self.document_cache.insert_document(current_index, cached);
+        let document = self.page.view.document.clone();
+        let session = mem::replace(&mut self.page.session, html::engine::Engine::new(self.provider.clone()));
+        let images = SpineItem::image_pipeline_for(&document, self.provider.clone());
+        let layout = self.page.view.layout.clone();
+        self.document_cache.insert_document(current_index, SpineItem { session, inputs: self.page.inputs.clone(), images, view: DocumentView::new(document, layout) });
     }
 
     fn rebased_inputs_for_doc_index(&self, doc_index: usize, source_inputs: &html::pipeline::PipelineInputs) -> html::pipeline::PipelineInputs {
@@ -208,21 +224,21 @@ impl RendererCore {
             next_inputs.base_uri = uri.clone();
             next_inputs.markup_syntax = html::pipeline::MarkupSyntax::from_uri(uri);
         }
-        next_inputs.style_environment = self.pipeline_inputs.style_environment;
-        next_inputs.user_styles = self.pipeline_inputs.user_styles.clone();
+        next_inputs.style_environment = self.page.inputs.style_environment;
+        next_inputs.user_styles = self.page.inputs.user_styles.clone();
         next_inputs.layout = html::pipeline::LayoutConstraints {
-            viewport_width: self.pipeline_inputs.layout.viewport_width,
-            viewport_height: self.pipeline_inputs.layout.viewport_height,
-            line_height: self.pipeline_inputs.style_environment.root_font_size as f64,
-            image_sizing_policy: self.pipeline_inputs.layout.image_sizing_policy,
-            text_composition_policy: self.pipeline_inputs.layout.text_composition_policy,
+            viewport_width: self.page.inputs.layout.viewport_width,
+            viewport_height: self.page.inputs.layout.viewport_height,
+            line_height: self.page.inputs.style_environment.root_font_size as f64,
+            image_sizing_policy: self.page.inputs.layout.image_sizing_policy,
+            text_composition_policy: self.page.inputs.layout.text_composition_policy,
         };
-        next_inputs.resource_revision = self.pipeline_inputs.resource_revision;
-        next_inputs.stylesheet_revision = self.pipeline_inputs.stylesheet_revision;
-        next_inputs.font_environment = self.pipeline_inputs.font_environment;
-        next_inputs.image_metrics_revision = self.pipeline_inputs.image_metrics_revision;
-        next_inputs.image_metrics = self.pipeline_inputs.image_metrics.clone();
-        next_inputs.paint = self.pipeline_inputs.paint;
+        next_inputs.resource_revision = self.page.inputs.resource_revision;
+        next_inputs.stylesheet_revision = self.page.inputs.stylesheet_revision;
+        next_inputs.font_environment = self.page.inputs.font_environment;
+        next_inputs.image_metrics_revision = self.page.inputs.image_metrics_revision;
+        next_inputs.image_metrics = self.page.inputs.image_metrics.clone();
+        next_inputs.paint = self.page.inputs.paint;
         next_inputs
     }
 
@@ -235,17 +251,17 @@ impl RendererCore {
             self.provider.clone(),
             &uri,
             self.root_font_size,
-            self.pipeline_inputs.layout.viewport_width,
-            self.pipeline_inputs.reader_overrides.clone(),
-            self.pipeline_inputs.layout.image_sizing_policy,
-            self.pipeline_inputs.layout.text_composition_policy,
+            self.page.inputs.layout.viewport_width,
+            self.page.inputs.reader_overrides.clone(),
+            self.page.inputs.layout.image_sizing_policy,
+            self.page.inputs.layout.text_composition_policy,
             self.note_display,
             glyph_shaper,
         )
     }
 
     pub fn handle_link_click(&mut self, glyph_shaper: &mut impl GlyphShaper, glyph_idx: u32) -> bool {
-        let view = self.page.document.render_view();
+        let view = self.page.view.document.render_view();
         let addressing = view.addressing();
         let Some(href_idx) = addressing.link_for_glyph(glyph_idx) else {
             return false;
@@ -296,8 +312,8 @@ impl RendererCore {
         let is_note_target = {
             let laid_out = match freshly_loaded.as_ref() {
                 Some(loaded) => &loaded.document,
-                None if doc == self.nav.current_doc_index => &self.page.document,
-                None => &self.document_cache.document(doc)?.document,
+                None if doc == self.nav.current_doc_index => &self.page.view.document,
+                None => &self.document_cache.document(doc)?.view.document,
             };
             laid_out.render_view().addressing().is_note_target(fragment)
         };
@@ -309,20 +325,21 @@ impl RendererCore {
 
         // The host decides how wide a note is shown, so it is laid out to that
         // width here rather than to the page's and stretched on arrival.
-        let width = self.host.note_popup_width().filter(|width| width.is_finite() && *width > 0.0).unwrap_or(self.page.layout.col_width);
+        let width = self.host.note_popup_width().filter(|width| width.is_finite() && *width > 0.0).unwrap_or(self.page.view.layout.col_width);
         let constraints = html::layout::LayoutConstraints::new(width, self.root_font_size as f64).ok()?;
         let note = match freshly_loaded.as_mut() {
             Some(loaded) => loaded.session.layout_note(fragment, constraints, glyph_shaper),
-            None if doc == self.nav.current_doc_index => self.pipeline_session.layout_note(fragment, constraints, glyph_shaper),
+            None if doc == self.nav.current_doc_index => self.page.session.layout_note(fragment, constraints, glyph_shaper),
             None => self.document_cache.document_mut(doc)?.session.layout_note(fragment, constraints, glyph_shaper),
         }?;
         let blocks = Self::note_preview_blocks(&note);
         // Held as a view of its own, so selecting and hit testing inside it go
         // through the same code the page uses.
-        self.note = Some(crate::document_view::DocumentView::new(note.clone(), crate::ColumnLayout { col_width: width, base_col_width: width, ..self.page.layout }).framed_whole());
+        self.note = Some(crate::document_view::DocumentView::new(note.clone(), crate::ColumnLayout { col_width: width, base_col_width: width, ..self.page.view.layout }).framed_whole());
 
         if let Some(loaded) = freshly_loaded {
-            self.document_cache.insert_document(doc, CachedDocument { session: loaded.session, inputs: loaded.inputs, document: loaded.document });
+            let item = self.spine_item(loaded);
+            self.document_cache.insert_document(doc, item);
         }
         (!blocks.is_empty()).then(|| crate::FootnotePreview { href: href.to_owned(), blocks, note: std::sync::Arc::new(note) })
     }
@@ -482,9 +499,9 @@ impl RendererCore {
         }
 
         let mut next_start_offset_y = self.viewport.start_offset_y;
-        if let Some(end_idx) = self.page.frame.current_page_end_line {
+        if let Some(end_idx) = self.page.view.frame.current_page_end_line {
             let next_idx = end_idx + 1;
-            if let Some(line) = self.page.document.render_view().text().line(next_idx) {
+            if let Some(line) = self.page.view.document.render_view().text().line(next_idx) {
                 next_start_offset_y = line.point().y;
             }
         } else if self.viewport.next_start_offset_y > self.viewport.start_offset_y {
@@ -509,7 +526,7 @@ impl RendererCore {
     }
 
     pub fn prev_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        if self.page.frame.current_page_start_line == Some(0) || self.viewport.start_offset_y <= 0.0 {
+        if self.page.view.frame.current_page_start_line == Some(0) || self.viewport.start_offset_y <= 0.0 {
             if self.nav.current_doc_index > 0 {
                 self.load_document_at(glyph_shaper, self.nav.current_doc_index - 1, DocAnchor::End);
                 return;
@@ -518,8 +535,8 @@ impl RendererCore {
             return;
         }
 
-        let back_anchor_end_line = self.page.frame.current_page_start_line.and_then(|idx| idx.checked_sub(1));
-        let end_offset_y = back_anchor_end_line.and_then(|anchor_idx| self.page.document.render_view().text().line(anchor_idx)).map(|line| line.point().y + line.height()).unwrap_or(self.viewport.start_offset_y);
+        let back_anchor_end_line = self.page.view.frame.current_page_start_line.and_then(|idx| idx.checked_sub(1));
+        let end_offset_y = back_anchor_end_line.and_then(|anchor_idx| self.page.view.document.render_view().text().line(anchor_idx)).map(|line| line.point().y + line.height()).unwrap_or(self.viewport.start_offset_y);
         self.cache_current_prepared_page();
         if let Some(anchor_idx) = back_anchor_end_line
             && self.restore_prepared_page_ending_at(anchor_idx)
@@ -568,9 +585,9 @@ impl RendererCore {
     pub fn set_col_width(&mut self, glyph_shaper: &mut impl GlyphShaper, new_width: f64) {
         let clamped = new_width.clamp(200.0, 1200.0);
         let rounded = clamped.round();
-        let base_changed = (rounded - self.page.layout.base_col_width).abs() >= f64::EPSILON;
-        let effective = if self.page.layout.size.width > 0.0 { rounded.min(self.page.layout.size.width) } else { rounded };
-        let effective_changed = (effective - self.page.layout.col_width).abs() >= 0.1;
+        let base_changed = (rounded - self.page.view.layout.base_col_width).abs() >= f64::EPSILON;
+        let effective = if self.page.view.layout.size.width > 0.0 { rounded.min(self.page.view.layout.size.width) } else { rounded };
+        let effective_changed = (effective - self.page.view.layout.col_width).abs() >= 0.1;
         if !base_changed && !effective_changed {
             return;
         }
@@ -579,21 +596,21 @@ impl RendererCore {
             return;
         }
         if base_changed {
-            self.page.layout.base_col_width = rounded;
-            self.host.emit(RendererEvent::ColumnWidthChanged(self.page.layout.base_col_width));
+            self.page.view.layout.base_col_width = rounded;
+            self.host.emit(RendererEvent::ColumnWidthChanged(self.page.view.layout.base_col_width));
         }
         if effective_changed {
-            self.page.layout.col_width = effective;
+            self.page.view.layout.col_width = effective;
         }
     }
 
     pub fn set_scale(&mut self, new_scale: f64) {
         let clamped = new_scale.clamp(0.5, 3.0);
-        if (clamped - self.page.layout.scale).abs() < f64::EPSILON {
+        if (clamped - self.page.view.layout.scale).abs() < f64::EPSILON {
             return;
         }
-        self.page.layout.scale = clamped;
-        self.host.emit(RendererEvent::ScaleChanged(self.page.layout.scale));
+        self.page.view.layout.scale = clamped;
+        self.host.emit(RendererEvent::ScaleChanged(self.page.view.layout.scale));
         self.host.request_repaint();
     }
 
@@ -611,10 +628,10 @@ impl RendererCore {
                 }
                 DocAnchor::End => {
                     self.viewport.direction = PaintDirection::Backward;
-                    if let Some(last) = self.page.document.render_view().text().lines().last() {
+                    if let Some(last) = self.page.view.document.render_view().text().lines().last() {
                         self.viewport.end_offset_y = last.point().y + last.height();
                         self.viewport.reached_end = true;
-                        self.viewport.back_anchor_end_line = Some(self.page.document.render_view().text().line_count().saturating_sub(1));
+                        self.viewport.back_anchor_end_line = Some(self.page.view.document.render_view().text().line_count().saturating_sub(1));
                     }
                 }
                 DocAnchor::Glyph(glyph_idx) => {
@@ -639,32 +656,30 @@ impl RendererCore {
             self.host.set_glyph_document(doc_index);
             let Ok(document) = cached.session.rehydrate_glyphs(glyph_shaper) else {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
+                let fallback = self.spine_item(fallback);
                 self.nav.current_doc_index = doc_index;
                 self.replace_document_state(fallback, true);
                 self.reset_view_state();
                 self.finish_document_navigation(anchor);
                 return;
             };
-            cached.document = document;
+            cached.replace_document(document);
             let requested_inputs = self.rebased_inputs_for_doc_index(doc_index, &cached.inputs);
-            if cached.inputs == requested_inputs {
+            let inputs_match = cached.inputs == requested_inputs;
+            self.nav.current_doc_index = doc_index;
+            self.replace_document_state(cached, inputs_match);
+            if !inputs_match && self.apply_pipeline_inputs(requested_inputs, glyph_shaper).is_err() {
+                let fallback = self.load_document_for_index(glyph_shaper, doc_index);
+                let fallback = self.spine_item(fallback);
                 self.nav.current_doc_index = doc_index;
-                self.replace_document_state(load::LoadedRenderDocument { session: cached.session, inputs: cached.inputs, document: cached.document, source: requested_inputs.source }, true);
-            } else {
-                self.nav.current_doc_index = doc_index;
-                let requested_source = requested_inputs.source.clone();
-                self.replace_document_state(load::LoadedRenderDocument { session: cached.session, inputs: cached.inputs, document: cached.document, source: requested_source }, false);
-                if self.apply_pipeline_inputs(requested_inputs, glyph_shaper).is_err() {
-                    let fallback = self.load_document_for_index(glyph_shaper, doc_index);
-                    self.nav.current_doc_index = doc_index;
-                    self.replace_document_state(fallback, true);
-                }
+                self.replace_document_state(fallback, true);
             }
             self.reset_view_state();
         } else {
-            let document = self.load_document_for_index(glyph_shaper, doc_index);
+            let loaded = self.load_document_for_index(glyph_shaper, doc_index);
+            let item = self.spine_item(loaded);
             self.nav.current_doc_index = doc_index;
-            self.replace_document_state(document, true);
+            self.replace_document_state(item, true);
             self.reset_view_state();
         }
 
@@ -674,10 +689,10 @@ impl RendererCore {
     pub fn reset_view_state(&mut self) {
         self.viewport = ViewportState::default();
         self.following_key = None;
-        self.page.frame.clear();
+        self.page.view.frame.clear();
         self.frame_scratch.clear_transient();
-        self.page.selection = SelectionState::default();
-        self.page.table_selection = crate::TableSelectionState::default();
+        self.page.view.selection = SelectionState::default();
+        self.page.view.table_selection = crate::TableSelectionState::default();
     }
 
 }
@@ -849,22 +864,22 @@ mod tests {
 
         core.configure_layout_for_viewport(&mut shaper, Size::new(1_100.0, 600.0));
 
-        assert_eq!(core.page.layout.col_count, 5.0);
+        assert_eq!(core.page.view.layout.col_count, 5.0);
     }
 
     fn line_index_for_character(core: &RendererCore, wanted: char) -> usize {
-        let text = core.page.document.render_view().text();
+        let text = core.page.view.document.render_view().text();
         let glyph = glyph_index_for_character(core, wanted);
         text.line_index_for_glyph(glyph).expect("fixture character must own a line")
     }
 
     fn glyph_index_for_character(core: &RendererCore, wanted: char) -> u32 {
-        let text = core.page.document.render_view().text();
+        let text = core.page.view.document.render_view().text();
         (0..text.glyph_count() as u32).find(|index| text.glyph_at(*index as usize).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == wanted)).expect("fixture character must exist")
     }
 
     fn visible_positions(core: &RendererCore) -> Vec<(usize, i32, f64)> {
-        core.page.frame.last_line_positions.iter().map(|(line, screen)| (line, screen.col_index, screen.point.y)).collect()
+        core.page.view.frame.last_line_positions.iter().map(|(line, screen)| (line, screen.col_index, screen.point.y)).collect()
     }
 
     #[test]
@@ -880,9 +895,9 @@ mod tests {
         let refined_positions = visible_positions(&natural);
 
         assert_eq!(natural_positions.iter().map(|(line, column, _)| (*line, *column)).collect::<Vec<_>>(), refined_positions.iter().map(|(line, column, _)| (*line, *column)).collect::<Vec<_>>());
-        assert_eq!(natural.page.frame.last_line_positions.get(a).map(|screen| screen.point.y), Some(0.0), "the first line remains anchored");
-        assert_eq!(natural.page.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(32.0), "the sole safe block gap receives the 2px cap");
-        assert_eq!(natural.page.document.render_view().text().line(b).map(|line| line.point().y), Some(30.0), "continuous CSS layout is untouched");
+        assert_eq!(natural.page.view.frame.last_line_positions.get(a).map(|screen| screen.point.y), Some(0.0), "the first line remains anchored");
+        assert_eq!(natural.page.view.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(32.0), "the sole safe block gap receives the 2px cap");
+        assert_eq!(natural.page.view.document.render_view().text().line(b).map(|line| line.point().y), Some(30.0), "continuous CSS layout is untouched");
     }
 
     #[test]
@@ -916,8 +931,8 @@ mod tests {
         let first = line_index_for_character(&core, 'L');
         let second = line_index_for_character(&core, 'M');
 
-        assert_eq!(core.page.frame.last_line_positions.get(first).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
     }
 
     #[test]
@@ -928,9 +943,9 @@ mod tests {
         let definition = line_index_for_character(&core, 'D');
         let definition_second = line_index_for_character(&core, 'E');
 
-        assert_eq!(core.page.frame.last_line_positions.get(term).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(definition).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(definition_second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 40.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(term).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(definition).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(definition_second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 40.0)));
     }
 
     #[test]
@@ -939,8 +954,8 @@ mod tests {
         let (compact_core, _) = pagination_core_with_policy(compact, Size::new(420.0, 50.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let compact_first = line_index_for_character(&compact_core, 'C');
         let compact_second = line_index_for_character(&compact_core, 'D');
-        let compact_first_position = compact_core.page.frame.last_line_positions.get(compact_first).expect("first compact code line");
-        let compact_second_position = compact_core.page.frame.last_line_positions.get(compact_second).expect("second compact code line");
+        let compact_first_position = compact_core.page.view.frame.last_line_positions.get(compact_first).expect("first compact code line");
+        let compact_second_position = compact_core.page.view.frame.last_line_positions.get(compact_second).expect("second compact code line");
         assert_eq!((compact_first_position.col_index, compact_second_position.col_index), (1, 1));
         assert!(compact_second_position.point.y > compact_first_position.point.y);
 
@@ -948,8 +963,8 @@ mod tests {
         let (oversized_core, _) = pagination_core_with_policy(oversized, Size::new(640.0, 50.0), 3, html::pipeline::TextCompositionPolicy::BookOptimized);
         let oversized_first = line_index_for_character(&oversized_core, 'C');
         let oversized_last = line_index_for_character(&oversized_core, 'F');
-        let first_column = oversized_core.page.frame.last_line_positions.get(oversized_first).map(|screen| screen.col_index).expect("first oversized code line");
-        let last_column = oversized_core.page.frame.last_line_positions.get(oversized_last).map(|screen| screen.col_index).expect("last oversized code line");
+        let first_column = oversized_core.page.view.frame.last_line_positions.get(oversized_first).map(|screen| screen.col_index).expect("first oversized code line");
+        let last_column = oversized_core.page.view.frame.last_line_positions.get(oversized_last).map(|screen| screen.col_index).expect("last oversized code line");
         assert!(last_column > first_column, "oversized code must fall back to splitting across columns");
     }
 
@@ -960,8 +975,8 @@ mod tests {
         let first = line_index_for_character(&core, 'L');
         let second = line_index_for_character(&core, 'M');
 
-        assert_eq!(core.page.frame.last_line_positions.get(first).map(|screen| screen.col_index), Some(0));
-        assert_eq!(core.page.frame.last_line_positions.get(second).map(|screen| screen.col_index), Some(1));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first).map(|screen| screen.col_index), Some(0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(second).map(|screen| screen.col_index), Some(1));
     }
 
     #[test]
@@ -972,11 +987,11 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.current_page_start_line, Some(a));
-        assert_eq!(core.page.frame.current_page_end_line, Some(b));
-        assert_eq!(core.page.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| screen.col_index), Some(0));
-        assert!(core.page.frame.last_line_positions.get(c).is_none(), "the first line beyond the exact bottom edge belongs to the next page");
+        assert_eq!(core.page.view.frame.current_page_start_line, Some(a));
+        assert_eq!(core.page.view.frame.current_page_end_line, Some(b));
+        assert_eq!(core.page.view.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| screen.col_index), Some(0));
+        assert!(core.page.view.frame.last_line_positions.get(c).is_none(), "the first line beyond the exact bottom edge belongs to the next page");
     }
 
     #[test]
@@ -985,8 +1000,8 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(420.0, 39.0), 2);
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
-        let first = core.page.frame.last_line_positions.get(a).expect("first line visible");
-        let second = core.page.frame.last_line_positions.get(b).expect("overflow line visible in the following column");
+        let first = core.page.view.frame.last_line_positions.get(a).expect("first line visible");
+        let second = core.page.view.frame.last_line_positions.get(b).expect("overflow line visible in the following column");
 
         assert_eq!(first.col_index, 0);
         assert_eq!(second.col_index, 1);
@@ -999,10 +1014,10 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(420.0, 40.0), 2);
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
-        let first = core.page.frame.last_line_positions.get(a).expect("first line visible");
-        let second = core.page.frame.last_line_positions.get(b).expect("second line visible");
+        let first = core.page.view.frame.last_line_positions.get(a).expect("first line visible");
+        let second = core.page.view.frame.last_line_positions.get(b).expect("second line visible");
 
-        assert!(core.page.document.render_view().text().line(b).expect("second source line").point().y > core.page.document.render_view().text().line(a).expect("first source line").point().y + 20.0);
+        assert!(core.page.view.document.render_view().text().line(b).expect("second source line").point().y > core.page.view.document.render_view().text().line(a).expect("first source line").point().y + 20.0);
         assert_eq!((first.col_index, second.col_index), (0, 1));
         assert_eq!(second.point.y, 0.0);
     }
@@ -1013,11 +1028,11 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(420.0, 40.0), 2);
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
-        let images = core.page.document.render_view().fragments().images_for_line(a);
+        let images = core.page.view.document.render_view().fragments().images_for_line(a);
 
         assert!(images.iter().any(|image| image.size().height == 35.0), "fixture must retain the 35px replaced-content height");
-        assert_eq!(core.page.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| screen.col_index), Some(1));
+        assert_eq!(core.page.view.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| screen.col_index), Some(1));
     }
 
     #[test]
@@ -1027,16 +1042,16 @@ mod tests {
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.current_page_start_line, Some(a));
-        assert_eq!(core.page.frame.current_page_end_line, Some(a));
-        assert_eq!(core.page.frame.last_line_positions.get(a).map(|screen| screen.point.y), Some(0.0));
-        assert!(core.page.frame.last_line_positions.get(b).is_none());
+        assert_eq!(core.page.view.frame.current_page_start_line, Some(a));
+        assert_eq!(core.page.view.frame.current_page_end_line, Some(a));
+        assert_eq!(core.page.view.frame.last_line_positions.get(a).map(|screen| screen.point.y), Some(0.0));
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none());
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
 
-        assert_eq!(core.page.frame.current_page_start_line, Some(b));
-        assert!(core.page.frame.last_line_positions.get(b).is_some(), "pagination must make progress beyond the oversized line");
+        assert_eq!(core.page.view.frame.current_page_start_line, Some(b));
+        assert!(core.page.view.frame.last_line_positions.get(b).is_some(), "pagination must make progress beyond the oversized line");
     }
 
     #[test]
@@ -1044,7 +1059,7 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:60px'>A</div><div style='line-height:20px'>B</div><div style='line-height:20px'>C</div></body></html>";
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 40.0), 1);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1052,7 +1067,7 @@ mod tests {
         core.prev_page(&mut shaper);
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -1064,9 +1079,9 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
-        assert!(core.page.frame.last_line_positions.get(c).is_none(), "the oversized image consumes its destination column");
+        assert_eq!(core.page.view.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert!(core.page.view.frame.last_line_positions.get(c).is_none(), "the oversized image consumes its destination column");
     }
 
     #[test]
@@ -1077,9 +1092,9 @@ mod tests {
             let a = line_index_for_character(&core, 'A');
             let b = line_index_for_character(&core, 'B');
 
-            assert!(core.page.frame.last_line_positions.get(a).is_some());
-            assert!(core.page.frame.last_line_positions.get(b).is_none(), "{property} must start B in the next fragmentainer");
-            assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 40.0);
+            assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+            assert!(core.page.view.frame.last_line_positions.get(b).is_none(), "{property} must start B in the next fragmentainer");
+            assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 40.0);
         }
     }
 
@@ -1088,17 +1103,17 @@ mod tests {
         let column_html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><div style='line-height:20px;break-before:column'>B</div></body></html>";
         let (column_core, _) = pagination_core_with_policy(column_html, Size::new(700.0, 60.0), 3, html::pipeline::TextCompositionPolicy::BookOptimized);
         let column_b = line_index_for_character(&column_core, 'B');
-        assert_eq!(column_core.page.frame.last_line_positions.get(column_b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(column_core.page.view.frame.last_line_positions.get(column_b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
 
         for property in ["break-before:page", "page-break-before:always", "break-before:left", "break-before:right"] {
             let html = format!("<html><body style='margin:0'><div style='line-height:20px'>A</div><div style='line-height:20px;{property}'>B</div></body></html>");
             let (mut core, mut shaper) = pagination_core_with_policy(&html, Size::new(700.0, 60.0), 3, html::pipeline::TextCompositionPolicy::BookOptimized);
             let b = line_index_for_character(&core, 'B');
 
-            assert!(core.page.frame.last_line_positions.get(b).is_none(), "{property} must skip the remaining reader columns");
+            assert!(core.page.view.frame.last_line_positions.get(b).is_none(), "{property} must skip the remaining reader columns");
             core.next_page(&mut shaper);
             core.paint_forward(&mut RecordingPainter::default());
-            assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "{property} must begin at the next reader page origin");
+            assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "{property} must begin at the next reader page origin");
         }
     }
 
@@ -1110,8 +1125,8 @@ mod tests {
             let a = line_index_for_character(&core, 'A');
             let b = line_index_for_character(&core, 'B');
 
-            assert_eq!(core.page.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
-            assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{property} on an empty box must anchor to B");
+            assert_eq!(core.page.view.frame.last_line_positions.get(a).map(|screen| screen.col_index), Some(0));
+            assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{property} on an empty box must anchor to B");
         }
     }
 
@@ -1123,8 +1138,8 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "avoid must not move content preceding an internal forced break");
-        assert_eq!(core.page.frame.last_line_positions.get(c).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "avoid must not move content preceding an internal forced break");
+        assert_eq!(core.page.view.frame.last_line_positions.get(c).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
     }
 
     #[test]
@@ -1133,8 +1148,8 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(700.0, 100.0), 3, html::pipeline::TextCompositionPolicy::BookOptimized);
         let b = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 110.0, "continuous layout must retain the ordinary block margin");
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 110.0, "continuous layout must retain the ordinary block margin");
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
     }
 
     #[test]
@@ -1144,14 +1159,14 @@ mod tests {
             let (mut core, mut shaper) = pagination_core_with_policy(&html, Size::new(700.0, 60.0), 3, html::pipeline::TextCompositionPolicy::BookOptimized);
             let b = line_index_for_character(&core, 'B');
 
-            assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 40.0, "forced pagination must not rewrite continuous document geometry");
+            assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 40.0, "forced pagination must not rewrite continuous document geometry");
             if first_page_has_b {
-                assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+                assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
             } else {
-                assert!(core.page.frame.last_line_positions.get(b).is_none(), "{property} must skip the remaining columns");
+                assert!(core.page.view.frame.last_line_positions.get(b).is_none(), "{property} must skip the remaining columns");
                 core.next_page(&mut shaper);
                 core.paint_forward(&mut RecordingPainter::default());
-                assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
+                assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
             }
         }
     }
@@ -1163,10 +1178,10 @@ mod tests {
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
 
-        assert!(core.page.frame.last_line_positions.get(a).is_some());
-        assert!(core.page.frame.last_line_positions.get(b).is_none());
-        assert_eq!(core.page.document.render_view().text().line(a).expect("A line").point().y, 0.0);
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(a).expect("A line").point().y, 0.0);
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 40.0);
     }
 
     #[test]
@@ -1177,10 +1192,10 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(a).is_some());
-        assert!(core.page.frame.last_line_positions.get(b).is_none());
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 40.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("C line").point().y, 60.0);
+        assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 40.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 60.0);
     }
 
     #[test]
@@ -1190,13 +1205,13 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("C line").point().y, 40.0);
-        assert!(core.page.frame.last_line_positions.get(b).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none());
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(c).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(c).map(|screen| screen.point.y), Some(20.0));
     }
 
     #[test]
@@ -1207,10 +1222,10 @@ mod tests {
         let heading = line_index_for_character(&core, 'H');
         let b = line_index_for_character(&core, 'B');
 
-        assert!(core.page.frame.last_line_positions.get(a).is_some());
-        assert!(core.page.frame.last_line_positions.get(heading).is_none());
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 40.0);
-        assert_eq!(core.page.document.render_view().text().line(b).expect("following line").point().y, 60.0);
+        assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 40.0);
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("following line").point().y, 60.0);
     }
 
     #[test]
@@ -1222,11 +1237,11 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(a).is_some());
-        assert!(core.page.frame.last_line_positions.get(heading).is_none(), "the heading must move instead of becoming the last line of the page");
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(b).expect("first paragraph line").point().y, 40.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("second paragraph line").point().y, 60.0);
+        assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_none(), "the heading must move instead of becoming the last line of the page");
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("first paragraph line").point().y, 40.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("second paragraph line").point().y, 60.0);
     }
 
     #[test]
@@ -1235,8 +1250,8 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(200.0, 40.0), 1);
         let heading = line_index_for_character(&core, 'H');
 
-        assert!(core.page.frame.last_line_positions.get(heading).is_some(), "web-compatible pagination must retain browser-style heading placement");
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_some(), "web-compatible pagination must retain browser-style heading placement");
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
     }
 
     #[test]
@@ -1246,9 +1261,9 @@ mod tests {
         let heading = line_index_for_character(&core, 'H');
         let second_heading_line = line_index_for_character(&core, 'I');
 
-        assert!(core.page.frame.last_line_positions.get(heading).is_none());
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(second_heading_line).expect("second heading line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(second_heading_line).expect("second heading line").point().y, 40.0);
     }
 
     #[test]
@@ -1258,8 +1273,8 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(200.0, 60.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
         let heading = line_index_for_character(&core, 'H');
 
-        assert!(core.page.frame.last_line_positions.get(heading).is_some(), "a group taller than a full column must use best-effort pagination");
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_some(), "a group taller than a full column must use best-effort pagination");
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
     }
 
     #[test]
@@ -1269,10 +1284,10 @@ mod tests {
         let heading = line_index_for_character(&core, 'H');
         let b = line_index_for_character(&core, 'B');
 
-        assert!(core.page.frame.last_line_positions.get(heading).is_some(), "the authored forced break must leave the heading before the break");
-        assert!(core.page.frame.last_line_positions.get(b).is_none(), "the following paragraph must begin on the next reader page");
-        assert_eq!(core.page.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(b).expect("following line").point().y, 40.0, "forced pagination must not insert a gap into continuous layout");
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_some(), "the authored forced break must leave the heading before the break");
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none(), "the following paragraph must begin on the next reader page");
+        assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("following line").point().y, 40.0, "forced pagination must not insert a gap into continuous layout");
     }
 
     #[test]
@@ -1280,7 +1295,7 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><h2 style='margin:0;line-height:20px'>H</h2><p style='margin:0;line-height:20px;widows:1;orphans:1'>B<br>C<br>D</p></body></html>";
         let (mut core, mut shaper) = pagination_core_with_policy(html, Size::new(200.0, 60.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1288,7 +1303,7 @@ mod tests {
         core.prev_page(&mut shaper);
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -1311,8 +1326,8 @@ mod tests {
             let sidebar = line_index_for_character(&core, 'S');
             let sidebar_end = line_index_for_character(&core, 'T');
 
-            assert_eq!(core.page.frame.last_line_positions.get(sidebar).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{semantic} must move as one compact block");
-            assert_eq!(core.page.frame.last_line_positions.get(sidebar_end).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+            assert_eq!(core.page.view.frame.last_line_positions.get(sidebar).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{semantic} must move as one compact block");
+            assert_eq!(core.page.view.frame.last_line_positions.get(sidebar_end).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
         }
     }
 
@@ -1337,8 +1352,8 @@ mod tests {
             let start = line_index_for_character(&core, 'B');
             let end = line_index_for_character(&core, 'C');
 
-            assert_eq!(core.page.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{semantic} must move as one compact structure");
-            assert_eq!(core.page.frame.last_line_positions.get(end).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)), "{semantic} must remain intact");
+            assert_eq!(core.page.view.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)), "{semantic} must move as one compact structure");
+            assert_eq!(core.page.view.frame.last_line_positions.get(end).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)), "{semantic} must remain intact");
         }
     }
 
@@ -1348,7 +1363,7 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let start = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "an oversized semantic structure must use available space instead of moving as one unit");
+        assert_eq!(core.page.view.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "an oversized semantic structure must use available space instead of moving as one unit");
     }
 
     #[test]
@@ -1358,8 +1373,8 @@ mod tests {
         let start = line_index_for_character(&core, 'B');
         let after_break = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(after_break).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(start).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(after_break).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
     }
 
     #[test]
@@ -1370,9 +1385,9 @@ mod tests {
         let first = line_index_for_character(&core, 'B');
         let second = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.last_line_positions.get(label).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(first).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
-        assert_eq!(core.page.frame.last_line_positions.get(second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 40.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(label).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(second).map(|screen| (screen.col_index, screen.point.y)), Some((1, 40.0)));
     }
 
     #[test]
@@ -1381,7 +1396,7 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(420.0, 50.0), 2);
         let sidebar = line_index_for_character(&core, 'S');
 
-        assert_eq!(core.page.frame.last_line_positions.get(sidebar).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(sidebar).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
     }
 
     #[test]
@@ -1415,10 +1430,10 @@ mod tests {
             let (mut core, mut shaper) = pagination_core_with_policy_at_uri("document.xhtml", &html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
             let section = line_index_for_character(&core, 'B');
 
-            assert!(core.page.frame.last_line_positions.get(section).is_none(), "EPUB {semantic} must skip all remaining columns on the current reader page");
+            assert!(core.page.view.frame.last_line_positions.get(section).is_none(), "EPUB {semantic} must skip all remaining columns on the current reader page");
             core.next_page(&mut shaper);
             core.paint_forward(&mut RecordingPainter::default());
-            assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "EPUB {semantic} must start at the first column");
+            assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "EPUB {semantic} must start at the first column");
         }
     }
 
@@ -1445,10 +1460,10 @@ mod tests {
             let (mut core, mut shaper) = pagination_core_with_policy(&html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
             let section = line_index_for_character(&core, 'B');
 
-            assert!(core.page.frame.last_line_positions.get(section).is_none(), "ARIA {semantic} must skip all remaining columns on the current reader page");
+            assert!(core.page.view.frame.last_line_positions.get(section).is_none(), "ARIA {semantic} must skip all remaining columns on the current reader page");
             core.next_page(&mut shaper);
             core.paint_forward(&mut RecordingPainter::default());
-            assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "ARIA {semantic} must start at the first column");
+            assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)), "ARIA {semantic} must start at the first column");
         }
     }
 
@@ -1458,7 +1473,7 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let section = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
     }
 
     #[test]
@@ -1467,7 +1482,7 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let section = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
     }
 
     #[test]
@@ -1476,7 +1491,7 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let section = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
     }
 
     #[test]
@@ -1488,7 +1503,7 @@ mod tests {
             let (core, _) = pagination_core(html, Size::new(420.0, 60.0), 2);
             let section = line_index_for_character(&core, 'B');
 
-            assert_eq!(core.page.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "{semantic} must remain ordinary flow in web mode");
+            assert_eq!(core.page.view.frame.last_line_positions.get(section).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)), "{semantic} must remain ordinary flow in web mode");
         }
     }
 
@@ -1498,7 +1513,7 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(420.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let chapter = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(chapter).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(chapter).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
     }
 
     #[test]
@@ -1507,7 +1522,7 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(420.0, 60.0), 2);
         let chapter = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.frame.last_line_positions.get(chapter).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+        assert_eq!(core.page.view.frame.last_line_positions.get(chapter).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
     }
 
     #[test]
@@ -1517,44 +1532,44 @@ mod tests {
         let image_label = line_index_for_character(&core, 'I');
         let caption = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(image_label).is_none(), "the compact figure must not be split across columns");
-        assert_eq!(core.page.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(image_label).is_none(), "the compact figure must not be split across columns");
+        assert_eq!(core.page.view.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 40.0);
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0));
     }
 
     #[test]
     fn book_paginator_keeps_an_image_only_figure_whole() {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><figure style='margin:0'><img src='missing.png' style='width:10px;height:20px;vertical-align:top'></figure></body></html>";
         let (mut core, mut shaper) = pagination_core_with_policy(html, Size::new(200.0, 30.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
-        let image_line = core.page.document.render_view().fragments().images().iter().next().expect("fixture image fragment").line_idx();
+        let image_line = core.page.view.document.render_view().fragments().images().iter().next().expect("fixture image fragment").line_idx();
 
-        assert!(core.page.frame.last_line_positions.get(image_line).is_none(), "the image-only figure must move intact");
+        assert!(core.page.view.frame.last_line_positions.get(image_line).is_none(), "the image-only figure must move intact");
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(image_line).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(image_line).map(|screen| screen.point.y), Some(0.0));
     }
 
     #[test]
     fn book_paginator_keeps_a_replaced_image_with_its_multiline_caption() {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><figure style='margin:0'><img src='missing.png' style='width:10px;height:20px;vertical-align:top'><figcaption style='line-height:20px'>C<br>D</figcaption></figure></body></html>";
         let (mut core, mut shaper) = pagination_core_with_policy(html, Size::new(200.0, 70.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
-        let image_line = core.page.document.render_view().fragments().images().iter().next().expect("fixture image fragment").line_idx();
+        let image_line = core.page.view.document.render_view().fragments().images().iter().next().expect("fixture image fragment").line_idx();
         let caption_first = line_index_for_character(&core, 'C');
         let caption_second = line_index_for_character(&core, 'D');
 
-        assert!(core.page.frame.last_line_positions.get(image_line).is_none(), "the image must move instead of leaving its caption behind");
-        assert!(core.page.frame.last_line_positions.get(caption_first).is_none());
-        assert!(core.page.frame.last_line_positions.get(caption_second).is_none());
+        assert!(core.page.view.frame.last_line_positions.get(image_line).is_none(), "the image must move instead of leaving its caption behind");
+        assert!(core.page.view.frame.last_line_positions.get(caption_first).is_none());
+        assert!(core.page.view.frame.last_line_positions.get(caption_second).is_none());
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(image_line).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(caption_first).map(|screen| screen.point.y), Some(20.0));
-        assert_eq!(core.page.frame.last_line_positions.get(caption_second).map(|screen| screen.point.y), Some(40.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(image_line).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption_first).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption_second).map(|screen| screen.point.y), Some(40.0));
     }
 
     #[test]
@@ -1563,8 +1578,8 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(200.0, 50.0), 1);
         let image_label = line_index_for_character(&core, 'I');
 
-        assert!(core.page.frame.last_line_positions.get(image_label).is_some(), "web-compatible pagination must preserve normal flow placement");
-        assert_eq!(core.page.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
+        assert!(core.page.view.frame.last_line_positions.get(image_label).is_some(), "web-compatible pagination must preserve normal flow placement");
+        assert_eq!(core.page.view.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
     }
 
     #[test]
@@ -1574,14 +1589,14 @@ mod tests {
         let image_label = line_index_for_character(&core, 'I');
         let caption = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 40.0);
-        assert!(core.page.frame.last_line_positions.get(image_label).is_none());
-        assert!(core.page.frame.last_line_positions.get(caption).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(image_label).expect("figure content line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(image_label).is_none());
+        assert!(core.page.view.frame.last_line_positions.get(caption).is_none());
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0));
     }
 
     #[test]
@@ -1591,14 +1606,14 @@ mod tests {
         let caption = line_index_for_character(&core, 'C');
         let image_label = line_index_for_character(&core, 'I');
 
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(image_label).expect("figure content line").point().y, 40.0);
-        assert!(core.page.frame.last_line_positions.get(caption).is_none());
-        assert!(core.page.frame.last_line_positions.get(image_label).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(image_label).expect("figure content line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(caption).is_none());
+        assert!(core.page.view.frame.last_line_positions.get(image_label).is_none());
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(image_label).map(|screen| screen.point.y), Some(20.0));
     }
 
     #[test]
@@ -1608,9 +1623,9 @@ mod tests {
         let image_label = line_index_for_character(&core, 'I');
         let caption = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.document.render_view().text().line(image_label).expect("figure content line").point().y, 0.0);
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "forced pagination must not insert a gap into continuous layout");
-        assert!(core.page.frame.last_line_positions.get(caption).is_none(), "the caption must begin on the next reader page");
+        assert_eq!(core.page.view.document.render_view().text().line(image_label).expect("figure content line").point().y, 0.0);
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "forced pagination must not insert a gap into continuous layout");
+        assert!(core.page.view.frame.last_line_positions.get(caption).is_none(), "the caption must begin on the next reader page");
     }
 
     #[test]
@@ -1618,7 +1633,7 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><figure style='margin:0'><div style='line-height:20px'>I</div><figcaption style='line-height:20px'>C</figcaption></figure><div style='line-height:20px'>D</div></body></html>";
         let (mut core, mut shaper) = pagination_core_with_policy(html, Size::new(200.0, 50.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1626,7 +1641,7 @@ mod tests {
         core.prev_page(&mut shaper);
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -1638,13 +1653,13 @@ mod tests {
         let first_row = line_index_for_character(&core, 'B');
         let second_row = line_index_for_character(&core, 'D');
 
-        assert!(core.page.frame.last_line_positions.get(caption).is_none(), "the table caption must move with the compact table");
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "layout geometry remains continuous");
+        assert!(core.page.view.frame.last_line_positions.get(caption).is_none(), "the table caption must move with the compact table");
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "layout geometry remains continuous");
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(20.0));
-        assert_eq!(core.page.frame.last_line_positions.get(second_row).map(|screen| screen.point.y), Some(40.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(second_row).map(|screen| screen.point.y), Some(40.0));
     }
 
     #[test]
@@ -1653,8 +1668,8 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(200.0, 70.0), 1);
         let caption = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(caption).is_some());
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 20.0);
+        assert!(core.page.view.frame.last_line_positions.get(caption).is_some());
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 20.0);
     }
 
     #[test]
@@ -1665,10 +1680,10 @@ mod tests {
         let first_row = line_index_for_character(&core, 'B');
         let second_row = line_index_for_character(&core, 'D');
 
-        assert_eq!(core.page.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0), "an oversized table should use the remainder after preceding content");
-        assert_eq!(core.page.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(40.0));
-        assert!(core.page.frame.last_line_positions.get(second_row).is_none(), "the next complete row should move when it no longer fits");
-        assert_eq!(core.page.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "layout geometry remains continuous");
+        assert_eq!(core.page.view.frame.last_line_positions.get(caption).map(|screen| screen.point.y), Some(20.0), "an oversized table should use the remainder after preceding content");
+        assert_eq!(core.page.view.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(40.0));
+        assert!(core.page.view.frame.last_line_positions.get(second_row).is_none(), "the next complete row should move when it no longer fits");
+        assert_eq!(core.page.view.document.render_view().text().line(caption).expect("caption line").point().y, 20.0, "layout geometry remains continuous");
     }
 
     #[test]
@@ -1678,13 +1693,13 @@ mod tests {
         let first_row = line_index_for_character(&core, 'B');
         let first_row_second_line = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(first_row).is_none());
-        assert_eq!(core.page.document.render_view().text().line(first_row).expect("first row line").point().y, 20.0, "layout geometry remains continuous");
+        assert!(core.page.view.frame.last_line_positions.get(first_row).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(first_row).expect("first row line").point().y, 20.0, "layout geometry remains continuous");
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(0.0));
-        let first_y = core.page.frame.last_line_positions.get(first_row).expect("first row line is visible").point.y;
-        let second_y = core.page.frame.last_line_positions.get(first_row_second_line).expect("the paginator must not split a row").point.y;
+        assert_eq!(core.page.view.frame.last_line_positions.get(first_row).map(|screen| screen.point.y), Some(0.0));
+        let first_y = core.page.view.frame.last_line_positions.get(first_row).expect("first row line is visible").point.y;
+        let second_y = core.page.view.frame.last_line_positions.get(first_row_second_line).expect("the paginator must not split a row").point.y;
         assert!(second_y > first_y);
     }
 
@@ -1694,9 +1709,9 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(500.0, 70.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let continued_row = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.repeated_table_headers.len(), 1);
-        assert_eq!(core.page.frame.repeated_table_headers[0].col_index, 1);
-        assert_eq!(core.page.frame.last_line_positions.get(continued_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+        assert_eq!(core.page.view.frame.repeated_table_headers.len(), 1);
+        assert_eq!(core.page.view.frame.repeated_table_headers[0].col_index, 1);
+        assert_eq!(core.page.view.frame.last_line_positions.get(continued_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
     }
 
     #[test]
@@ -1705,8 +1720,8 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(500.0, 70.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let continued_row = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.repeated_table_headers.len(), 1);
-        assert_eq!(core.page.frame.last_line_positions.get(continued_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
+        assert_eq!(core.page.view.frame.repeated_table_headers.len(), 1);
+        assert_eq!(core.page.view.frame.last_line_positions.get(continued_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 20.0)));
     }
 
     #[test]
@@ -1715,8 +1730,8 @@ mod tests {
         let (core, _) = pagination_core_with_policy(html, Size::new(500.0, 60.0), 2, html::pipeline::TextCompositionPolicy::BookOptimized);
         let body_row = line_index_for_character(&core, 'B');
 
-        assert!(core.page.frame.repeated_table_headers.is_empty());
-        assert_eq!(core.page.frame.last_line_positions.get(body_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
+        assert!(core.page.view.frame.repeated_table_headers.is_empty());
+        assert_eq!(core.page.view.frame.last_line_positions.get(body_row).map(|screen| (screen.col_index, screen.point.y)), Some((1, 0.0)));
     }
 
     #[test]
@@ -1727,9 +1742,9 @@ mod tests {
         let first_last = line_index_for_character(&core, 'B');
         let second = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.frame.last_line_positions.get(first).map(|screen| screen.col_index), Some(0));
-        assert_eq!(core.page.frame.last_line_positions.get(first_last).map(|screen| screen.col_index), Some(0), "a line ending exactly at the next row's top still belongs to the previous row");
-        assert_eq!(core.page.frame.last_line_positions.get(second).map(|screen| screen.col_index), Some(1));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first).map(|screen| screen.col_index), Some(0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(first_last).map(|screen| screen.col_index), Some(0), "a line ending exactly at the next row's top still belongs to the previous row");
+        assert_eq!(core.page.view.frame.last_line_positions.get(second).map(|screen| screen.col_index), Some(1));
     }
 
     #[test]
@@ -1740,14 +1755,14 @@ mod tests {
         let second_group_row = line_index_for_character(&core, 'U');
 
         for _ in 0..4 {
-            if core.page.frame.last_line_positions.get(first_group_row).is_some() {
+            if core.page.view.frame.last_line_positions.get(first_group_row).is_some() {
                 break;
             }
             core.next_page(&mut shaper);
             core.paint_forward(&mut RecordingPainter::default());
         }
-        assert!(core.page.frame.last_line_positions.get(first_group_row).is_some(), "the rowspan group must eventually be visible");
-        assert!(core.page.frame.last_line_positions.get(second_group_row).is_some(), "rows connected by a rowspan must stay on the same page");
+        assert!(core.page.view.frame.last_line_positions.get(first_group_row).is_some(), "the rowspan group must eventually be visible");
+        assert!(core.page.view.frame.last_line_positions.get(second_group_row).is_some(), "rows connected by a rowspan must stay on the same page");
     }
 
     #[test]
@@ -1757,8 +1772,8 @@ mod tests {
         let last_row = line_index_for_character(&core, 'B');
         let caption = line_index_for_character(&core, 'C');
 
-        let row_y = core.page.document.render_view().text().line(last_row).expect("last row line").point().y;
-        let caption_line = core.page.document.render_view().text().line(caption).expect("bottom caption line");
+        let row_y = core.page.view.document.render_view().text().line(last_row).expect("last row line").point().y;
+        let caption_line = core.page.view.document.render_view().text().line(caption).expect("bottom caption line");
         assert_eq!(row_y, 40.0, "layout geometry remains continuous");
         let (group_top, group_bottom) = core.paginator().table_row_group_bounds_containing(row_y).expect("the final row owns a pagination group");
         assert_eq!(group_top, row_y);
@@ -1773,13 +1788,13 @@ mod tests {
         let first_row = line_index_for_character(&core, 'A');
         let second_row = line_index_for_character(&core, 'B');
 
-        assert_eq!(core.page.document.render_view().text().line(first_row).expect("first row line").point().y, 0.0);
-        assert_eq!(core.page.document.render_view().text().line(second_row).expect("second row line").point().y, 20.0, "forced pagination does not alter layout geometry");
-        assert!(core.page.frame.last_line_positions.get(second_row).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(first_row).expect("first row line").point().y, 0.0);
+        assert_eq!(core.page.view.document.render_view().text().line(second_row).expect("second row line").point().y, 20.0, "forced pagination does not alter layout geometry");
+        assert!(core.page.view.frame.last_line_positions.get(second_row).is_none());
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert!(core.page.frame.repeated_table_headers.is_empty(), "ordinary td rows must not be inferred as table headers");
-        assert_eq!(core.page.frame.last_line_positions.get(second_row).map(|screen| screen.point.y), Some(0.0));
+        assert!(core.page.view.frame.repeated_table_headers.is_empty(), "ordinary td rows must not be inferred as table headers");
+        assert_eq!(core.page.view.frame.last_line_positions.get(second_row).map(|screen| screen.point.y), Some(0.0));
     }
 
     #[test]
@@ -1787,7 +1802,7 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><table style='margin:0;border-spacing:0'><caption style='line-height:20px'>C</caption><tr><td style='padding:0;line-height:20px'>B</td></tr><tr><td style='padding:0;line-height:20px'>D</td></tr></table></body></html>";
         let (mut core, mut shaper) = pagination_core_with_policy(html, Size::new(200.0, 70.0), 1, html::pipeline::TextCompositionPolicy::BookOptimized);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1795,7 +1810,7 @@ mod tests {
         core.prev_page(&mut shaper);
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -1807,10 +1822,10 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(a).is_some());
-        assert!(core.page.frame.last_line_positions.get(b).is_none(), "a 1/1 paragraph split violates the default 2-line limits");
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 40.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("C line").point().y, 60.0);
+        assert!(core.page.view.frame.last_line_positions.get(a).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none(), "a 1/1 paragraph split violates the default 2-line limits");
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 40.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 60.0);
     }
 
     #[test]
@@ -1820,13 +1835,13 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("C line").point().y, 40.0);
-        assert!(core.page.frame.last_line_positions.get(b).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(b).is_none());
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(0.0));
-        assert_eq!(core.page.frame.last_line_positions.get(c).map(|screen| screen.point.y), Some(20.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(b).map(|screen| screen.point.y), Some(0.0));
+        assert_eq!(core.page.view.frame.last_line_positions.get(c).map(|screen| screen.point.y), Some(20.0));
     }
 
     #[test]
@@ -1836,10 +1851,10 @@ mod tests {
         let b = line_index_for_character(&core, 'B');
         let c = line_index_for_character(&core, 'C');
 
-        assert!(core.page.frame.last_line_positions.get(b).is_some(), "an authored one-line orphan allowance should permit B at the column bottom");
-        assert!(core.page.frame.last_line_positions.get(c).is_none());
-        assert_eq!(core.page.document.render_view().text().line(b).expect("B line").point().y, 20.0);
-        assert_eq!(core.page.document.render_view().text().line(c).expect("C line").point().y, 40.0);
+        assert!(core.page.view.frame.last_line_positions.get(b).is_some(), "an authored one-line orphan allowance should permit B at the column bottom");
+        assert!(core.page.view.frame.last_line_positions.get(c).is_none());
+        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0);
+        assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0);
     }
 
     #[test]
@@ -1847,7 +1862,7 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><section style='break-inside:avoid'><div style='line-height:20px'>B</div><div style='line-height:20px'>C</div></section></body></html>";
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 40.0), 1);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1855,7 +1870,7 @@ mod tests {
         core.prev_page(&mut shaper);
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -1865,10 +1880,10 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(200.0, 20.0), 1);
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
-        let source_a = core.page.document.render_view().text().line(a).expect("first cell line").point().y;
-        let source_b = core.page.document.render_view().text().line(b).expect("second cell line").point().y;
-        let screen_a = core.page.frame.last_line_positions.get(a).expect("first cell visible");
-        let screen_b = core.page.frame.last_line_positions.get(b).expect("second cell visible");
+        let source_a = core.page.view.document.render_view().text().line(a).expect("first cell line").point().y;
+        let source_b = core.page.view.document.render_view().text().line(b).expect("second cell line").point().y;
+        let screen_a = core.page.view.frame.last_line_positions.get(a).expect("first cell visible");
+        let screen_b = core.page.view.frame.last_line_positions.get(b).expect("second cell visible");
 
         assert_eq!(source_a, source_b, "table cell lines must exercise the equal-document-y path");
         assert_eq!(screen_a.col_index, screen_b.col_index);
@@ -1882,12 +1897,12 @@ mod tests {
         let (core, _) = pagination_core(html, Size::new(200.0, 40.0), 1);
         let left_glyph = glyph_index_for_character(&core, 'L');
         let right_glyph = glyph_index_for_character(&core, 'R');
-        let left_line_idx = core.page.document.render_view().text().line_index_for_glyph(left_glyph).expect("left cell line");
-        let right_line_idx = core.page.document.render_view().text().line_index_for_glyph(right_glyph).expect("right cell line");
-        let left_line = core.page.document.render_view().text().line(left_line_idx).expect("left cell geometry");
-        let right_line = core.page.document.render_view().text().line(right_line_idx).expect("right cell geometry");
-        let left_screen = core.page.frame.last_line_positions.get(left_line_idx).expect("left cell visible");
-        let right_screen = core.page.frame.last_line_positions.get(right_line_idx).expect("right cell visible");
+        let left_line_idx = core.page.view.document.render_view().text().line_index_for_glyph(left_glyph).expect("left cell line");
+        let right_line_idx = core.page.view.document.render_view().text().line_index_for_glyph(right_glyph).expect("right cell line");
+        let left_line = core.page.view.document.render_view().text().line(left_line_idx).expect("left cell geometry");
+        let right_line = core.page.view.document.render_view().text().line(right_line_idx).expect("right cell geometry");
+        let left_screen = core.page.view.frame.last_line_positions.get(left_line_idx).expect("left cell visible");
+        let right_screen = core.page.view.frame.last_line_positions.get(right_line_idx).expect("right cell visible");
         let left_point = Point::new(left_screen.point.x + core.text_geometry().glyph_x_in_line(&left_line, left_glyph) + 0.1, left_screen.point.y + left_line.height() / 2.0);
         let right_point = Point::new(right_screen.point.x + core.text_geometry().glyph_x_in_line(&right_line, right_glyph) + 0.1, right_screen.point.y + right_line.height() / 2.0);
 
@@ -1900,26 +1915,26 @@ mod tests {
     fn semantic_selection_promotes_table_cells_and_embeds_a_markdown_table() {
         let html = "<html><body style='margin:0'><p>Before</p><table><tr><th>Head A</th><th>Head B</th></tr><tr><td>One</td><td>Two</td></tr></table><p>After</p></body></html>";
         let (mut core, _) = pagination_core(html, Size::new(500.0, 300.0), 1);
-        let glyph_count = core.page.document.render_view().text().glyph_count() as u32;
+        let glyph_count = core.page.view.document.render_view().text().glyph_count() as u32;
 
-        core.page.selection.selection_anchor = Some(0);
-        core.page.selection.selection_active = Some(glyph_count);
-        core.page.selection.semantic_selection = true;
+        core.page.view.selection.selection_anchor = Some(0);
+        core.page.view.selection.selection_active = Some(glyph_count);
+        core.page.view.selection.semantic_selection = true;
         core.update_selection_text();
 
-        let markdown = core.page.selection.selected_text_markdown.as_deref().expect("semantic Markdown selection");
+        let markdown = core.page.view.selection.selected_text_markdown.as_deref().expect("semantic Markdown selection");
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("| Head A | Head B |\n| --- | --- |\n| One | Two |"));
         assert!(markdown.contains("After"));
         assert_eq!(core.selection_view().semantic_cell_glyph_ranges(0, glyph_count).len(), 4);
 
         let one = glyph_index_for_character(&core, 'O');
-        core.page.selection.selection_anchor = Some(one);
-        core.page.selection.selection_active = Some(one + 1);
+        core.page.view.selection.selection_anchor = Some(one);
+        core.page.view.selection.selection_active = Some(one + 1);
         core.update_selection_text();
 
-        assert_eq!(core.page.selection.selected_text.as_deref(), Some("O"), "annotation text remains tied to the actual glyph range");
-        assert_eq!(core.page.selection.selected_text_markdown.as_deref(), Some("|  |\n| --- |\n| One |"));
+        assert_eq!(core.page.view.selection.selected_text.as_deref(), Some("O"), "annotation text remains tied to the actual glyph range");
+        assert_eq!(core.page.view.selection.selected_text_markdown.as_deref(), Some("|  |\n| --- |\n| One |"));
         assert_eq!(core.selection_view().semantic_cell_glyph_ranges(one, one + 1).len(), 1);
     }
 
@@ -1929,21 +1944,21 @@ mod tests {
         let (mut core, _) = pagination_core(html, Size::new(500.0, 300.0), 1);
         let alpha = glyph_index_for_character(&core, 'p');
 
-        core.page.selection.selection_anchor = Some(alpha);
-        core.page.selection.selection_active = Some(alpha + 1);
-        core.page.selection.semantic_selection = true;
+        core.page.view.selection.selection_anchor = Some(alpha);
+        core.page.view.selection.selection_active = Some(alpha + 1);
+        core.page.view.selection.semantic_selection = true;
         core.update_selection_text();
 
-        assert_eq!(core.page.selection.selected_text.as_deref(), Some("p"), "annotation text remains tied to the actual glyph range");
-        assert_eq!(core.page.selection.selected_text_markdown.as_deref(), Some("5. Alpha\n    - Beta"));
+        assert_eq!(core.page.view.selection.selected_text.as_deref(), Some("p"), "annotation text remains tied to the actual glyph range");
+        assert_eq!(core.page.view.selection.selected_text_markdown.as_deref(), Some("5. Alpha\n    - Beta"));
         let promoted = core.selection_view().semantic_promoted_glyph_ranges(alpha, alpha + 1);
         assert!(promoted.len() >= 2, "the complete parent and nested item text should be selected");
 
         let beta = glyph_index_for_character(&core, 't');
-        core.page.selection.selection_anchor = Some(beta);
-        core.page.selection.selection_active = Some(beta + 1);
+        core.page.view.selection.selection_anchor = Some(beta);
+        core.page.view.selection.selection_active = Some(beta + 1);
         core.update_selection_text();
-        assert_eq!(core.page.selection.selected_text_markdown.as_deref(), Some("- Beta"), "a nested item selected alone should remain a portable standalone list item");
+        assert_eq!(core.page.view.selection.selected_text_markdown.as_deref(), Some("- Beta"), "a nested item selected alone should remain a portable standalone list item");
     }
 
     #[test]
@@ -1952,21 +1967,21 @@ mod tests {
         let (mut core, _) = pagination_core(html, Size::new(500.0, 300.0), 1);
         let selected = glyph_index_for_character(&core, 'x');
 
-        core.page.selection.selection_anchor = Some(selected);
-        core.page.selection.selection_active = Some(selected + 1);
-        core.page.selection.semantic_selection = true;
+        core.page.view.selection.selection_anchor = Some(selected);
+        core.page.view.selection.selection_active = Some(selected + 1);
+        core.page.view.selection.semantic_selection = true;
         core.update_selection_text();
 
-        assert_eq!(core.page.selection.selected_text.as_deref(), Some("x"));
-        assert_eq!(core.page.selection.selected_text_markdown.as_deref(), Some("`x`"));
+        assert_eq!(core.page.view.selection.selected_text.as_deref(), Some("x"));
+        assert_eq!(core.page.view.selection.selected_text_markdown.as_deref(), Some("`x`"));
         assert!(core.selection_view().semantic_promoted_glyph_ranges(selected, selected + 1).is_empty(), "a selection contained by the code block must remain granular");
 
         let before = glyph_index_for_character(&core, 'B');
-        core.page.selection.selection_anchor = Some(before);
-        core.page.selection.selection_active = Some(selected + 1);
+        core.page.view.selection.selection_anchor = Some(before);
+        core.page.view.selection.selection_active = Some(selected + 1);
         core.update_selection_text();
 
-        let markdown = core.page.selection.selected_text_markdown.as_deref().expect("cross-boundary Markdown selection");
+        let markdown = core.page.view.selection.selected_text_markdown.as_deref().expect("cross-boundary Markdown selection");
         assert!(markdown.contains("Before"));
         assert!(markdown.contains("````rust\nlet x = ```;\nnext();\n````"));
         assert!(!core.selection_view().semantic_promoted_glyph_ranges(before, selected + 1).is_empty(), "crossing into the code block must promote it completely");
@@ -1977,18 +1992,18 @@ mod tests {
         let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><div style='line-height:20px'>B</div><div style='line-height:20px'>C</div><div style='line-height:20px'>D</div><div style='line-height:20px'>E</div></body></html>";
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 40.0), 1);
         let first_page = visible_positions(&core);
-        let first_range = (core.page.frame.current_page_start_line, core.page.frame.current_page_end_line);
+        let first_range = (core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line);
 
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_ne!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range, "forward navigation must reach a different page");
+        assert_ne!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range, "forward navigation must reach a different page");
 
         core.prepared_pages.clear();
         core.prev_page(&mut shaper);
         assert!(matches!(core.viewport.direction, crate::PaintDirection::Backward));
         core.prepare_backward();
 
-        assert_eq!((core.page.frame.current_page_start_line, core.page.frame.current_page_end_line), first_range);
+        assert_eq!((core.page.view.frame.current_page_start_line, core.page.view.frame.current_page_end_line), first_range);
         assert_eq!(visible_positions(&core), first_page);
     }
 
@@ -2010,13 +2025,13 @@ mod tests {
 
         core.configure_layout_for_viewport(&mut shaper, Size::new(600.0, 800.0));
         core.paint_forward(&mut RecordingPainter::default());
-        let view = core.page.document.render_view();
+        let view = core.page.view.document.render_view();
         let text = view.text();
         let addressing = view.addressing();
         let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
         let line_idx = core.doc().find_line_for_glyph(linked_glyph).expect("linked glyph should be laid out");
-        let screen = core.page.frame.last_line_positions.get(line_idx).expect("linked line should be painted");
-        let line = core.page.document.render_view().text().line(line_idx).expect("linked line should be present");
+        let screen = core.page.view.frame.last_line_positions.get(line_idx).expect("linked line should be painted");
+        let line = core.page.view.document.render_view().text().line(line_idx).expect("linked line should be present");
         let position = Point::new(screen.point.x + core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
         assert!(core.link_at(position));
         assert!(core.begin_selection_at(position, false));
@@ -2048,18 +2063,18 @@ mod tests {
         let loaded = load::load_document(provider.clone(), &uris[0], 16.0, 600.0, &mut shaper);
         let host = Rc::new(TestHost::default());
         let mut core = RendererCore::new(host.clone(), loaded, provider, uris, 0, RendererInitialConfig::default());
-        assert_eq!(core.pipeline_inputs.layout.image_sizing_policy, html::pipeline::ImageSizingPolicy::SmartStandalone, "reader UI documents should enable smart standalone image sizing at initial layout");
+        assert_eq!(core.page.inputs.layout.image_sizing_policy, html::pipeline::ImageSizingPolicy::SmartStandalone, "reader UI documents should enable smart standalone image sizing at initial layout");
 
         core.apply(&mut shaper, crate::RendererCommand::SetColumnWidth(480.0));
         core.apply(&mut shaper, crate::RendererCommand::SetFontSize(18.0));
         core.apply(&mut shaper, crate::RendererCommand::SetScale(1.5));
-        assert_eq!(core.page.layout.base_col_width, 480.0);
+        assert_eq!(core.page.view.layout.base_col_width, 480.0);
         assert_eq!(core.root_font_size, 18.0);
-        assert_eq!(core.page.layout.scale, 1.5);
-        let reader_overrides_before_theme = core.pipeline_inputs.reader_overrides.clone();
+        assert_eq!(core.page.view.layout.scale, 1.5);
+        let reader_overrides_before_theme = core.page.inputs.reader_overrides.clone();
         let repaint_before_theme = host.repaint_requests.get();
         core.apply(&mut shaper, crate::RendererCommand::SetReaderPaintPalette(crate::ReaderPaintPalette { foreground: Some(0xe7e2d8ff), background: Some(0x171916ff) }));
-        assert_eq!(core.pipeline_inputs.reader_overrides, reader_overrides_before_theme, "theme changes must not rerun the style pipeline");
+        assert_eq!(core.page.inputs.reader_overrides, reader_overrides_before_theme, "theme changes must not rerun the style pipeline");
         assert!(host.repaint_requests.get() > repaint_before_theme);
         let width_event_count = host.events.borrow().iter().filter(|event| matches!(event, RendererEvent::ColumnWidthChanged(_))).count();
         let repaint_count = host.repaint_requests.get();
@@ -2075,13 +2090,13 @@ mod tests {
         assert_eq!(core.highlight.current_match, 1);
 
         let (start, end) = core.highlight.matches[0];
-        core.page.selection.selection_anchor = Some(start);
-        core.page.selection.selection_active = Some(end);
+        core.page.view.selection.selection_anchor = Some(start);
+        core.page.view.selection.selection_active = Some(end);
         core.update_selection_text();
-        assert_eq!(core.page.selection.selected_text.as_deref(), Some("Needle"));
-        assert_eq!(core.page.selection.selected_text_markdown.as_deref(), Some("**Needle**"));
-        let range_cfi = crate::cfi::generate_cfi_range(&core.page.document, 0, start, end).expect("selection has a range CFI");
-        assert_eq!(crate::cfi::parse_cfi_range(&core.page.document, &range_cfi), Some((0, start, end)));
+        assert_eq!(core.page.view.selection.selected_text.as_deref(), Some("Needle"));
+        assert_eq!(core.page.view.selection.selected_text_markdown.as_deref(), Some("**Needle**"));
+        let range_cfi = crate::cfi::generate_cfi_range(&core.page.view.document, 0, start, end).expect("selection has a range CFI");
+        assert_eq!(crate::cfi::parse_cfi_range(&core.page.view.document, &range_cfi), Some((0, start, end)));
         core.apply(
             &mut shaper,
             crate::RendererCommand::SetAnnotations(vec![crate::RendererAnnotation {
@@ -2116,8 +2131,8 @@ mod tests {
         assert_eq!(host.clipboard_text.borrow().as_deref(), Some("**Needle**"));
 
         core.configure_layout_for_viewport(&mut shaper, Size::new(1_600.0, 800.0));
-        assert_eq!(core.page.layout.col_count, 2.0);
-        assert!(core.page.layout.col_gap >= 0.0);
+        assert_eq!(core.page.view.layout.col_count, 2.0);
+        assert!(core.page.view.layout.col_gap >= 0.0);
 
         let events = host.events.borrow();
         assert!(events.iter().any(|event| matches!(event, RendererEvent::ColumnWidthChanged(width) if *width == 480.0)));
@@ -2142,14 +2157,14 @@ mod tests {
         let host = Rc::new(TestHost::default());
         let mut core = RendererCore::new(host.clone(), loaded, provider, vec!["doc.html".to_owned()], 0, RendererInitialConfig::default());
         let committed_size = core.root_font_size;
-        let committed_input_size = core.pipeline_inputs.style_environment.root_font_size;
+        let committed_input_size = core.page.inputs.style_environment.root_font_size;
         host.events.borrow_mut().clear();
 
         shaper.reject_glyphs = true;
         core.set_root_font_size(&mut shaper, 24.0);
 
         assert_eq!(core.root_font_size, committed_size);
-        assert_eq!(core.pipeline_inputs.style_environment.root_font_size, committed_input_size);
+        assert_eq!(core.page.inputs.style_environment.root_font_size, committed_input_size);
         let events = host.events.borrow();
         assert!(!events.iter().any(|event| matches!(event, RendererEvent::FontSizeChanged(size) if *size == 24.0)));
         assert!(events.iter().any(|event| matches!(event, RendererEvent::OperationFailed { operation: RendererOperation::UpdateDocument, message } if !message.is_empty())));
@@ -2168,8 +2183,8 @@ mod tests {
 
         core.configure_layout_for_viewport(&mut shaper, Size::new(600.0, 800.0));
         core.paint_forward(&mut RecordingPainter::default());
-        let document_y = core.page.document.render_view().text().line(0).expect("fixture has a text line").point().y;
-        let screen_y = core.page.frame.last_line_positions.get(0).expect("first line is visible").point.y;
+        let document_y = core.page.view.document.render_view().text().line(0).expect("fixture has a text line").point().y;
+        let screen_y = core.page.view.frame.last_line_positions.get(0).expect("first line is visible").point.y;
         assert_eq!(screen_y, document_y, "the first frame must not scroll directly to its first glyph");
     }
 
@@ -2187,10 +2202,10 @@ mod tests {
         let heading = line_index_for_character(&core, 'H');
         let moved = line_index_for_character(&core, 'B');
         assert_eq!(core.viewport.start_offset_y, 0.0, "a publication without saved state must retain the true document origin");
-        assert_eq!(core.page.frame.current_page_start_line, Some(heading));
-        assert!(core.page.frame.last_line_positions.get(heading).is_some());
-        assert!(core.page.frame.last_line_positions.get(moved).is_none(), "the protected paragraph should move without becoming the restored startup anchor");
-        assert_eq!(core.page.document.render_view().text().line(moved).expect("moved line").point().y, 60.0, "continuous layout must not contain a pagination gap");
+        assert_eq!(core.page.view.frame.current_page_start_line, Some(heading));
+        assert!(core.page.view.frame.last_line_positions.get(heading).is_some());
+        assert!(core.page.view.frame.last_line_positions.get(moved).is_none(), "the protected paragraph should move without becoming the restored startup anchor");
+        assert_eq!(core.page.view.document.render_view().text().line(moved).expect("moved line").point().y, 60.0, "continuous layout must not contain a pagination gap");
     }
 
     #[test]
@@ -2305,7 +2320,7 @@ mod tests {
         let mut core = RendererCore::from_provider_with_nav(host.clone(), &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), RendererInitialConfig::default());
         let regular = glyph_index_for_character(&core, 'R');
         let noteref = glyph_index_for_character(&core, 'N');
-        let addressing = core.page.document.render_view().addressing();
+        let addressing = core.page.view.document.render_view().addressing();
 
         assert!(!addressing.is_note_reference(regular));
         assert!(addressing.is_note_reference(noteref));
@@ -2324,9 +2339,9 @@ mod tests {
     fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
         let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside><p>Continues</p></body></html>";
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
-        let text = core.page.document.render_view().text();
+        let text = core.page.view.document.render_view().text();
         let noteref = glyph_index_for_character(&core, '1');
-        assert!(core.page.document.render_view().addressing().is_note_reference(noteref));
+        assert!(core.page.view.document.render_view().addressing().is_note_reference(noteref));
         let visible_source = (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>();
 
         assert!(visible_source.contains("Reading"));
@@ -2357,13 +2372,13 @@ mod tests {
         core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
         core.paint_forward(&mut RecordingPainter::default());
 
-        let text = core.page.document.render_view().text();
+        let text = core.page.view.document.render_view().text();
         let visible_source = (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>();
         assert!(visible_source.contains("zebra"), "an as-authored note occupies the reading flow rather than being held back for a popup");
 
         // The engine's note semantics are untouched by the display mode: the
         // target is still a note, which is what a later mode switch relies on.
-        assert!(core.page.document.render_view().addressing().is_note_target("note"));
+        assert!(core.page.view.document.render_view().addressing().is_note_target("note"));
     }
 
     #[test]
@@ -2372,7 +2387,7 @@ mod tests {
         let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
 
         let flow_text = |core: &RendererCore| {
-            let text = core.page.document.render_view().text();
+            let text = core.page.view.document.render_view().text();
             (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>()
         };
         assert!(!flow_text(&core).contains("zebra"), "the note starts held back for a popup");
@@ -2403,9 +2418,11 @@ mod tests {
         assert!(scene.content_height() > 0.0, "a note's scene must have height");
     }
 
-    /// A reader over a spine, laid out in columns of `column_width`.
+    /// A reader over a spine, laid out in columns of `column_width`. The
+    /// spine is the HTML; anything else a fixture lists is a resource the
+    /// documents refer to.
     fn spine_core(documents: Vec<(&str, &str)>, continuous_spine: bool, viewport: Size, column_width: f64, max_columns: u8) -> (RendererCore, TestShaper) {
-        let uris = documents.iter().map(|(uri, _)| (*uri).to_owned()).collect::<Vec<_>>();
+        let uris = documents.iter().filter(|(uri, _)| uri.ends_with(".html")).map(|(uri, _)| (*uri).to_owned()).collect::<Vec<_>>();
         let (provider, _) = CountingProvider::new(documents);
         let host = Rc::new(TestHost::default());
         let mut shaper = TestShaper::default();
@@ -2446,7 +2463,7 @@ mod tests {
         let following = core.following_views();
         assert_eq!(following.len(), 1, "the free column is filled by the next spine item");
 
-        let view = &following[0].view;
+        let view = &following[0].spine.view;
         let first_line = view.frame.current_page_start_line.expect("the following item is paginated");
         let screen = view.frame.last_line_positions.get(first_line).expect("its first line is placed");
 
@@ -2467,13 +2484,30 @@ mod tests {
             ("two.html", "<html><body style='margin:0'><p>Second document</p></body></html>"),
         ]);
 
-        let layout = &core.page.layout;
+        let layout = &core.page.view.layout;
         let second_column_x = layout.col_x(1.0, 0.0);
-        let view = &core.following_views()[0].view;
+        let view = &core.following_views()[0].spine.view;
         let first_line = view.frame.current_page_start_line.expect("the following item is paginated");
         let screen = view.frame.last_line_positions.get(first_line).expect("its first line is placed");
 
         assert!(screen.point.x >= second_column_x, "it is drawn in the column its index claims");
+    }
+
+    #[test]
+    fn a_following_item_fetches_its_own_images() {
+        // `image_idx` indexes the document that refers to the image, so the
+        // page's pipeline would answer an item's index with a different
+        // picture -- or, as here, with nothing at all.
+        let (core, _shaper) = continuous_spine_core(vec![
+            ("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"),
+            ("two.html", "<html><body style='margin:0'><p>Second</p><img src='plate.png' width='40' height='40'></body></html>"),
+            ("plate.png", "not really a picture, but it is fetched like one"),
+        ]);
+
+        let item = &core.following_views()[0];
+        assert_eq!(item.doc_index, 1, "the second document follows the page");
+        assert!(item.spine.images.has_pending(), "the item fetches its picture through its own pipeline");
+        assert!(!core.page.images.has_pending(), "the page's pipeline addresses its own document's resources, and it has none");
     }
 
     #[test]
@@ -2482,7 +2516,7 @@ mod tests {
         // its tail in columns that are not there.
         let (core, _shaper) = continuous_spine_core(vec![("one.html", "<html><body style='margin:0'><p>First document</p></body></html>"), ("two.html", &long_document("Second"))]);
 
-        let view = &core.following_views()[0].view;
+        let view = &core.following_views()[0].spine.view;
         let last_column = view.frame.last_line_positions.iter().map(|(_, screen)| screen.col_index).max().expect("the following item paints something");
         assert_eq!(last_column, 1, "the item fills the one free column and stops there");
 
@@ -2690,7 +2724,7 @@ mod tests {
         core.paint_forward(&mut RecordingPainter::default());
 
         let noteref = glyph_index_for_character(&core, '1');
-        assert!(core.page.document.render_view().addressing().is_note_reference(noteref), "the reference keeps its note semantics; only the presentation differs");
+        assert!(core.page.view.document.render_view().addressing().is_note_reference(noteref), "the reference keeps its note semantics; only the presentation differs");
 
         assert!(core.handle_link_click(&mut shaper, noteref));
 
@@ -2711,9 +2745,9 @@ mod tests {
         core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
         core.paint_forward(&mut RecordingPainter::default());
 
-        let text = core.page.document.render_view().text();
+        let text = core.page.view.document.render_view().text();
         let noteref = glyph_index_for_character(&core, '1');
-        assert!(core.page.document.render_view().addressing().is_note_reference(noteref), "namespaced EPUB noteref semantics must survive preparation");
+        assert!(core.page.view.document.render_view().addressing().is_note_reference(noteref), "namespaced EPUB noteref semantics must survive preparation");
         let visible_source = (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>();
         assert!(visible_source.contains("Reading"));
         assert!(visible_source.contains("Continues"));
