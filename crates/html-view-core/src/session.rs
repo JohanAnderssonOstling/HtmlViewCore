@@ -46,6 +46,11 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.paint_note(note, painter);
     }
 
+    /// Height the note occupies at the width it was laid out to.
+    pub fn note_height(&self, note: &crate::LaidOutDocument) -> f64 {
+        self.core.note_height(note)
+    }
+
     pub fn from_provider_with_nav(host: Rc<dyn RendererHost>, mut glyph_shaper: S, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, start_index: usize, nav_state: Option<&str>, config: crate::RendererInitialConfig) -> Self {
         let started = Instant::now();
         let core = RendererCore::from_provider_with_nav(host, &mut glyph_shaper, provider, document_uris, start_index, nav_state, config);

@@ -23,19 +23,32 @@ impl RendererCore {
     /// own layout positions, for a host showing it in a popup.
     ///
     /// The note carries no selection, search or annotation state, so those
-    /// overlays are empty. Images inside a note are not painted: the note was
-    /// held out of the reading flow, so its image resources never entered this
-    /// document's pipeline.
+    /// overlays are empty.
+    ///
+    /// Images are resolved against an empty pipeline, so a note's images do
+    /// not paint. A scoped note indexes its own image resources, while the
+    /// page's pipeline holds the page's -- the same index means different
+    /// pictures in each. Handing over the page's pipeline would not leave a
+    /// note's image blank, it would draw whichever page image shared its
+    /// index. Notes with images want a pipeline of their own.
     ///
     /// [`FootnotePreview`]: crate::FootnotePreview
+    /// Height a note occupies at the width it was laid out to, so a host can
+    /// size the popup it will be drawn in.
+    pub(crate) fn note_height(&self, note: &crate::LaidOutDocument) -> f64 {
+        let text = DocQuery::new(note).text();
+        (0..text.line_count()).filter_map(|line_idx| text.line(line_idx)).map(|line| line.point().y + line.height()).fold(0.0, f64::max)
+    }
+
     pub(crate) fn paint_note(&self, note: &crate::LaidOutDocument, cx: &mut impl Painter) {
         let frame = crate::VisibleFrame::default();
         let layout = crate::ColumnLayout { col_count: 1.0, ..self.layout };
         let geo = html_view_doc::TextGeometry::new(DocQuery::new(note), &frame, &layout);
         let (selection_state, table_state) = (crate::SelectionState::default(), crate::TableSelectionState::default());
+        let images = html::resources::ImagePipeline::new(std::sync::Arc::new(Vec::new()), self.provider.clone());
         PagePainter {
             geo,
-            images: &self.image_pipeline,
+            images: &images,
             reader_palette: self.reader_palette,
             interaction_palette: self.interaction_palette,
             highlight: &Default::default(),
