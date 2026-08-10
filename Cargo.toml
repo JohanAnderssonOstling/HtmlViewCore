@@ -19,7 +19,8 @@ kurbo = "0.11.3"
 peniko = "0.2.0"
 unicode-normalization = "0.1"
 
-# Temporary: builds against the local note-handling worktree until that work
-# lands upstream and the pin above moves. Remove with the pin bump.
+# Temporary: the note-handling work is on master locally but not yet pushed,
+# so the git pin above cannot resolve it. Remove this block and bump the pin
+# once master is pushed.
 [patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
-html-engine = { path = "../HtmlEngine-notes/crates/html" }
+html-engine = { path = "../HtmlEngine/crates/html" }
