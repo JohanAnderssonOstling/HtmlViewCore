@@ -1,12 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-doc", "crates/html-view-load", "crates/html-view-navigate", "crates/html-view-paginate", "crates/html-view-paint", "crates/html-view-select", "crates/html-view-types"]
+members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-doc", "crates/html-view-harness", "crates/html-view-load", "crates/html-view-navigate", "crates/html-view-paginate", "crates/html-view-paint", "crates/html-view-select", "crates/html-view-types"]
 
 [workspace.package]
 repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
 
 [workspace.dependencies]
 html-view-cfi = { path = "crates/html-view-cfi" }
+html-view-core = { path = "crates/html-view-core" }
 html-view-doc = { path = "crates/html-view-doc" }
 html-view-load = { path = "crates/html-view-load" }
 html-view-navigate = { path = "crates/html-view-navigate" }

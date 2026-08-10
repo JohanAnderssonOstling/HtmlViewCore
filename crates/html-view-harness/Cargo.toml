@@ -1,0 +1,23 @@
+[package]
+name = "html-view-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository.workspace = true
+
+# A window over the renderer, for looking at what a change did. Not part of
+# the library: nothing here is depended on by the crates it exercises, and its
+# windowing dependencies stay out of their builds.
+
+[[bin]]
+name = "spine-harness"
+path = "src/main.rs"
+
+[dependencies]
+html.workspace = true
+html-view-core.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+fontdue = "0.9"
+softbuffer = "0.4"
+winit = "0.30"

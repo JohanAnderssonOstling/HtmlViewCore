@@ -2535,13 +2535,10 @@ mod tests {
         assert_eq!(core.viewport.start_offset_y, resume_at, "picking up where the screen left it");
     }
 
-    // -- visual harness -----------------------------------------------------
+    // -- the spine the native harness reads ---------------------------------
     //
-    // Continuous mode is a claim about where things land on a screen, and the
-    // cheapest way to be wrong about it is to assert on numbers that look
-    // plausible. This writes the screens out as a page you can step through,
-    // painted through the renderer's own painter rather than redrawn by the
-    // harness.
+    // `cargo run -p html-view-harness` opens a window on this same fixture.
+    // The tests below assert about screens it can be looked at on.
 
     const HARNESS_VIEWPORT: Size = Size::new(900.0, 520.0);
     const HARNESS_COLUMN_WIDTH: f64 = 260.0;
@@ -2575,92 +2572,6 @@ mod tests {
         spine.iter().map(|(uri, body)| (*uri, body.as_str())).collect()
     }
 
-    fn json_string(value: &str) -> String {
-        let mut escaped = String::with_capacity(value.len() + 2);
-        escaped.push('"');
-        for ch in value.chars() {
-            match ch {
-                '"' => escaped.push_str("\\\""),
-                '\\' => escaped.push_str("\\\\"),
-                '<' => escaped.push_str("\\u003c"),
-                '&' => escaped.push_str("\\u0026"),
-                ch if (ch as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
-                ch => escaped.push(ch),
-            }
-        }
-        escaped.push('"');
-        escaped
-    }
-
-    fn round(value: f64) -> f64 {
-        (value * 100.0).round() / 100.0
-    }
-
-    /// One document's contribution to a screen, as the painter drew it.
-    fn painted_document_json(uri: &str, doc_index: usize, view: &crate::document_view::DocumentView, painter: &crate::RecordingPainter, viewport: Size) -> String {
-        let text = view.doc().text();
-        let mut glyphs = painter.glyphs.iter().filter_map(|(glyph, origin)| text.glyph_metric(*glyph).map(|metric| (round(origin.y), origin.x, metric.ch()))).collect::<Vec<_>>();
-        glyphs.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.total_cmp(&right.1)));
-
-        let mut runs = Vec::new();
-        for (baseline, group) in glyphs.chunk_by(|left, right| left.0 == right.0).map(|group| (group[0].0, group)) {
-            let xs = group.iter().map(|(_, x, _)| round(*x).to_string()).collect::<Vec<_>>().join(",");
-            let line = group.iter().map(|(_, _, ch)| *ch).collect::<String>();
-            runs.push(format!("{{\"y\":{baseline},\"x\":[{xs}],\"text\":{}}}", json_string(&line)));
-        }
-
-        // The page fills the whole viewport with the canvas colour; drawing
-        // that would bury every other document under the last one painted.
-        let rects = painter
-            .fills
-            .iter()
-            .filter(|(rect, _)| rect.width() < viewport.width || rect.height() < viewport.height)
-            .map(|(rect, _)| format!("{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}", round(rect.x0), round(rect.y0), round(rect.width()), round(rect.height())))
-            .collect::<Vec<_>>();
-
-        format!("{{\"doc_index\":{doc_index},\"uri\":{},\"runs\":[{}],\"rects\":[{}]}}", json_string(uri), runs.join(","), rects.join(","))
-    }
-
-    /// Steps a reader forward a screen at a time, recording each screen.
-    fn harness_mode_json(name: &str, continuous_spine: bool) -> String {
-        let spine = harness_spine();
-        let (mut core, mut shaper) = spine_core(harness_spine_refs(&spine), continuous_spine, HARNESS_VIEWPORT, HARNESS_COLUMN_WIDTH, HARNESS_COLUMNS);
-        let mut screens = Vec::new();
-
-        for _ in 0..12 {
-            core.prepare_frame(&mut shaper, HARNESS_VIEWPORT);
-
-            let uris = core.nav.document_uris.clone();
-            let mut documents = Vec::new();
-            core.paint_by_document(|doc_index, view, painter| {
-                documents.push(painted_document_json(&uris[doc_index], doc_index, view, painter, HARNESS_VIEWPORT));
-            });
-
-            let continuation = match core.spine_continuation() {
-                Some((doc_index, crate::DocAnchor::Offset(offset_y))) => format!("A page turn resumes {} at y = {:.1}, below the part shown here.", uris[doc_index], offset_y),
-                Some((doc_index, _)) => format!("Everything after the page fits, so a page turn opens {} at its start.", uris[doc_index]),
-                None if continuous_spine => "The page fills the screen, so a page turn opens the next spine item at its start.".to_owned(),
-                None => "One document at a time: a page turn opens the next spine item at its start.".to_owned(),
-            };
-
-            screens.push(format!(
-                "{{\"page_uri\":{},\"start_offset_y\":{},\"continuation\":{},\"documents\":[{}]}}",
-                json_string(&uris[core.nav.current_doc_index]),
-                round(core.viewport.start_offset_y),
-                json_string(&continuation),
-                documents.join(",")
-            ));
-
-            let before = (core.nav.current_doc_index, core.viewport.start_offset_y);
-            core.next_page(&mut shaper);
-            if (core.nav.current_doc_index, core.viewport.start_offset_y) == before {
-                break;
-            }
-        }
-
-        format!("{{\"name\":{},\"screens\":[{}]}}", json_string(name), screens.join(","))
-    }
-
     #[test]
     fn arriving_in_a_document_does_not_keep_the_previous_one_s_position() {
         // The frame that arrives in a document often relayouts, and relayout
@@ -2678,35 +2589,6 @@ mod tests {
 
         assert_eq!(core.nav.current_doc_index, 3, "the short item beside the page was shown whole, so reading continues after it");
         assert_eq!(core.viewport.start_offset_y, 0.0, "a document opened at its start is shown from its start");
-    }
-
-    #[test]
-    #[ignore = "writes an interactive page instead of asserting; run with --ignored"]
-    fn spine_harness_writes_an_interactive_page() {
-        let spine = harness_spine();
-        let (core, _shaper) = spine_core(harness_spine_refs(&spine), true, HARNESS_VIEWPORT, HARNESS_COLUMN_WIDTH, HARNESS_COLUMNS);
-        let layout = &core.page.layout;
-        let columns = (0..layout.col_count as i32)
-            .map(|column| format!("{{\"x\":{},\"width\":{}}}", round(layout.col_x(f64::from(column), 0.0)), round(layout.col_width)))
-            .collect::<Vec<_>>()
-            .join(",");
-        drop(core);
-
-        let data = format!(
-            "{{\"viewport\":{{\"width\":{},\"height\":{}}},\"columns\":[{columns}],\"modes\":[{},{}]}}",
-            HARNESS_VIEWPORT.width,
-            HARNESS_VIEWPORT.height,
-            harness_mode_json("continuous", true),
-            harness_mode_json("single", false)
-        );
-
-        let page = include_str!("spine_harness.html").replace("__DATA__", &data);
-        let path = std::env::var("SPINE_HARNESS_OUT").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/spine-harness.html").to_owned());
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            std::fs::create_dir_all(parent).expect("the harness page's directory must exist");
-        }
-        std::fs::write(&path, page).expect("the harness page must be writable");
-        eprintln!("wrote {path}");
     }
 
     #[test]

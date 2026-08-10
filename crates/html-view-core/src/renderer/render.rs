@@ -246,21 +246,6 @@ impl RendererCore {
         &self.following
     }
 
-    /// Paints the screen one document at a time, keeping what each contributed
-    /// apart. The screen as a whole is `paint_frame`; this is for looking at
-    /// how it was put together.
-    #[cfg(test)]
-    pub(crate) fn paint_by_document(&self, mut record: impl FnMut(usize, &crate::document_view::DocumentView, &mut crate::RecordingPainter)) {
-        let mut painter = crate::RecordingPainter::default();
-        self.painter().paint_frame(&mut painter);
-        record(self.nav.current_doc_index, &self.page, &mut painter);
-        for item in &self.following {
-            let mut painter = crate::RecordingPainter::default();
-            self.paint_following_item(item, &mut painter);
-            record(item.doc_index, &item.view, &mut painter);
-        }
-    }
-
     /// Columns a view's painted lines occupy, which is where the next spine
     /// item may start.
     fn columns_used(&self, view: &crate::document_view::DocumentView) -> i32 {
