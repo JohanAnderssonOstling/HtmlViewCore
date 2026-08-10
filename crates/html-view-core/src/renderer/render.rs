@@ -25,12 +25,11 @@ impl RendererCore {
     /// The note carries no selection, search or annotation state, so those
     /// overlays are empty.
     ///
-    /// Images are resolved against an empty pipeline, so a note's images do
-    /// not paint. A scoped note indexes its own image resources, while the
-    /// page's pipeline holds the page's -- the same index means different
-    /// pictures in each. Handing over the page's pipeline would not leave a
-    /// note's image blank, it would draw whichever page image shared its
-    /// index. Notes with images want a pipeline of their own.
+    /// Images resolve through the page's pipeline, which is this document's.
+    /// Image resources belong to the DOM and `image_idx` is an index into the
+    /// document's list, so a scoped note -- sharing the document -- shares
+    /// that index space. A note's images are the same resources as the page's,
+    /// already loaded and decoded.
     ///
     /// [`FootnotePreview`]: crate::FootnotePreview
     /// Height a note occupies at the width it was laid out to, so a host can
@@ -45,10 +44,9 @@ impl RendererCore {
         let layout = crate::ColumnLayout { col_count: 1.0, ..self.layout };
         let geo = html_view_doc::TextGeometry::new(DocQuery::new(note), &frame, &layout);
         let (selection_state, table_state) = (crate::SelectionState::default(), crate::TableSelectionState::default());
-        let images = html::resources::ImagePipeline::new(std::sync::Arc::new(Vec::new()), self.provider.clone());
         PagePainter {
             geo,
-            images: &images,
+            images: &self.image_pipeline,
             reader_palette: self.reader_palette,
             interaction_palette: self.interaction_palette,
             highlight: &Default::default(),
