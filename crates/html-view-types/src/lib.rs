@@ -244,6 +244,10 @@ pub trait RendererHost {
     /// Width to lay a note out at before the reader hands it back to be shown.
     /// A host that presents notes in a panel narrower than the page should
     /// answer with that width; `None` lays the note out at the column width.
+    ///
+    /// Read once, when a note is activated. A note is not laid out again while
+    /// it is on screen, so this must be the width the host will actually show
+    /// it at -- notes are presented at a fixed size rather than resized.
     fn note_popup_width(&self) -> Option<f64> {
         None
     }
