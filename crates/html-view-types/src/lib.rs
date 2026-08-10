@@ -392,11 +392,6 @@ pub enum DocAnchor {
     Start,
     End,
     Glyph(u32),
-    /// A document entered part-way, at a layout offset rather than at one of
-    /// its ends. Continuous reading arrives this way: the item was already on
-    /// screen beside the previous page, so reading resumes below what was
-    /// shown of it.
-    Offset(f64),
 }
 
 pub struct RenderState {

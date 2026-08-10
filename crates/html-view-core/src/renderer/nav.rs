@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use html_view_doc::DocQuery;
-use html_view_navigate::{NavContext, NavView};
+use html_view_navigate::{NavContext, NavView, SpinePosition};
 use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
 use crate::{NavigationState,  DocAnchor, GlyphShaper, ColumnLayout, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
@@ -34,13 +34,6 @@ impl RendererCore {
     pub fn restore_glyph_position(&mut self, glyph_idx: u32) {
         let (nav, mut cx) = self.nav_cx();
         nav.restore_glyph_position(&mut cx, glyph_idx);
-    }
-
-    /// Settles on the line at `offset_y`, for a position known as a place in
-    /// the document rather than as a glyph.
-    pub fn restore_offset_position(&mut self, offset_y: f64) {
-        let (nav, mut cx) = self.nav_cx();
-        nav.restore_anchor_position(&mut cx, offset_y);
     }
 
     pub fn restore_position_from_cfi(&mut self, cfi: &str) -> bool {
@@ -150,8 +143,9 @@ impl RendererCore {
         if glyph_idx > 0 {
             renderer.restore_glyph_position(glyph_idx);
         }
-        if restoring_position && renderer.nav.nav_anchor_glyph.is_none() {
-            renderer.nav.nav_anchor_glyph = renderer.current_glyph_position();
+        if restoring_position && renderer.nav.anchor_glyph_here().is_none() {
+            let glyph = renderer.current_glyph_position();
+            renderer.nav.anchor_at(glyph);
         }
         renderer.update_nav_signal();
         renderer
@@ -184,11 +178,6 @@ impl RendererCore {
         // arriving, so it stays behind.
         item.view.layout = std::mem::replace(&mut self.page.view.layout, ColumnLayout::default());
         self.page = item;
-        // A glyph index addresses the document it was taken from. Carrying one
-        // into a different document does not merely lose the position, it
-        // names a place in the new one -- and the relayout that often follows
-        // arriving will honour it.
-        self.nav.nav_anchor_glyph = None;
         self.root_font_size = self.page.inputs.style_environment.root_font_size as f32;
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
@@ -516,13 +505,35 @@ impl RendererCore {
     /// A document at a time, that means opening the next spine item. Reading
     /// continuously, the next items are already on screen beside the page, so
     /// reading resumes where the screen ran out rather than at a start the
-    /// reader has passed.
+    /// reader has passed. Both are a place in the spine, so both are one call.
     fn continue_past_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
-        if let Some((doc_index, anchor)) = self.spine_continuation() {
-            self.load_document_at(glyph_shaper, doc_index, anchor);
-        } else if self.following.is_empty() && self.nav.current_doc_index + 1 < self.nav.document_uris.len() {
-            self.load_document_at(glyph_shaper, self.nav.current_doc_index + 1, DocAnchor::Start);
+        let Some(position) = self.spine_continuation() else { return };
+        self.go_to(glyph_shaper, position);
+    }
+
+    /// Puts reading at a place in the spine, opening its document if the
+    /// reader is not already in it.
+    ///
+    /// The offset is where the screen starts, and the anchor is taken from
+    /// what is there -- rather than the reader being moved to the anchor,
+    /// which would push a document's start down to its first line of text.
+    pub fn go_to(&mut self, glyph_shaper: &mut impl GlyphShaper, position: SpinePosition) {
+        if position.doc != self.nav.current_doc_index {
+            self.load_document_at(glyph_shaper, position.doc, DocAnchor::Start);
         }
+        self.viewport.direction = PaintDirection::Forward;
+        self.viewport.reached_end = false;
+        self.viewport.back_anchor_end_line = None;
+        self.viewport.start_offset_y = position.offset_y;
+        self.viewport.end_offset_y = position.offset_y;
+
+        let line_idx = self.doc().start_line_at(position.offset_y, 0.1);
+        let glyph = self.doc().text().line(line_idx).map(|line| line.start());
+        self.nav.anchor_at(glyph);
+
+        self.host.request_repaint();
+        self.nav.pending_nav_anchor_update = false;
+        self.update_nav_signal();
     }
 
     pub fn prev_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
@@ -637,12 +648,9 @@ impl RendererCore {
                 DocAnchor::Glyph(glyph_idx) => {
                     self.restore_glyph_position(glyph_idx);
                 }
-                DocAnchor::Offset(offset_y) => {
-                    self.restore_offset_position(offset_y);
-                }
             }
             self.host.request_repaint();
-            if matches!(anchor, DocAnchor::Glyph(_) | DocAnchor::Offset(_)) {
+            if matches!(anchor, DocAnchor::Glyph(_)) {
                 self.update_nav_signal();
             } else {
                 self.nav.pending_nav_anchor_update = true;
@@ -2039,7 +2047,7 @@ mod tests {
 
         assert!(core.handle_link_click(&mut shaper, linked_glyph));
         assert_eq!(core.nav.current_doc_index, 1);
-        assert!(core.nav.current_anchor_id(core.nav_view()).as_deref() == Some("target") || core.nav.nav_anchor_glyph.is_some());
+        assert!(core.nav.current_anchor_id(core.nav_view()).as_deref() == Some("target") || core.nav.nav_anchor.is_some());
         assert!(core.navigate_history_back(&mut shaper));
         assert_eq!(core.nav.current_doc_index, 0);
         assert!(core.navigate_history_forward(&mut shaper));
@@ -2613,8 +2621,9 @@ mod tests {
     #[test]
     fn arriving_in_a_document_does_not_keep_the_previous_one_s_position() {
         // The frame that arrives in a document often relayouts, and relayout
-        // restores the reading anchor. An anchor left over from the document
-        // just left names a place in this one too.
+        // restores the reading anchor. An anchor carries the document it
+        // indexes, so one from the document just left does not apply here --
+        // it used to, and named a place in this one.
         let spine = harness_spine();
         let (mut core, mut shaper) = spine_core(harness_spine_refs(&spine), true, HARNESS_VIEWPORT, HARNESS_COLUMN_WIDTH, HARNESS_COLUMNS);
 

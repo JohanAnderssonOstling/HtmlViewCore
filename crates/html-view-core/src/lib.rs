@@ -6,7 +6,7 @@ use std::sync::Arc;
 use kurbo::Point;
 pub use html_view_types::*;
 pub use html_view_doc::DocQuery;
-pub use html_view_navigate::NavigationState;
+pub use html_view_navigate::{NavigationState, SpineAnchor, SpinePosition};
 pub use html_view_paint::{AnnotationOverlayState, HighlightState, MediaOverlayHighlightState};
 pub use html_view_select::{SelectionState, TableSelectionState};
 
@@ -373,7 +373,7 @@ impl RendererCore {
                 document_uris,
                 document_text_lengths,
                 current_doc_index,
-                nav_anchor_glyph: None,
+                nav_anchor: None,
                 pending_nav_anchor_update: false,
                 signals: Default::default(),
                 history: Default::default(),
@@ -421,13 +421,13 @@ impl RendererCore {
         // zero offset instead of manufacturing a glyph anchor that scrolls
         // past that leading content.
         let first_glyph = self.page.view.document.render_view().text().line(0).map(|line| line.start());
-        let anchor_is_document_start = match (self.nav.nav_anchor_glyph, first_glyph) {
+        let anchor_is_document_start = match (self.nav.anchor_glyph_here(), first_glyph) {
             (None, _) => true,
             (Some(anchor), Some(first)) => anchor == first,
             (Some(_), None) => false,
         };
         let preserve_document_start = anchor_is_document_start && matches!(self.viewport.direction, PaintDirection::Forward) && self.viewport.start_offset_y <= 0.1 && self.page.view.frame.current_page_start_line.is_none_or(|line| line == 0);
-        let anchor_glyph = if preserve_document_start { None } else { self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position()) };
+        let anchor_glyph = if preserve_document_start { None } else { self.nav.anchor_glyph_here().or_else(|| self.current_glyph_position()) };
         let anchor_cfi = if preserve_document_start { None } else { self.current_cfi() };
 
         self.host.set_glyph_document(self.nav.current_doc_index);

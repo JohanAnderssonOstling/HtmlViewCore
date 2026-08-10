@@ -310,11 +310,39 @@ mod tests {
     }
 }
 
+/// A place in the book: a glyph, and the spine item it belongs to.
+///
+/// This is the durable form. It survives a relayout, because a glyph keeps
+/// its identity when the columns change shape and an offset does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpineAnchor {
+    pub doc: usize,
+    pub glyph: u32,
+}
+
+/// Where reading is: how far into a document, and which document.
+///
+/// The working form, in layout coordinates. It says exactly what the screen
+/// starts at, which an anchor cannot -- a document opens above its first
+/// glyph, not at it. It does not survive a relayout, so it travels with an
+/// anchor rather than instead of one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SpinePosition {
+    pub doc: usize,
+    pub offset_y: f64,
+}
+
 pub struct NavigationState {
     pub document_uris: Vec<String>,
     pub document_text_lengths: Vec<u64>,
     pub current_doc_index: usize,
-    pub nav_anchor_glyph: Option<u32>,
+    /// Where the reader is, durably: a glyph, and the document it indexes.
+    ///
+    /// A glyph index means nothing without its document -- the same number
+    /// names a different place in the next spine item. Carrying the document
+    /// with it is what makes an anchor from a document the reader has left
+    /// simply not apply, rather than apply somewhere wrong.
+    pub nav_anchor: Option<SpineAnchor>,
     pub pending_nav_anchor_update: bool,
     pub signals: NavSignals,
     pub history: LocationHistory,

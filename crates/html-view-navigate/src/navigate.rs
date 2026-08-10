@@ -8,7 +8,7 @@
 //! Crossing a document boundary stays on `RendererCore`: it asks these methods
 //! for a target, then performs the swap.
 
-use crate::{Location, NavContext, NavView};
+use crate::{SpineAnchor, Location, NavContext, NavView};
 use crate::NavigationState;
 use html_view_types::{DocAnchor, PaintDirection, RendererEvent};
 
@@ -62,12 +62,12 @@ impl NavigationState {
             return None;
         }
 
-        let glyph_idx = self.nav_anchor_glyph.or_else(|| self.current_glyph_position(cx))?;
+        let glyph_idx = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx))?;
         cx.doc.best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| cx.doc.view().string(id_idx).to_string())
     }
 
     pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
-        let glyph_idx = self.nav_anchor_glyph.or_else(|| self.current_glyph_position(cx))?;
+        let glyph_idx = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx))?;
         html_view_cfi::generate_cfi(cx.doc.document(), self.current_doc_index, glyph_idx)
     }
 
@@ -96,12 +96,12 @@ impl NavigationState {
         };
         let y = line.point().y;
         self.jump_to_forward_offset(cx, y, false);
-        self.nav_anchor_glyph = Some(glyph_idx);
+        self.anchor_at(Some(glyph_idx));
     }
 
     /// Anchors on the line covering `target_y`, for anchors recorded by
     /// position rather than by glyph.
-    pub fn restore_anchor_position(&mut self, cx: &mut NavContext<'_>, target_y: f64) -> bool {
+    fn restore_anchor_position(&mut self, cx: &mut NavContext<'_>, target_y: f64) -> bool {
         if cx.doc.text().lines().is_empty() {
             return false;
         }
@@ -113,7 +113,7 @@ impl NavigationState {
         let line_start = line.start();
         let line_end = line.end();
         self.jump_to_forward_offset(cx, line_y, false);
-        self.nav_anchor_glyph = if line_start < line_end { Some(line_start) } else { None };
+        self.anchor_at((line_start < line_end).then_some(line_start));
         true
     }
 
@@ -212,20 +212,10 @@ impl NavigationState {
             DocAnchor::Glyph(glyph_idx) => {
                 self.restore_glyph_position(cx, glyph_idx);
             }
-            DocAnchor::Offset(offset_y) => {
-                // Anchored on the line there, not merely scrolled to it. The
-                // frame that arrives may still relayout, and relayout keeps
-                // an anchor, not an offset.
-                if !self.restore_anchor_position(cx, offset_y) {
-                    cx.viewport.direction = PaintDirection::Forward;
-                    cx.viewport.start_offset_y = offset_y;
-                    cx.viewport.end_offset_y = offset_y;
-                }
-            }
         }
 
         cx.host.request_repaint();
-        if matches!(anchor, DocAnchor::Glyph(_) | DocAnchor::Offset(_)) {
+        if matches!(anchor, DocAnchor::Glyph(_)) {
             self.update_nav_signal(cx);
         } else {
             // The anchor is only knowable once the page has been laid out.
@@ -236,7 +226,19 @@ impl NavigationState {
     // -- bookkeeping --------------------------------------------------------
 
     pub fn update_nav_anchor_from_layout(&mut self, cx: NavView<'_>) {
-        self.nav_anchor_glyph = self.current_glyph_position(cx);
+        let glyph = self.current_glyph_position(cx);
+        self.anchor_at(glyph);
+    }
+
+    /// The anchor, if it belongs to the document being read. One from a
+    /// document the reader has left indexes glyphs that are not on screen.
+    pub fn anchor_glyph_here(&self) -> Option<u32> {
+        self.nav_anchor.filter(|anchor| anchor.doc == self.current_doc_index).map(|anchor| anchor.glyph)
+    }
+
+    /// Records where the reader is in the document being read.
+    pub fn anchor_at(&mut self, glyph: Option<u32>) {
+        self.nav_anchor = glyph.map(|glyph| SpineAnchor { doc: self.current_doc_index, glyph });
     }
 
     pub fn update_toc_anchor_filter(&mut self, cx: NavView<'_>) {
@@ -262,7 +264,7 @@ impl NavigationState {
     pub fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
         let host = cx.host;
         let view = cx.view();
-        let glyph = self.nav_anchor_glyph.or_else(|| self.current_glyph_position(view));
+        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(view));
         let current_doc = self.current_doc_index;
 
         self.signals.position.emit_if_changed((current_doc, glyph), host, |(doc, glyph)| RendererEvent::PositionChanged { doc, glyph });
@@ -339,7 +341,7 @@ mod tests {
             document_uris: lengths.iter().enumerate().map(|(index, _)| format!("doc{index}.html")).collect(),
             document_text_lengths: lengths,
             current_doc_index: current_doc,
-            nav_anchor_glyph: None,
+            nav_anchor: None,
             pending_nav_anchor_update: false,
             signals: Default::default(),
             history: Default::default(),

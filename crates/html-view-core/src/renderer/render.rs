@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use html_view_doc::DocQuery;
+use html_view_navigate::SpinePosition;
 use html_view_paginate::Paginator;
 use html_view_paint::PagePainter;
 use crate::{GlyphShaper, PagePositions, PaintDirection, Painter, RenderState, RendererCore};
@@ -245,13 +246,17 @@ impl RendererCore {
     ///
     /// `None` when the page is the whole screen, which is every screen
     /// outside continuous mode, and when the spine has nothing left.
-    pub(crate) fn spine_continuation(&self) -> Option<(usize, crate::DocAnchor)> {
-        let last = self.following.last()?;
-        if !last.reached_end {
-            return Some((last.doc_index, crate::DocAnchor::Offset(last.next_start_offset_y)));
+    pub(crate) fn spine_continuation(&self) -> Option<SpinePosition> {
+        match self.following.last() {
+            Some(last) if !last.reached_end => Some(SpinePosition { doc: last.doc_index, offset_y: last.next_start_offset_y }),
+            Some(last) => self.spine_item_start(last.doc_index + 1),
+            None => self.spine_item_start(self.nav.current_doc_index + 1),
         }
-        let after = last.doc_index + 1;
-        (after < self.nav.document_uris.len()).then_some((after, crate::DocAnchor::Start))
+    }
+
+    /// The start of a spine item, if the spine has one there.
+    fn spine_item_start(&self, doc: usize) -> Option<SpinePosition> {
+        (doc < self.nav.document_uris.len()).then_some(SpinePosition { doc, offset_y: 0.0 })
     }
 
     #[cfg(test)]
