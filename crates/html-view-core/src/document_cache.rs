@@ -65,6 +65,12 @@ impl DocumentCache {
         self.document_order.clear();
     }
 
+    /// Mutable counterpart of [`Self::document`], for work that appends to a
+    /// cached document's renderer resources.
+    pub(crate) fn document_mut(&mut self, doc_index: usize) -> Option<&mut CachedDocument> {
+        self.documents.get_mut(&doc_index)
+    }
+
     /// Borrows a cached document without disturbing its position in the LRU.
     /// Note previews read through this: they consult a document the reader may
     /// still navigate to, and must not evict or claim it.

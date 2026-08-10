@@ -595,24 +595,6 @@ impl<'a> PagePainter<'a> {
         render_state
     }
 
-    /// Draws every line of the document at its own layout position, ignoring
-    /// pagination and the viewport.
-    ///
-    /// This suits a small document shown whole and on its own -- a note in a
-    /// popup -- rather than a page of a book, which is what [`paint_frame`]
-    /// walks. Overlays are the caller's to supply and are normally empty here:
-    /// a note carries no selection, search or annotation state of its own.
-    ///
-    /// [`paint_frame`]: Self::paint_frame
-    pub fn paint_whole_document(&self, cx: &mut impl Painter) {
-        let text = self.geo.doc.text();
-        let mut render_state = RenderState { y_offset: 0.0, col_index: 0.0, should_stop: false };
-        for line_idx in 0..text.line_count() {
-            let Some(line) = text.line(line_idx) else { continue };
-            render_state = self.draw_line_at(cx, line_idx, line.point(), render_state);
-        }
-    }
-
     pub fn draw_line_at(&self, cx: &mut impl Painter, line_idx: usize, point: Point, render_state: RenderState) -> RenderState {
         // Preserve the layout-space line origin for decorations and replaced
         // content. Text painters snap only the baseline axis where required;

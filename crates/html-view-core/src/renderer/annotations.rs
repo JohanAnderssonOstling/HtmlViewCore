@@ -19,7 +19,7 @@ impl RendererCore {
 
     pub(crate) fn resolve_visible_annotations(&mut self) {
         let current_doc = self.nav.current_doc_index;
-        let doc = DocQuery::new(&self.document);
+        let doc = DocQuery::new(&self.page.document);
         self.annotations.resolve(doc, current_doc);
     }
 

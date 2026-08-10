@@ -11,6 +11,7 @@ pub use html_view_paint::{AnnotationOverlayState, HighlightState, MediaOverlayHi
 pub use html_view_select::{SelectionState, TableSelectionState};
 
 use crate::document_cache::DocumentCache;
+use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPageCache;
 use html::engine::Engine;
 use html::layout::GlyphShaper;
@@ -23,6 +24,7 @@ pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider
 pub use html_view_cfi as cfi;
 
 mod document_cache;
+mod document_view;
 mod prepared_page;
 
 pub mod layout {
@@ -177,21 +179,19 @@ mod frame_cache_tests {
 
 pub(crate) struct RendererCore {
     host: Rc<dyn RendererHost>,
-    document: LaidOutDocument,
+    /// The document being read, with the geometry, frame and selection that
+    /// belong to it. A note shown on its own is the same kind of thing.
+    page: DocumentView,
     pipeline_session: Engine,
     pipeline_inputs: PipelineInputs,
     image_pipeline: ImagePipeline,
     provider: Arc<dyn ResourceProvider>,
     root_font_size: f32,
-    layout: ColumnLayout,
     viewport: ViewportState,
     document_cache: DocumentCache,
     prepared_pages: PreparedPageCache,
-    frame: VisibleFrame,
     frame_scratch: FrameScratch,
     revisions: RendererRevisions,
-    selection: SelectionState,
-    table_selection: TableSelectionState,
     highlight: HighlightState,
     annotations: AnnotationOverlayState,
     media_overlay: MediaOverlayHighlightState,
@@ -208,7 +208,7 @@ pub(crate) struct RendererCore {
 
 impl RendererCore {
     pub(crate) fn doc(&self) -> DocQuery<'_> {
-        DocQuery::new(&self.document)
+        DocQuery::new(&self.page.document)
     }
 
     pub fn revisions(&self) -> RendererRevisions {
@@ -244,12 +244,12 @@ impl RendererCore {
         };
         FrameGeometryCacheKey {
             layout_revision: self.revisions.layout,
-            viewport_width_bits: self.layout.size.width.to_bits(),
-            viewport_height_bits: self.layout.size.height.to_bits(),
-            column_width_bits: self.layout.col_width.to_bits(),
-            column_gap_bits: self.layout.col_gap.to_bits(),
-            column_count: self.layout.col_count.max(0.0).min(255.0) as u8,
-            scale_bits: self.layout.scale.to_bits(),
+            viewport_width_bits: self.page.layout.size.width.to_bits(),
+            viewport_height_bits: self.page.layout.size.height.to_bits(),
+            column_width_bits: self.page.layout.col_width.to_bits(),
+            column_gap_bits: self.page.layout.col_gap.to_bits(),
+            column_count: self.page.layout.col_count.max(0.0).min(255.0) as u8,
+            scale_bits: self.page.layout.scale.to_bits(),
             page_offset_bits: page_offset.to_bits(),
             direction: match self.viewport.direction {
                 PaintDirection::Forward => 0,
@@ -274,7 +274,7 @@ impl RendererCore {
     }
 
     pub fn document(&self) -> &LaidOutDocument {
-        &self.document
+        &self.page.document
     }
 
     pub fn root_font_size(&self) -> f32 {
@@ -282,11 +282,11 @@ impl RendererCore {
     }
 
     pub fn preferred_column_width(&self) -> f64 {
-        self.layout.base_col_width
+        self.page.layout.base_col_width
     }
 
     pub fn scale(&self) -> f64 {
-        self.layout.scale
+        self.page.layout.scale
     }
 
     pub fn search_active(&self) -> bool {
@@ -294,7 +294,7 @@ impl RendererCore {
     }
 
     pub fn link_cursor_active(&self) -> bool {
-        self.selection.link_cursor_active
+        self.page.selection.link_cursor_active
     }
 
     pub fn origin(&self) -> Point {
@@ -314,15 +314,15 @@ impl RendererCore {
     }
 
     pub fn to_layout_point(&self, position: Point) -> Point {
-        let scale = self.layout.scale;
+        let scale = self.page.layout.scale;
         let dx = self.origin.x * (scale - 1.0);
         let dy = self.origin.y * (scale - 1.0);
         Point::new((position.x + dx) / scale, (position.y + dy) / scale)
     }
 
     pub fn set_link_cursor_active(&mut self, active: bool) {
-        if self.selection.link_cursor_active != active {
-            self.selection.link_cursor_active = active;
+        if self.page.selection.link_cursor_active != active {
+            self.page.selection.link_cursor_active = active;
             self.host.request_style();
         }
     }
@@ -345,21 +345,17 @@ impl RendererCore {
         highlight.query = config.search_query;
         Self {
             host,
-            document,
+            page: DocumentView::new(document, layout),
             pipeline_session: loaded.session,
             pipeline_inputs: loaded.inputs,
             image_pipeline,
             provider,
             root_font_size,
-            layout,
             viewport: ViewportState::default(),
             document_cache,
             prepared_pages: PreparedPageCache::new(),
-            frame: VisibleFrame::default(),
             frame_scratch: FrameScratch::default(),
             revisions: RendererRevisions::default(),
-            selection: SelectionState::default(),
-            table_selection: TableSelectionState::default(),
             highlight,
             annotations: AnnotationOverlayState::default(),
             media_overlay: MediaOverlayHighlightState::default(),
@@ -385,12 +381,12 @@ impl RendererCore {
         let mut next = self.pipeline_inputs.clone();
         next.layout = html::pipeline::LayoutConstraints {
             viewport_width,
-            viewport_height: (self.layout.size.height.is_finite() && self.layout.size.height >= 0.0).then_some(self.layout.size.height),
+            viewport_height: (self.page.layout.size.height.is_finite() && self.page.layout.size.height >= 0.0).then_some(self.page.layout.size.height),
             line_height: self.pipeline_inputs.layout.line_height,
             image_sizing_policy: self.pipeline_inputs.layout.image_sizing_policy,
             text_composition_policy: self.pipeline_inputs.layout.text_composition_policy,
         };
-        let viewport_height = (self.layout.size.height.is_finite() && self.layout.size.height > 0.0).then_some(self.layout.size.height);
+        let viewport_height = (self.page.layout.size.height.is_finite() && self.page.layout.size.height > 0.0).then_some(self.page.layout.size.height);
         next.style_environment.media = html::pipeline::MediaEnvironment::screen(viewport_width, viewport_height).expect("effective column dimensions must be finite and positive");
         next
     }
@@ -414,20 +410,20 @@ impl RendererCore {
         // precedes it. Relayout at the true document start must preserve the
         // zero offset instead of manufacturing a glyph anchor that scrolls
         // past that leading content.
-        let first_glyph = self.document.render_view().text().line(0).map(|line| line.start());
+        let first_glyph = self.page.document.render_view().text().line(0).map(|line| line.start());
         let anchor_is_document_start = match (self.nav.nav_anchor_glyph, first_glyph) {
             (None, _) => true,
             (Some(anchor), Some(first)) => anchor == first,
             (Some(_), None) => false,
         };
-        let preserve_document_start = anchor_is_document_start && matches!(self.viewport.direction, PaintDirection::Forward) && self.viewport.start_offset_y <= 0.1 && self.frame.current_page_start_line.is_none_or(|line| line == 0);
+        let preserve_document_start = anchor_is_document_start && matches!(self.viewport.direction, PaintDirection::Forward) && self.viewport.start_offset_y <= 0.1 && self.page.frame.current_page_start_line.is_none_or(|line| line == 0);
         let anchor_glyph = if preserve_document_start { None } else { self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position()) };
         let anchor_cfi = if preserve_document_start { None } else { self.current_cfi() };
 
         let update = self.pipeline_session.update(requested_inputs.clone(), glyph_shaper)?;
 
         let document = self.pipeline_session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
-        self.document = document;
+        self.page.document = document;
         self.pipeline_inputs = requested_inputs;
         self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
         if update.stage == EarliestStage::None {
@@ -455,14 +451,14 @@ impl RendererCore {
     }
 
     pub fn emit_state_snapshot(&mut self) {
-        self.host.emit(RendererEvent::TitleChanged(self.document.render_view().title().map(str::to_owned)));
-        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.document)));
+        self.host.emit(RendererEvent::TitleChanged(self.page.document.render_view().title().map(str::to_owned)));
+        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.document)));
         self.nav.history.emit_availability(self.host.as_ref());
         self.host.emit(RendererEvent::SearchActiveChanged(self.highlight.search_active));
         self.update_match_signal();
-        self.host.emit(RendererEvent::ColumnWidthChanged(self.layout.base_col_width));
+        self.host.emit(RendererEvent::ColumnWidthChanged(self.page.layout.base_col_width));
         self.host.emit(RendererEvent::FontSizeChanged(self.root_font_size));
-        self.host.emit(RendererEvent::ScaleChanged(self.layout.scale));
+        self.host.emit(RendererEvent::ScaleChanged(self.page.layout.scale));
         self.update_nav_signal();
     }
 
@@ -499,8 +495,8 @@ impl RendererCore {
             RendererCommand::SetColumnWidth(width) => self.set_col_width(glyph_shaper, width),
             RendererCommand::SetMaxColumnCount(count) => {
                 let count = count.map(|count| count.max(1));
-                if self.layout.max_col_count != count {
-                    self.layout.max_col_count = count;
+                if self.page.layout.max_col_count != count {
+                    self.page.layout.max_col_count = count;
                     self.host.request_repaint();
                 }
             }
@@ -589,7 +585,7 @@ impl RendererCore {
                 }
             }
             RendererCommand::CopySelectionCitation { title, cfi } => {
-                let text = self.selection.selected_text.as_deref().unwrap_or_default();
+                let text = self.page.selection.selected_text.as_deref().unwrap_or_default();
                 if !text.is_empty() {
                     let citation = match cfi {
                         Some(cfi) => format!("“{text}” — {title}, {cfi}"),
@@ -633,7 +629,7 @@ impl RendererCore {
     }
 
     pub fn document_toc(&self) -> Vec<TocEntry> {
-        Self::build_document_toc_entries_for(&self.document)
+        Self::build_document_toc_entries_for(&self.page.document)
     }
 
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {

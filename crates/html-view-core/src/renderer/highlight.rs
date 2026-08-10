@@ -17,7 +17,7 @@ impl RendererCore {
             return;
         };
         // Only scroll if the match is not already on screen
-        let is_visible = self.frame.last_line_positions.contains(line_idx);
+        let is_visible = self.page.frame.last_line_positions.contains(line_idx);
         if is_visible {
             self.request_overlay_repaint();
             return;

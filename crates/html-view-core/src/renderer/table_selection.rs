@@ -5,19 +5,19 @@ use crate::RendererCore;
 
 impl RendererCore {
     pub(crate) fn selection_view(&self) -> SelectionView<'_> {
-        SelectionView::new(self.text_geometry(), &self.selection, &self.table_selection)
+        SelectionView::new(self.text_geometry(), &self.page.selection, &self.page.table_selection)
     }
 
     pub fn begin_table_selection_at(&mut self, position: Point) -> bool {
         let Some(hit) = self.selection_view().table_hit(position) else { return false };
-        self.table_selection.begin(hit);
+        self.page.table_selection.begin(hit);
         self.request_overlay_repaint();
         true
     }
 
     pub(crate) fn begin_table_selection_drag(&mut self, position: Point) -> bool {
         let Some(hit) = self.selection_view().table_hit(position) else { return false };
-        if !self.table_selection.begin_drag(hit) {
+        if !self.page.table_selection.begin_drag(hit) {
             return false;
         }
         self.request_overlay_repaint();
@@ -26,7 +26,7 @@ impl RendererCore {
 
     pub(crate) fn update_table_selection_drag(&mut self, position: Point) -> bool {
         let hit = self.selection_view().table_hit(position);
-        let Some(changed) = self.table_selection.update_drag(hit) else {
+        let Some(changed) = self.page.table_selection.update_drag(hit) else {
             return false;
         };
         if changed {
@@ -36,11 +36,11 @@ impl RendererCore {
     }
 
     pub(crate) fn finish_table_selection_drag(&mut self) -> bool {
-        self.table_selection.finish_drag()
+        self.page.table_selection.finish_drag()
     }
 
     pub fn clear_table_selection(&mut self) -> bool {
-        if !self.table_selection.clear() {
+        if !self.page.table_selection.clear() {
             return false;
         }
         self.request_overlay_repaint();
@@ -69,7 +69,7 @@ impl RendererCore {
     }
 
     pub(crate) fn table_selection_active(&self) -> bool {
-        self.table_selection.is_active()
+        self.page.table_selection.is_active()
     }
 
     pub fn table_at(&self, position: Point) -> bool {
@@ -92,15 +92,15 @@ impl RendererCore {
         let (plain, markdown) = {
             let view = self.selection_view();
             let Some((start, end)) = view.range() else {
-                self.selection.selected_text = None;
-                self.selection.selected_text_markdown = None;
+                self.page.selection.selected_text = None;
+                self.page.selection.selected_text_markdown = None;
                 return;
             };
             let (plain, ordinary) = view.geo.doc.build_selection_text(start, end);
-            let markdown = if self.selection.semantic_selection { view.build_semantic_selection_text(start, end).1 } else { ordinary };
+            let markdown = if self.page.selection.semantic_selection { view.build_semantic_selection_text(start, end).1 } else { ordinary };
             (plain, markdown)
         };
-        self.selection.selected_text = plain;
-        self.selection.selected_text_markdown = markdown;
+        self.page.selection.selected_text = plain;
+        self.page.selection.selected_text_markdown = markdown;
     }
 }

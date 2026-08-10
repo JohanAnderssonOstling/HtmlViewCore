@@ -32,29 +32,23 @@ impl RendererCore {
     /// already loaded and decoded.
     ///
     /// [`FootnotePreview`]: crate::FootnotePreview
-    /// Height a note occupies at the width it was laid out to, so a host can
-    /// size the popup it will be drawn in.
-    pub(crate) fn note_height(&self, note: &crate::LaidOutDocument) -> f64 {
-        let text = DocQuery::new(note).text();
-        (0..text.line_count()).filter_map(|line_idx| text.line(line_idx)).map(|line| line.point().y + line.height()).fold(0.0, f64::max)
+    /// A note as a paintable scene, sized and clipped to the width it was laid
+    /// out to.
+    ///
+    /// The engine's fragment renderer owns this: natural height over lines,
+    /// decorations and images alike, content in paint order, and per-line
+    /// overflow clipping. A note is an ordinary laid-out document, so it is
+    /// drawn by the same machinery rather than by a second painter here.
+    pub(crate) fn note_scene(&self, note: &crate::LaidOutDocument) -> Option<html::render::RenderScene> {
+        let width = self.note_layout_width();
+        let options = html::render::FragmentRenderOptions::new(width, None).ok()?.with_typography(self.root_font_size.max(1.0) as u32, self.root_font_size as f64).ok()?;
+        Some(html::render::RenderScene::for_document(note, &options))
     }
 
-    pub(crate) fn paint_note(&self, note: &crate::LaidOutDocument, cx: &mut impl Painter) {
-        let frame = crate::VisibleFrame::default();
-        let layout = crate::ColumnLayout { col_count: 1.0, ..self.layout };
-        let geo = html_view_doc::TextGeometry::new(DocQuery::new(note), &frame, &layout);
-        let (selection_state, table_state) = (crate::SelectionState::default(), crate::TableSelectionState::default());
-        PagePainter {
-            geo,
-            images: &self.image_pipeline,
-            reader_palette: self.reader_palette,
-            interaction_palette: self.interaction_palette,
-            highlight: &Default::default(),
-            annotations: &Default::default(),
-            media_overlay: &Default::default(),
-            selection: html_view_select::SelectionView::new(geo, &selection_state, &table_state),
-        }
-        .paint_whole_document(cx);
+    /// Width a note is laid out and shown at. The host decides; the reading
+    /// column is the fallback when it has no opinion.
+    pub(crate) fn note_layout_width(&self) -> f64 {
+        self.host.note_popup_width().filter(|width| width.is_finite() && *width > 0.0).unwrap_or(self.page.layout.col_width)
     }
 
     pub(crate) fn paint_frame(&self, cx: &mut impl Painter) {
@@ -81,23 +75,23 @@ impl RendererCore {
     }
 
     pub(crate) fn paginator(&self) -> Paginator<'_> {
-        Paginator::new(DocQuery::new(&self.document), &self.layout, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm)
+        Paginator::new(DocQuery::new(&self.page.document), &self.page.layout, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm)
     }
 
     fn install_positioned_page(&mut self, page: PagePositions, start_offset_y: f64, paint_end: Option<usize>, use_cached_inline_positions: bool) {
-        let previous_positions = std::mem::replace(&mut self.frame.last_line_positions, page.positions);
+        let previous_positions = std::mem::replace(&mut self.page.frame.last_line_positions, page.positions);
         self.frame_scratch.recycle_line_position_buffer(previous_positions.into_buffer());
-        self.frame.current_page_start_line = Some(page.start_line);
-        self.frame.current_page_end_line = paint_end;
-        self.frame.paint_start_offset_y = start_offset_y;
-        self.frame.use_cached_inline_positions = use_cached_inline_positions;
-        self.frame.offset_breaks = page.offset_breaks;
-        self.frame.repeated_table_headers = page.repeated_table_headers;
+        self.page.frame.current_page_start_line = Some(page.start_line);
+        self.page.frame.current_page_end_line = paint_end;
+        self.page.frame.paint_start_offset_y = start_offset_y;
+        self.page.frame.use_cached_inline_positions = use_cached_inline_positions;
+        self.page.frame.offset_breaks = page.offset_breaks;
+        self.page.frame.repeated_table_headers = page.repeated_table_headers;
     }
 
     pub(crate) fn prepare_forward(&mut self) {
         // render forward from current offset
-        let positions = self.frame_scratch.take_line_position_buffer(&mut self.frame.last_line_positions);
+        let positions = self.frame_scratch.take_line_position_buffer(&mut self.page.frame.last_line_positions);
         let paginator = self.paginator();
         let events = paginator.events();
         let page = paginator.page_at(&events, self.viewport.start_offset_y, positions);
@@ -108,16 +102,16 @@ impl RendererCore {
     }
 
     pub(crate) fn prefetch_images_for_current_page(&mut self) {
-        let root = self.document.render_view();
+        let root = self.page.document.render_view();
         let text = root.text();
         let fragments = root.fragments();
         if fragments.images().is_empty() || text.line_count() == 0 {
             return;
         }
-        let Some(start_line) = self.frame.current_page_start_line else {
+        let Some(start_line) = self.page.frame.current_page_start_line else {
             return;
         };
-        let Some(end_line) = self.frame.current_page_end_line else {
+        let Some(end_line) = self.page.frame.current_page_end_line else {
             return;
         };
         if start_line >= text.line_count() || end_line >= text.line_count() {
@@ -147,7 +141,7 @@ impl RendererCore {
         // render backward from end offset
         self.viewport.reached_end = false;
 
-        let lines = self.document.render_view().text().lines();
+        let lines = self.page.document.render_view().text().lines();
         let end_line = if let Some(idx) = self.viewport.back_anchor_end_line {
             idx.min(lines.len().saturating_sub(1))
         } else if let Some(idx) = self.doc().end_line_at(self.viewport.end_offset_y, 1e-6) {
@@ -166,7 +160,7 @@ impl RendererCore {
             return;
         }
 
-        let available_height = self.layout.col_count * self.layout.size.height;
+        let available_height = self.page.layout.col_count * self.page.layout.size.height;
         let end_line_data = lines.get(end_line).expect("end line must be within line count");
         let end_line_height = self.doc().effective_line_height(end_line, end_line_data.height());
         // Keep a tiny safety margin so the anchor line doesn't land exactly on the
@@ -176,11 +170,11 @@ impl RendererCore {
 
         // Use the same forward position resolver as normal rendering so lines that share
         // the same document Y (e.g. table rows across columns) keep consistent screen Y.
-        let positions = self.frame_scratch.take_line_position_buffer(&mut self.frame.last_line_positions);
+        let positions = self.frame_scratch.take_line_position_buffer(&mut self.page.frame.last_line_positions);
         // Both scratch buffers are claimed before the paginator borrows the
         // document and column layout, so the search below needs no further
         // mutable access while it runs.
-        let mut candidate_positions = self.frame_scratch.take_line_position_buffer(&mut self.frame.last_line_positions);
+        let mut candidate_positions = self.frame_scratch.take_line_position_buffer(&mut self.page.frame.last_line_positions);
         let back_start_offset_y = self.viewport.back_start_offset_y;
         let paginator = self.paginator();
         let events = paginator.events();

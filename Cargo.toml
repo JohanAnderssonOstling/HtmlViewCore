@@ -18,3 +18,8 @@ html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstlin
 kurbo = "0.11.3"
 peniko = "0.2.0"
 unicode-normalization = "0.1"
+
+# Temporary: the note shaping fix and the table markup restore are on the
+# engine's master locally, not yet pushed. Remove once the pin can resolve them.
+[patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
+html-engine = { path = "../HtmlEngine/crates/html" }
