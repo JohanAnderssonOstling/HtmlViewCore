@@ -82,19 +82,23 @@ impl RendererCore {
     }
 
     pub(crate) fn paint_frame(&self, cx: &mut impl Painter) {
+        self.host.set_glyph_document(self.nav.current_doc_index);
         self.painter().paint_frame(cx);
         self.paint_following(cx);
     }
 
     pub(crate) fn paint_base_before_overlay(&self, cx: &mut impl Painter) {
+        self.host.set_glyph_document(self.nav.current_doc_index);
         self.painter().paint_base_before_overlay(cx);
     }
 
     pub(crate) fn paint_interaction_overlay(&self, cx: &mut impl Painter) {
+        self.host.set_glyph_document(self.nav.current_doc_index);
         self.painter().paint_interaction_overlay(cx);
     }
 
     pub(crate) fn paint_base_after_overlay(&self, cx: &mut impl Painter) -> RenderState {
+        self.host.set_glyph_document(self.nav.current_doc_index);
         let state = self.painter().paint_base_after_overlay(cx);
         // The following items belong to the base layer. They occupy columns
         // the page does not, so painting them after its overlay hides nothing.
@@ -105,6 +109,7 @@ impl RendererCore {
     #[cfg(test)]
     pub(crate) fn paint_forward(&mut self, cx: &mut impl Painter) -> RenderState {
         self.prepare_forward();
+        self.host.set_glyph_document(self.nav.current_doc_index);
         self.painter().paint_frame(cx);
         self.paint_following(cx);
         html_view_paginate::initial_render_state()
@@ -117,9 +122,12 @@ impl RendererCore {
         for item in &self.following {
             self.paint_following_item(item, cx);
         }
+        // Whatever comes next belongs to the page again.
+        self.host.set_glyph_document(self.nav.current_doc_index);
     }
 
     fn paint_following_item(&self, item: &crate::document_view::FollowingItem, cx: &mut impl Painter) {
+        self.host.set_glyph_document(item.doc_index);
         let view = &item.view;
         PagePainter {
             geo: view.geometry(),
@@ -191,6 +199,7 @@ impl RendererCore {
         while used < columns && doc_index + 1 < self.nav.document_uris.len() {
             doc_index += 1;
             let loaded = self.load_document_for_index(glyph_shaper, doc_index);
+            // The load above shaped this item's glyphs under its own id space.
             let mut view = crate::document_view::DocumentView::new(loaded.document, self.page.layout.clone());
 
             // Paginated against the free columns alone, then shifted into

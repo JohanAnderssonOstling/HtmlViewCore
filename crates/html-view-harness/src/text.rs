@@ -7,8 +7,13 @@
 //! Rasters are cached behind a `RefCell` because painting only ever borrows
 //! the shaper: drawing a glyph the first time is a cache fill, not a change to
 //! what the shaper says about any document.
+//!
+//! An id indexes the registry of the document it was shaped from, and a
+//! continuous spine puts more than one document on a screen. So there is a
+//! table per document, and the renderer says which one is in play before every
+//! stretch of shaping or painting that belongs to it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -34,26 +39,49 @@ struct GlyphKey {
     italic: bool,
 }
 
+/// One document's glyph registry as the harness sees it.
+#[derive(Default)]
+struct DocumentGlyphs {
+    /// What each id the renderer holds was shaped from.
+    keys: Vec<GlyphKey>,
+    /// Ids already handed out, so a repeated character keeps its id.
+    ids: HashMap<GlyphKey, GlyphId>,
+}
+
+/// Which document the renderer is shaping or painting, shared with the host it
+/// is announced through.
+#[derive(Clone, Default)]
+pub struct ActiveDocument(Rc<Cell<usize>>);
+
+impl ActiveDocument {
+    pub fn set(&self, doc: usize) {
+        self.0.set(doc);
+    }
+
+    fn get(&self) -> usize {
+        self.0.get()
+    }
+}
+
 pub struct FontShaper {
     regular: fontdue::Font,
     bold: Option<fontdue::Font>,
     italic: Option<fontdue::Font>,
-    /// What each id the renderer holds was shaped from.
-    glyphs: Vec<GlyphKey>,
-    /// Ids already handed out, so a repeated character keeps its id.
-    ids: HashMap<GlyphKey, GlyphId>,
+    active: ActiveDocument,
+    documents: RefCell<HashMap<usize, DocumentGlyphs>>,
+    /// Rasters are what a glyph looks like, which is the same in any document.
     rasters: RefCell<HashMap<GlyphKey, Rc<GlyphRaster>>>,
 }
 
 impl FontShaper {
     /// Loads the faces fontconfig answers with for a serif family.
-    pub fn from_system_fonts() -> Result<Self, String> {
+    pub fn from_system_fonts(active: ActiveDocument) -> Result<Self, String> {
         Ok(Self {
             regular: load_face("serif")?,
             bold: load_face("serif:bold").ok(),
             italic: load_face("serif:italic").ok(),
-            glyphs: Vec::new(),
-            ids: HashMap::new(),
+            active,
+            documents: RefCell::new(HashMap::new()),
             rasters: RefCell::new(HashMap::new()),
         })
     }
@@ -67,9 +95,10 @@ impl FontShaper {
     }
 
     /// The coverage bitmap for a glyph the renderer is painting, rasterized
-    /// once and kept.
+    /// once and kept. The id is read against the document being painted.
     pub fn raster(&self, glyph: GlyphId) -> Option<Rc<GlyphRaster>> {
-        Some(self.rasterize(*self.glyphs.get(glyph as usize)?))
+        let key = *self.documents.borrow().get(&self.active.get())?.keys.get(glyph as usize)?;
+        Some(self.rasterize(key))
     }
 
     /// A character rasterized for the harness's own text -- status lines and
@@ -110,16 +139,16 @@ fn load_face(pattern: &str) -> Result<fontdue::Font, String> {
 
 impl GlyphShaper for FontShaper {
     fn reset(&mut self) {
-        // Ids index the document's registry, which starts over with the
-        // document. Rasters are keyed by what was drawn, not by id, so they
-        // survive.
-        self.glyphs.clear();
-        self.ids.clear();
+        // A registry starts over with the document it belongs to, and only
+        // that document's table goes with it. Rasters are keyed by what was
+        // drawn rather than by id, so they survive.
+        self.documents.borrow_mut().insert(self.active.get(), DocumentGlyphs::default());
     }
 
     fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
         let key = GlyphKey { ch, size_bits: font_size.to_bits(), bold: font_weight >= 600, italic: !matches!(font_slant, FontSlant::Normal) };
-        if let Some(&glyph) = self.ids.get(&key)
+        let document = self.active.get();
+        if let Some(&glyph) = self.documents.borrow().get(&document).and_then(|glyphs| glyphs.ids.get(&key))
             && glyph_metrics.contains(glyph)
         {
             return Ok(glyph);
@@ -131,11 +160,13 @@ impl GlyphShaper for FontShaper {
         let metric = GlyphMetric::try_new(ch, advance.max(0.0), line.ascent.max(0.0), (-line.descent).max(0.0), 0.0).map_err(ShapeError::rejected_metric)?;
 
         let glyph = glyph_metrics.register(metric)?;
-        if self.glyphs.len() <= glyph as usize {
-            self.glyphs.resize(glyph as usize + 1, key);
+        let mut documents = self.documents.borrow_mut();
+        let glyphs = documents.entry(document).or_default();
+        if glyphs.keys.len() <= glyph as usize {
+            glyphs.keys.resize(glyph as usize + 1, key);
         }
-        self.glyphs[glyph as usize] = key;
-        self.ids.insert(key, glyph);
+        glyphs.keys[glyph as usize] = key;
+        glyphs.ids.insert(key, glyph);
         Ok(glyph)
     }
 }

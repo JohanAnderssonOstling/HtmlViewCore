@@ -227,6 +227,9 @@ impl RendererCore {
     }
 
     pub(crate) fn load_document_for_index(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize) -> load::LoadedRenderDocument {
+        // Shaping fills this document's glyph registry, and ids only mean
+        // something alongside the document they came from.
+        self.host.set_glyph_document(doc_index);
         let uri = self.nav.document_uris[doc_index].clone();
         load::load_document_with_settings(
             self.provider.clone(),
@@ -633,6 +636,7 @@ impl RendererCore {
         self.cache_current_document();
 
         if let Some(mut cached) = self.document_cache.take_document(doc_index) {
+            self.host.set_glyph_document(doc_index);
             let Ok(document) = cached.session.rehydrate_glyphs(glyph_shaper) else {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
                 self.nav.current_doc_index = doc_index;

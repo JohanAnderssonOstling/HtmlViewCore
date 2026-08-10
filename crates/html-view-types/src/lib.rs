@@ -249,6 +249,19 @@ pub trait RendererHost {
     }
     fn emit(&self, event: RendererEvent);
 
+    /// Names the spine item whose glyphs are about to be shaped or painted.
+    ///
+    /// A glyph id indexes the registry of the document it was shaped from, so
+    /// ids only mean something alongside the document they came from. A host
+    /// that shows one document at a time never needs to know: there is only
+    /// ever one registry in play, and the default here ignores the call. A
+    /// host reading a continuous spine keeps a table per document and switches
+    /// to this one.
+    ///
+    /// Called before every stretch of work that belongs to a single document,
+    /// so a host may treat it as the current one until told otherwise.
+    fn set_glyph_document(&self, _doc: usize) {}
+
     /// Width to lay a note out at before the reader hands it back to be shown.
     /// A host that presents notes in a panel narrower than the page should
     /// answer with that width; `None` lays the note out at the column width.

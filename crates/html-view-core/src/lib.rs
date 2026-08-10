@@ -435,6 +435,7 @@ impl RendererCore {
         let anchor_glyph = if preserve_document_start { None } else { self.nav.nav_anchor_glyph.or_else(|| self.current_glyph_position()) };
         let anchor_cfi = if preserve_document_start { None } else { self.current_cfi() };
 
+        self.host.set_glyph_document(self.nav.current_doc_index);
         let update = self.pipeline_session.update(requested_inputs.clone(), glyph_shaper)?;
 
         let document = self.pipeline_session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;

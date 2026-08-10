@@ -31,7 +31,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use paint::BufferPainter;
-use text::FontShaper;
+use text::{ActiveDocument, FontShaper};
 
 const STATUS_HEIGHT: f64 = 28.0;
 
@@ -44,6 +44,11 @@ struct HostState {
 
 struct HarnessHost {
     state: RefCell<HostState>,
+    /// The renderer says which document it is about to shape or paint, and the
+    /// shaper reads its table for that one. A continuous spine puts more than
+    /// one on a screen, and a glyph id only means something alongside the
+    /// document it was shaped from.
+    active_document: ActiveDocument,
 }
 
 impl RendererHost for HarnessHost {
@@ -68,6 +73,10 @@ impl RendererHost for HarnessHost {
         Err("the harness does not copy images".to_owned())
     }
 
+    fn set_glyph_document(&self, doc: usize) {
+        self.active_document.set(doc);
+    }
+
     fn emit(&self, event: RendererEvent) {
         if let RendererEvent::PositionChanged { doc, glyph } = event {
             self.state.borrow_mut().position = Some((doc, glyph));
@@ -85,8 +94,9 @@ struct Reader {
 
 impl Reader {
     fn open(provider: Arc<dyn ResourceProvider>, uris: Vec<String>, continuous: bool, start: Option<(usize, f32, f64)>) -> Result<Self, String> {
-        let host = Rc::new(HarnessHost { state: RefCell::new(HostState::default()) });
-        let shaper = FontShaper::from_system_fonts()?;
+        let active_document = ActiveDocument::default();
+        let host = Rc::new(HarnessHost { state: RefCell::new(HostState::default()), active_document: active_document.clone() });
+        let shaper = FontShaper::from_system_fonts(active_document)?;
         let (doc_index, font_size, column_width) = start.unwrap_or((0, 17.0, 340.0));
         let config = RendererInitialConfig {
             font_size,
