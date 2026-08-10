@@ -250,7 +250,13 @@ impl RendererCore {
     /// note out on its own, rather than re-deriving it from source. The note is
     /// held out of the reading flow, so it owns no glyphs in the document on
     /// screen; a scoped layout is what makes its content available.
+    ///
+    /// There is nothing to preview when notes read in place: the reference
+    /// resolves as an ordinary link to text the reader can already see.
     fn footnote_preview_for_reference(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str, explicit_noteref: bool) -> Option<crate::FootnotePreview> {
+        if self.note_display == crate::NoteDisplay::AsAuthored {
+            return None;
+        }
         let (_, fragment) = href.split_once('#')?;
         if fragment.is_empty() {
             return None;
@@ -2307,6 +2313,36 @@ mod tests {
         // The engine's note semantics are untouched by the display mode: the
         // target is still a note, which is what a later mode switch relies on.
         assert!(core.document.render_view().addressing().is_note_target("note"));
+    }
+
+    #[test]
+    fn an_as_authored_note_reference_navigates_rather_than_opening_a_popup() {
+        // The note reads in place under this mode, so a popup would repeat
+        // text already on the page. The reference resolves as a plain link.
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside></body></html>";
+        let (provider, _) = CountingProvider::new(vec![("document.html", html)]);
+        let host = Rc::new(TestHost::default());
+        let mut shaper = TestShaper::default();
+        let config = RendererInitialConfig {
+            font_size: 16.0,
+            column_width: 200.0,
+            max_column_count: Some(1),
+            image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
+            text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+            note_display: crate::NoteDisplay::AsAuthored,
+            ..RendererInitialConfig::default()
+        };
+        let mut core = RendererCore::from_provider_with_nav(host.clone(), &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), config);
+        core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
+        core.paint_forward(&mut RecordingPainter::default());
+
+        let noteref = glyph_index_for_character(&core, '1');
+        assert!(core.document.render_view().addressing().is_note_reference(noteref), "the reference keeps its note semantics; only the presentation differs");
+
+        assert!(core.handle_link_click(&mut shaper, noteref));
+
+        assert!(!host.events.borrow().iter().any(|event| matches!(event, RendererEvent::FootnoteOpened(_))), "a note that reads in place must not also be shown as a popup");
+        assert_eq!(core.footnote_preview(&mut shaper, "#note"), None);
     }
 
     #[test]
