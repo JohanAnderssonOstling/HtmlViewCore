@@ -473,9 +473,15 @@ impl VisibleLinePositions {
 
     /// Moves every line right by `columns`, for content paginated from its own
     /// first column and then placed after something else.
-    pub fn shift_columns(&mut self, columns: i32) {
+    ///
+    /// Painting reads the recorded point rather than recomputing it from the
+    /// column index, so a shift that moved only the index would leave the
+    /// content drawn over whatever it was meant to sit beside.
+    pub fn shift_columns(&mut self, columns: i32, layout: &ColumnLayout) {
+        let distance = f64::from(columns) * (layout.col_width + layout.col_gap);
         for screen in &mut self.positions {
             screen.col_index += columns;
+            screen.point.x += distance;
         }
     }
 

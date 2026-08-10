@@ -1,0 +1,281 @@
+<title>Continuous spine — screen by screen</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ground: #eceff4;
+    --paper: #ffffff;
+    --ink: #10151d;
+    --muted: #5c6674;
+    --rule: #ccd3dd;
+    --hairline: #dfe4eb;
+    --accent: #23508f;
+    --accent-ink: #ffffff;
+
+    --doc-0: #1f4e9c;
+    --doc-1: #a8452a;
+    --doc-2: #1c6a4e;
+    --doc-3: #6b3fa0;
+    --doc-4: #85670f;
+    --doc-5: #146b7c;
+    --doc-6: #9a2c5d;
+    --doc-7: #4b5b2a;
+
+    --step: clamp(0.5rem, 0.4rem + 0.4vw, 0.75rem);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0f141b;
+      --paper: #161c25;
+      --ink: #dee5ee;
+      --muted: #8b96a6;
+      --rule: #2b333f;
+      --hairline: #232b35;
+      --accent: #86aee8;
+      --accent-ink: #0f141b;
+
+      --doc-0: #83abe9;
+      --doc-1: #e5947a;
+      --doc-2: #6ec49e;
+      --doc-3: #b596e2;
+      --doc-4: #d6b559;
+      --doc-5: #6dbdcd;
+      --doc-6: #e58cae;
+      --doc-7: #a6b876;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #eceff4; --paper: #ffffff; --ink: #10151d; --muted: #5c6674;
+    --rule: #ccd3dd; --hairline: #dfe4eb; --accent: #23508f; --accent-ink: #ffffff;
+    --doc-0: #1f4e9c; --doc-1: #a8452a; --doc-2: #1c6a4e; --doc-3: #6b3fa0;
+    --doc-4: #85670f; --doc-5: #146b7c; --doc-6: #9a2c5d; --doc-7: #4b5b2a;
+  }
+  :root[data-theme="dark"] {
+    --ground: #0f141b; --paper: #161c25; --ink: #dee5ee; --muted: #8b96a6;
+    --rule: #2b333f; --hairline: #232b35; --accent: #86aee8; --accent-ink: #0f141b;
+    --doc-0: #83abe9; --doc-1: #e5947a; --doc-2: #6ec49e; --doc-3: #b596e2;
+    --doc-4: #d6b559; --doc-5: #6dbdcd; --doc-6: #e58cae; --doc-7: #a6b876;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: calc(var(--step) * 3) var(--step) calc(var(--step) * 6);
+    background: var(--ground);
+    color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: calc(var(--step) * 2); }
+
+  header { display: flex; flex-direction: column; gap: 4px; }
+  h1 {
+    margin: 0;
+    font-family: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+    font-size: clamp(1.35rem, 1.1rem + 1vw, 1.75rem);
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+  }
+  header p { margin: 0; color: var(--muted); max-width: 62ch; }
+
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--step); }
+  .group { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--rule); border-radius: 7px; background: var(--paper); }
+  .grow { flex: 1 1 auto; }
+  button {
+    font: inherit; font-size: 13px; line-height: 1.4;
+    padding: 5px 11px; border: 0; border-radius: 5px;
+    background: transparent; color: var(--ink); cursor: pointer;
+  }
+  button:hover:not([disabled]) { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button[disabled] { color: var(--muted); opacity: 0.5; cursor: default; }
+  button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  .screens button { font-variant-numeric: tabular-nums; min-width: 30px; }
+  .savings { color: var(--muted); font-size: 13px; }
+  .savings b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .stage { background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: var(--step); overflow-x: auto; }
+  svg { display: block; width: 100%; height: auto; min-width: 520px; }
+  .rule { stroke: var(--hairline); stroke-width: 1; }
+  .glyphs { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 16px; }
+
+  .doc-0 { color: var(--doc-0); } .doc-1 { color: var(--doc-1); }
+  .doc-2 { color: var(--doc-2); } .doc-3 { color: var(--doc-3); }
+  .doc-4 { color: var(--doc-4); } .doc-5 { color: var(--doc-5); }
+  .doc-6 { color: var(--doc-6); } .doc-7 { color: var(--doc-7); }
+
+  .caption { display: flex; flex-wrap: wrap; gap: var(--step) calc(var(--step) * 2); align-items: baseline; }
+  .items { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+  .items li { display: flex; align-items: baseline; gap: 7px; color: var(--muted); }
+  .tick { width: 3px; height: 12px; border-radius: 1px; background: currentColor; transform: translateY(2px); }
+  .items .name { color: var(--ink); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+  .annotation {
+    border-top: 1px solid var(--hairline);
+    padding-top: var(--step);
+    color: var(--muted);
+    font-size: 14px;
+    max-width: 72ch;
+  }
+  .annotation .where { color: var(--ink); }
+  .annotation code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+  footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--hairline); padding-top: var(--step); }
+  footer code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+</style>
+
+<main>
+  <header>
+    <h1>Continuous spine, screen by screen</h1>
+    <p>Every glyph below was recorded from the renderer's own painter, one spine item at a time. Step through the page turns and compare the two reading modes.</p>
+  </header>
+
+  <div class="toolbar">
+    <div class="group" role="group" aria-label="Reading mode">
+      <button id="mode-continuous" aria-pressed="true">Continuous spine</button>
+      <button id="mode-single" aria-pressed="false">One document at a time</button>
+    </div>
+    <span class="savings" id="savings"></span>
+    <span class="grow"></span>
+    <div class="group">
+      <button id="guides" aria-pressed="true">Column rules</button>
+    </div>
+    <div class="group screens" id="screen-buttons" role="group" aria-label="Screen"></div>
+    <div class="group">
+      <button id="prev" aria-label="Previous screen">←</button>
+      <button id="next" aria-label="Next screen">→</button>
+    </div>
+  </div>
+
+  <div class="stage"><svg id="stage" preserveAspectRatio="xMidYMid meet" role="img"></svg></div>
+
+  <div class="caption">
+    <ul class="items" id="items"></ul>
+  </div>
+  <p class="annotation" id="annotation"></p>
+
+  <footer>Regenerate after any change with <code>cargo test -p html-view-core spine_harness -- --ignored</code>.</footer>
+</main>
+
+<script id="harness-data" type="application/json">__DATA__</script>
+<script>
+  const DATA = JSON.parse(document.getElementById("harness-data").textContent);
+  const NS = "http://www.w3.org/2000/svg";
+
+  let mode = "continuous";
+  let index = 0;
+  let rules = true;
+
+  const screens = () => DATA.modes.find((entry) => entry.name === mode).screens;
+  const el = (name, attrs, parent) => {
+    const node = document.createElementNS(NS, name);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    if (parent) parent.appendChild(node);
+    return node;
+  };
+  const columnOf = (x) => {
+    let best = 0;
+    DATA.columns.forEach((column, position) => {
+      if (x >= column.x - 1) best = position;
+    });
+    return best;
+  };
+
+  function draw(screen) {
+    const { width, height } = DATA.viewport;
+    const svg = document.getElementById("stage");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("aria-label", `Screen ${index + 1}: ${screen.documents.map((doc) => doc.uri).join(", ")}`);
+    svg.replaceChildren();
+
+    if (rules) {
+      for (const column of DATA.columns) {
+        el("line", { class: "rule", x1: column.x, y1: 0, x2: column.x, y2: height }, svg);
+        el("line", { class: "rule", x1: column.x + column.width, y1: 0, x2: column.x + column.width, y2: height }, svg);
+      }
+    }
+
+    for (const doc of screen.documents) {
+      const group = el("g", { class: `doc-${doc.doc_index % 8}`, fill: "currentColor" }, svg);
+      for (const rect of doc.rects) {
+        el("rect", { x: rect.x, y: rect.y, width: rect.width, height: rect.height, "fill-opacity": 0.16 }, group);
+      }
+      const text = el("g", { class: "glyphs" }, group);
+      for (const run of doc.runs) {
+        el("text", { x: run.x.join(" "), y: run.y, "xml:space": "preserve" }, text).textContent = run.text;
+      }
+      // A spine item always begins at the top of a column. The tick marks
+      // which column this one claimed.
+      const start = Math.min(...doc.runs.flatMap((run) => run.x));
+      el("rect", { x: DATA.columns[columnOf(start)].x - 6, y: 0, width: 3, height: 26, rx: 1 }, group);
+    }
+  }
+
+  function render() {
+    const all = screens();
+    index = Math.max(0, Math.min(index, all.length - 1));
+    const screen = all[index];
+    draw(screen);
+
+    const items = document.getElementById("items");
+    items.replaceChildren();
+    screen.documents.forEach((doc, order) => {
+      const item = document.createElement("li");
+      item.className = `doc-${doc.doc_index % 8}`;
+      const tick = document.createElement("span");
+      tick.className = "tick";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = doc.uri;
+      const role = document.createElement("span");
+      role.textContent = order === 0 ? "the page" : "fills the columns left over";
+      item.append(tick, name, role);
+      items.appendChild(item);
+    });
+
+    const buttons = document.getElementById("screen-buttons");
+    buttons.replaceChildren();
+    all.forEach((_, position) => {
+      const button = document.createElement("button");
+      button.textContent = String(position + 1);
+      button.setAttribute("aria-pressed", String(position === index));
+      button.setAttribute("aria-label", `Screen ${position + 1}`);
+      button.addEventListener("click", () => { index = position; render(); });
+      buttons.appendChild(button);
+    });
+
+    document.getElementById("prev").disabled = index === 0;
+    document.getElementById("next").disabled = index === all.length - 1;
+
+    const counts = Object.fromEntries(DATA.modes.map((entry) => [entry.name, entry.screens.length]));
+    document.getElementById("savings").innerHTML =
+      `Same spine, same words: <b>${counts.continuous}</b> screens continuous, <b>${counts.single}</b> one document at a time.`;
+
+    document.getElementById("annotation").innerHTML =
+      `<span class="where">Reading <code>${screen.page_uri}</code> from y&nbsp;=&nbsp;<code>${screen.start_offset_y.toFixed(1)}</code>.</span> ${screen.continuation}`;
+  }
+
+  const setMode = (next) => {
+    mode = next;
+    index = 0;
+    document.getElementById("mode-continuous").setAttribute("aria-pressed", String(next === "continuous"));
+    document.getElementById("mode-single").setAttribute("aria-pressed", String(next === "single"));
+    render();
+  };
+
+  document.getElementById("mode-continuous").addEventListener("click", () => setMode("continuous"));
+  document.getElementById("mode-single").addEventListener("click", () => setMode("single"));
+  document.getElementById("prev").addEventListener("click", () => { index -= 1; render(); });
+  document.getElementById("next").addEventListener("click", () => { index += 1; render(); });
+  document.getElementById("guides").addEventListener("click", (event) => {
+    rules = !rules;
+    event.currentTarget.setAttribute("aria-pressed", String(rules));
+    render();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.target.tagName === "BUTTON" && (event.key === " " || event.key === "Enter")) return;
+    if (event.key === "ArrowRight") { index += 1; render(); }
+    if (event.key === "ArrowLeft") { index -= 1; render(); }
+  });
+
+  render();
+</script>

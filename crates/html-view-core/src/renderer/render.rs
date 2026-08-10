@@ -115,19 +115,23 @@ impl RendererCore {
     /// down for the whole viewport.
     pub(crate) fn paint_following(&self, cx: &mut impl Painter) {
         for item in &self.following {
-            let view = &item.view;
-            PagePainter {
-                geo: view.geometry(),
-                images: &self.image_pipeline,
-                reader_palette: self.reader_palette,
-                interaction_palette: self.interaction_palette,
-                highlight: &Default::default(),
-                annotations: &Default::default(),
-                media_overlay: &Default::default(),
-                selection: view.selection_view(),
-            }
-            .paint_remaining_base(cx);
+            self.paint_following_item(item, cx);
         }
+    }
+
+    fn paint_following_item(&self, item: &crate::document_view::FollowingItem, cx: &mut impl Painter) {
+        let view = &item.view;
+        PagePainter {
+            geo: view.geometry(),
+            images: &self.image_pipeline,
+            reader_palette: self.reader_palette,
+            interaction_palette: self.interaction_palette,
+            highlight: &Default::default(),
+            annotations: &Default::default(),
+            media_overlay: &Default::default(),
+            selection: view.selection_view(),
+        }
+        .paint_remaining_base(cx);
     }
 
     pub(crate) fn paginator(&self) -> Paginator<'_> {
@@ -197,11 +201,19 @@ impl RendererCore {
             let paginator = Paginator::new(DocQuery::new(&view.document), &free_columns, self.pipeline_inputs.layout.text_composition_policy.is_book_optimized(), self.vertical_rhythm);
             let events = paginator.events();
             let mut page = paginator.page_at(&events, 0.0, Vec::new().into());
-            page.positions.shift_columns(used);
+            page.positions.shift_columns(used, &view.layout);
+            for header in &mut page.repeated_table_headers {
+                header.col_index += used;
+            }
 
             view.frame.current_page_start_line = Some(page.start_line);
             view.frame.current_page_end_line = page.last_line;
-            view.frame.paint_start_offset_y = 0.0;
+            // Backgrounds and borders are placed from the paint offset rather
+            // than from recorded line positions, and this item's document
+            // starts at the top of column `used`. Saying so puts them in the
+            // same columns as the text they belong to.
+            view.frame.paint_start_offset_y = -f64::from(used) * view.layout.size.height;
+            view.frame.use_cached_inline_positions = true;
             view.frame.offset_breaks = page.offset_breaks;
             view.frame.repeated_table_headers = page.repeated_table_headers;
             view.frame.last_line_positions = page.positions;
@@ -232,6 +244,21 @@ impl RendererCore {
     #[cfg(test)]
     pub(crate) fn following_views(&self) -> &[crate::document_view::FollowingItem] {
         &self.following
+    }
+
+    /// Paints the screen one document at a time, keeping what each contributed
+    /// apart. The screen as a whole is `paint_frame`; this is for looking at
+    /// how it was put together.
+    #[cfg(test)]
+    pub(crate) fn paint_by_document(&self, mut record: impl FnMut(usize, &crate::document_view::DocumentView, &mut crate::RecordingPainter)) {
+        let mut painter = crate::RecordingPainter::default();
+        self.painter().paint_frame(&mut painter);
+        record(self.nav.current_doc_index, &self.page, &mut painter);
+        for item in &self.following {
+            let mut painter = crate::RecordingPainter::default();
+            self.paint_following_item(item, &mut painter);
+            record(item.doc_index, &item.view, &mut painter);
+        }
     }
 
     /// Columns a view's painted lines occupy, which is where the next spine
