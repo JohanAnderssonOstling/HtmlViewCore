@@ -18,5 +18,4 @@ html-view-types.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 unicode-normalization.workspace = true
-scraper.workspace = true
 smallvec = "1"

@@ -64,6 +64,27 @@ impl Default for InteractionPalette {
     }
 }
 
+/// How note bodies take part in the reading flow.
+///
+/// Notes are identified by EPUB structural semantics (`epub:type` tokens
+/// `footnote`/`endnote`/`rearnote`) or the DPUB-ARIA roles `doc-footnote` and
+/// `doc-endnote`. Markup carrying neither is not a note to the reader and is
+/// unaffected by this setting.
+///
+/// The engine decides what *is* a note; this decides what the reader *does*
+/// with one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteDisplay {
+    /// Note bodies are held out of the paginated flow and shown on demand when
+    /// their reference is activated.
+    #[default]
+    Popup,
+    /// Note bodies stay where the author placed them and read inline. For
+    /// publications that already collect notes at the end of a chapter or the
+    /// book, this is the authored presentation.
+    AsAuthored,
+}
+
 #[derive(Clone, Debug)]
 pub struct RendererInitialConfig {
     pub font_size: f32,
@@ -75,6 +96,7 @@ pub struct RendererInitialConfig {
     pub style_overrides: html::pipeline::ReaderStyleOverrides,
     pub image_sizing_policy: html::pipeline::ImageSizingPolicy,
     pub text_composition_policy: html::pipeline::TextCompositionPolicy,
+    pub note_display: NoteDisplay,
     /// Opt-in pagination-only spacing refinement. This never changes DOM/CSS
     /// layout; it only distributes bounded page slack over existing block gaps.
     pub vertical_rhythm: bool,
@@ -94,6 +116,7 @@ impl Default for RendererInitialConfig {
             style_overrides: Default::default(),
             image_sizing_policy: html::pipeline::ImageSizingPolicy::SmartStandalone,
             text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
+            note_display: NoteDisplay::default(),
             vertical_rhythm: false,
             paint_palette: Default::default(),
             interaction_palette: Default::default(),

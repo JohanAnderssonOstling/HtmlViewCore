@@ -10,7 +10,7 @@ pub use html_view_navigate::NavigationState;
 pub use html_view_paint::{AnnotationOverlayState, HighlightState, MediaOverlayHighlightState};
 pub use html_view_select::{SelectionState, TableSelectionState};
 
-use crate::document_cache::{DocumentCache, FootnoteDocumentIndex};
+use crate::document_cache::DocumentCache;
 use crate::prepared_page::PreparedPageCache;
 use html::engine::Engine;
 use html::layout::GlyphShaper;
@@ -200,6 +200,10 @@ pub(crate) struct RendererCore {
     interaction_palette: InteractionPalette,
     reader_palette: ReaderPaintPalette,
     vertical_rhythm: bool,
+    /// Presentation policy for note bodies. Held here rather than derived from
+    /// `pipeline_inputs` because it decides what goes *into* those inputs, and
+    /// every subsequent document load has to agree with the first.
+    note_display: NoteDisplay,
 }
 
 impl RendererCore {
@@ -333,7 +337,7 @@ impl RendererCore {
         let image_resources = document.render_view().images().to_vec();
         let image_pipeline = ImagePipeline::new(Arc::new(image_resources), provider.clone());
         let document_text_lengths = vec![1; document_uris.len()];
-        let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY, current_doc_index, FootnoteDocumentIndex::parse(&loaded.inputs.source));
+        let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
         let layout = ColumnLayout { col_width: column_width, base_col_width: column_width, scale: config.scale.clamp(0.5, 3.0), max_col_count: config.max_column_count.map(|count| count.max(1)), ..Default::default() };
         let mut highlight = HighlightState::default();
@@ -373,6 +377,7 @@ impl RendererCore {
             interaction_palette: config.interaction_palette,
             reader_palette: config.paint_palette,
             vertical_rhythm: config.vertical_rhythm,
+            note_display: config.note_display,
         }
     }
 
@@ -425,9 +430,6 @@ impl RendererCore {
         self.document = document;
         self.pipeline_inputs = requested_inputs;
         self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
-        if update.stage == EarliestStage::Parse {
-            self.document_cache.insert_footnotes(self.nav.current_doc_index, FootnoteDocumentIndex::parse(&self.pipeline_inputs.source));
-        }
         if update.stage == EarliestStage::None {
             // reset_view_state also clears selection even when all pipeline
             // products were reusable.

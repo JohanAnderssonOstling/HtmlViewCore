@@ -17,5 +17,9 @@ html-view-types = { path = "crates/html-view-types" }
 html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine" }
 kurbo = "0.11.3"
 peniko = "0.2.0"
-scraper = "0.27"
 unicode-normalization = "0.1"
+
+# Temporary: builds against the local note-handling worktree until that work
+# lands upstream and the pin above moves. Remove with the pin bump.
+[patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
+html-engine = { path = "../HtmlEngine-notes/crates/html" }

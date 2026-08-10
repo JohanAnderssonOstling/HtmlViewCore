@@ -383,6 +383,7 @@ mod tests {
             markup_syntax: html::pipeline::MarkupSyntax::Html,
             user_styles: Vec::new(),
             reader_overrides: Default::default(),
+            note_flow: Default::default(),
             source_revision: html::pipeline::SourceRevision::INITIAL,
             base_uri: "doc.html".to_string(),
             resource_revision: html::pipeline::ResourceRevision::INITIAL,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
-use crate::document_cache::{CachedDocument, FootnoteDocumentIndex};
+use crate::document_cache::CachedDocument;
 use crate::{NavigationState,  DocAnchor, GlyphShaper, ImagePipeline, LaidOutDocument, PaintDirection, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, SelectionState, TocEntry, ViewportState, load};
 
 impl RendererCore {
@@ -129,7 +129,7 @@ impl RendererCore {
         let doc_index = doc_index.min(document_uris.len().saturating_sub(1));
         let font_size = config.font_size.clamp(8.0, 64.0).round();
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
-        let loaded = load::load_document_with_settings(provider.clone(), &document_uris[doc_index], font_size, column_width, config.style_overrides.clone(), config.image_sizing_policy, config.text_composition_policy, glyph_shaper);
+        let loaded = load::load_document_with_settings(provider.clone(), &document_uris[doc_index], font_size, column_width, config.style_overrides.clone(), config.image_sizing_policy, config.text_composition_policy, config.note_display, glyph_shaper);
         let mut renderer = Self::new(host, loaded, provider, document_uris, doc_index, config);
 
         if nav_state.as_deref().is_some_and(|state| state.trim().starts_with("epubcfi(") && renderer.restore_position_from_cfi(state.trim())) {
@@ -160,12 +160,10 @@ impl RendererCore {
     }
 
     fn replace_document_state(&mut self, loaded: load::LoadedRenderDocument, sync_doc_title: bool) {
-        let footnote_index = FootnoteDocumentIndex::parse(&loaded.inputs.source);
         self.document = loaded.document;
         self.pipeline_session = loaded.session;
         self.pipeline_inputs = loaded.inputs;
         self.root_font_size = self.pipeline_inputs.style_environment.root_font_size as f32;
-        self.document_cache.insert_footnotes(self.nav.current_doc_index, footnote_index);
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
         if sync_doc_title {
@@ -223,6 +221,7 @@ impl RendererCore {
             self.pipeline_inputs.reader_overrides.clone(),
             self.pipeline_inputs.layout.image_sizing_policy,
             self.pipeline_inputs.layout.text_composition_policy,
+            self.note_display,
             glyph_shaper,
         )
     }
@@ -235,7 +234,7 @@ impl RendererCore {
         };
         let explicit_noteref = addressing.is_note_reference(glyph_idx);
         let href = view.string(href_idx).to_string();
-        if let Some(preview) = self.footnote_preview_for_reference(&href, explicit_noteref) {
+        if let Some(preview) = self.footnote_preview_for_reference(glyph_shaper, &href, explicit_noteref) {
             self.host.emit(RendererEvent::FootnoteOpened(preview));
             return true;
         }
@@ -243,53 +242,96 @@ impl RendererCore {
         true
     }
 
-    fn footnote_preview(&mut self, href: &str) -> Option<crate::FootnotePreview> {
-        self.footnote_preview_for_reference(href, false)
+    fn footnote_preview(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str) -> Option<crate::FootnotePreview> {
+        self.footnote_preview_for_reference(glyph_shaper, href, false)
     }
 
-    fn footnote_preview_for_reference(&mut self, href: &str, explicit_noteref: bool) -> Option<crate::FootnotePreview> {
+    /// Builds the preview for a note reference by asking the engine to lay the
+    /// note out on its own, rather than re-deriving it from source. The note is
+    /// held out of the reading flow, so it owns no glyphs in the document on
+    /// screen; a scoped layout is what makes its content available.
+    fn footnote_preview_for_reference(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str, explicit_noteref: bool) -> Option<crate::FootnotePreview> {
         let (_, fragment) = href.split_once('#')?;
         if fragment.is_empty() {
             return None;
         }
         let (doc, _) = self.resolve_href_target(href)?;
-        let authoritative_target_semantics = (doc == self.nav.current_doc_index).then(|| self.document.render_view().addressing().is_note_target(fragment)).unwrap_or(false);
-        if !self.document_cache.has_footnotes(doc) {
-            let target_uri = self.nav.document_uris.get(doc)?;
-            let target_source = self.provider.read_string(target_uri).ok()?;
-            self.document_cache.insert_footnotes(doc, FootnoteDocumentIndex::parse(&target_source));
+
+        // A note in another spine document has to be laid out before it can be
+        // asked anything. Loading it is not wasted: a reader following the
+        // reference lands there next, and the cache keeps it.
+        let mut freshly_loaded = None;
+        if doc != self.nav.current_doc_index && self.document_cache.document(doc).is_none() {
+            self.nav.document_uris.get(doc)?;
+            freshly_loaded = Some(self.load_document_for_index(glyph_shaper, doc));
         }
-        let indexed = self.document_cache.footnotes(doc)?;
-        let selector = scraper::Selector::parse("[id]").expect("static id selector must parse");
-        let element = indexed.document.select(&selector).find(|element| element.value().attr("id") == Some(fragment))?;
-        let has_token = |attribute: &str, expected: &str| element.value().attr(attribute).is_some_and(|value| value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case(expected)));
-        let indexed_target_semantics = ["footnote", "endnote", "rearnote"].iter().any(|kind| has_token("epub:type", kind)) || ["doc-footnote", "doc-endnote"].iter().any(|role| has_token("role", role));
-        if !explicit_noteref && !authoritative_target_semantics && !indexed_target_semantics {
+
+        let (session, laid_out) = match freshly_loaded.as_ref() {
+            Some(loaded) => (&loaded.session, &loaded.document),
+            None if doc == self.nav.current_doc_index => (&self.pipeline_session, &self.document),
+            None => {
+                let cached = self.document_cache.document(doc)?;
+                (&cached.session, &cached.document)
+            }
+        };
+
+        // One authority for what a note is, whichever document it lives in.
+        if !explicit_noteref && !laid_out.render_view().addressing().is_note_target(fragment) {
             return None;
         }
-        let block_selector = scraper::Selector::parse("h1, h2, h3, h4, h5, h6, p, li, blockquote").expect("static footnote block selector must parse");
-        let mut blocks = element
-            .select(&block_selector)
-            .filter_map(|block| {
-                let text = block.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-                if text.is_empty() {
-                    return None;
-                }
-                let tag = block.value().name();
-                Some(match tag {
-                    "li" => format!("• {text}"),
-                    "blockquote" => format!("“{text}”"),
-                    _ => text,
-                })
-            })
-            .collect::<Vec<_>>();
-        if blocks.is_empty() {
-            let text = element.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-            if !text.is_empty() {
-                blocks.push(text);
-            }
+
+        let constraints = html::layout::LayoutConstraints::new(self.layout.col_width, self.root_font_size as f64).ok()?;
+        let note = session.layout_note(fragment, constraints, glyph_shaper)?;
+        let blocks = Self::note_preview_blocks(&note);
+
+        if let Some(loaded) = freshly_loaded {
+            self.document_cache.insert_document(doc, CachedDocument { session: loaded.session, inputs: loaded.inputs, document: loaded.document });
         }
         (!blocks.is_empty()).then(|| crate::FootnotePreview { href: href.to_owned(), blocks })
+    }
+
+    /// Flattens a laid-out note into the block-per-line shape the host renders.
+    /// Structure comes from the note's own boxes, so list items and quotations
+    /// keep the marking they had in the document.
+    fn note_preview_blocks(note: &LaidOutDocument) -> Vec<String> {
+        const BLOCK_TAGS: [&str; 10] = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "dd"];
+        let doc = DocQuery::new(note);
+        let boxes = doc.boxes();
+        let text = doc.text();
+        let glyph_text = |ranges: Vec<std::ops::Range<u32>>| {
+            let raw = ranges
+                .into_iter()
+                .flat_map(|range| range.filter_map(|glyph| text.glyph_at(glyph as usize).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())))
+                .collect::<String>();
+            raw.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+
+        let mut blocks = Vec::new();
+        for box_idx in 0..boxes.len() {
+            let Some(tag) = boxes.tag(box_idx) else { continue };
+            let Some(matched) = BLOCK_TAGS.iter().find(|candidate| tag.eq_ignore_ascii_case(candidate)) else { continue };
+            // A block nested inside one already taken would repeat its text.
+            if doc.boxes().ancestors(box_idx).any(|ancestor| boxes.tag(ancestor).is_some_and(|tag| BLOCK_TAGS.iter().any(|candidate| tag.eq_ignore_ascii_case(candidate)))) {
+                continue;
+            }
+            let content = glyph_text(doc.box_text_glyph_ranges(box_idx, false));
+            if content.is_empty() {
+                continue;
+            }
+            blocks.push(match *matched {
+                "li" => format!("\u{2022} {content}"),
+                "blockquote" => format!("\u{201c}{content}\u{201d}"),
+                _ => content,
+            });
+        }
+
+        if blocks.is_empty() {
+            let whole = glyph_text(vec![0..text.glyph_count() as u32]);
+            if !whole.is_empty() {
+                blocks.push(whole);
+            }
+        }
+        blocks
     }
 
     fn resolve_doc_index_for_path(&self, normalized_path: &str) -> Option<usize> {
@@ -2190,10 +2232,10 @@ mod tests {
         let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, uris, 0, Some("0:0"), RendererInitialConfig::default());
         let initial_reads = read_count.load(Ordering::Relaxed);
 
-        assert_eq!(core.footnote_preview("notes.html#n1").map(|preview| preview.blocks), Some(vec!["Structured note text".to_owned(), "• First source".to_owned()]));
+        assert_eq!(core.footnote_preview(&mut shaper, "notes.html#n1").map(|preview| preview.blocks), Some(vec!["Structured note text".to_owned(), "• First source".to_owned()]));
         let indexed_reads = read_count.load(Ordering::Relaxed);
         assert_eq!(indexed_reads, initial_reads + 1, "the target spine document should be indexed once on first use");
-        assert_eq!(core.footnote_preview("notes.html#ordinary"), None);
+        assert_eq!(core.footnote_preview(&mut shaper, "notes.html#ordinary"), None);
         assert_eq!(read_count.load(Ordering::Relaxed), indexed_reads, "subsequent targets in the same spine document must reuse its semantic index");
     }
 
@@ -2224,7 +2266,7 @@ mod tests {
     #[test]
     fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
         let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside><p>Continues</p></body></html>";
-        let (mut core, _) = pagination_core(html, Size::new(200.0, 200.0), 1);
+        let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
         let text = core.document.render_view().text();
         let noteref = glyph_index_for_character(&core, '1');
         assert!(core.document.render_view().addressing().is_note_reference(noteref));
@@ -2233,7 +2275,38 @@ mod tests {
         assert!(visible_source.contains("Reading"));
         assert!(visible_source.contains("Continues"));
         assert!(!visible_source.contains("zebra"), "the footnote body must not consume paginated layout space");
-        assert_eq!(core.footnote_preview("#note").map(|preview| preview.blocks), Some(vec!["Popup-only zebra".to_owned()]));
+        assert_eq!(core.footnote_preview(&mut shaper, "#note").map(|preview| preview.blocks), Some(vec!["Popup-only zebra".to_owned()]));
+    }
+
+    #[test]
+    fn as_authored_notes_read_inline_instead_of_being_held_for_a_popup() {
+        // The same fixture as the popup test above, differing only in the
+        // display mode. Under `AsAuthored` the reader injects no suppression
+        // rule, so the note reads where its author placed it.
+        let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside><p>Continues</p></body></html>";
+        let (provider, _) = CountingProvider::new(vec![("document.html", html)]);
+        let host = Rc::new(TestHost::default());
+        let mut shaper = TestShaper::default();
+        let config = RendererInitialConfig {
+            font_size: 16.0,
+            column_width: 200.0,
+            max_column_count: Some(1),
+            image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
+            text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+            note_display: crate::NoteDisplay::AsAuthored,
+            ..RendererInitialConfig::default()
+        };
+        let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), config);
+        core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
+        core.paint_forward(&mut RecordingPainter::default());
+
+        let text = core.document.render_view().text();
+        let visible_source = (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect::<String>();
+        assert!(visible_source.contains("zebra"), "an as-authored note occupies the reading flow rather than being held back for a popup");
+
+        // The engine's note semantics are untouched by the display mode: the
+        // target is still a note, which is what a later mode switch relies on.
+        assert!(core.document.render_view().addressing().is_note_target("note"));
     }
 
     #[test]
@@ -2256,6 +2329,6 @@ mod tests {
         assert!(visible_source.contains("Reading"));
         assert!(visible_source.contains("Continues"));
         assert!(!visible_source.contains("magenta"), "the namespaced XHTML footnote body must not consume paginated layout space");
-        assert_eq!(core.footnote_preview("#note").map(|preview| preview.blocks), Some(vec!["Popup-only magenta".to_owned()]));
+        assert_eq!(core.footnote_preview(&mut shaper, "#note").map(|preview| preview.blocks), Some(vec!["Popup-only magenta".to_owned()]));
     }
 }

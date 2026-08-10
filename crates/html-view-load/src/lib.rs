@@ -10,22 +10,8 @@ use html::pipeline::{
     FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints as PipelineLayoutConstraints, MarkupSyntax, PaintSettingsRevision, PipelineInputs, ReaderStyleOverrides, ResourceRevision, SourceRevision,
     StyleEnvironment, StylesheetRevision,
 };
+use html_view_types::NoteDisplay;
 
-/// Notes are rendered on demand by the reader's footnote preview. Keeping
-/// their source subtree in the document preserves link-target extraction,
-/// while this reader-layer rule removes it from the paginated reading flow.
-const READER_FOOTNOTE_CSS: &str = r#"
-[epub\:type~="footnote"],
-[epub\:type~="endnote"],
-[epub\:type~="rearnote"],
-[*|type~="footnote"],
-[*|type~="endnote"],
-[*|type~="rearnote"],
-[role~="doc-footnote"],
-[role~="doc-endnote"] {
-    display: none !important;
-}
-"#;
 
 pub struct LoadedRenderDocument {
     pub session: Engine,
@@ -48,25 +34,25 @@ pub fn load_css_with_provider(provider: &dyn ResourceProvider, base_uri: &str) -
 }
 
 pub fn load_document_with_dom_pipeline(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> LoadedRenderDocument {
-    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, glyph_shaper, None)
+    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, NoteDisplay::default(), glyph_shaper, None)
 }
 
 pub fn load_document_with_dom_pipeline_timed(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> (LoadedRenderDocument, PipelineTimings) {
     let mut timings = PipelineTimings::default();
-    let loaded = load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, glyph_shaper, Some(&mut timings));
+    let loaded = load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, Default::default(), ImageSizingPolicy::SmartStandalone, html::pipeline::TextCompositionPolicy::BookOptimized, NoteDisplay::default(), glyph_shaper, Some(&mut timings));
     (loaded, timings)
 }
 
 pub fn load_document_with_settings(
     provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, reader_overrides: ReaderStyleOverrides, image_sizing_policy: ImageSizingPolicy, text_composition_policy: html::pipeline::TextCompositionPolicy,
-    glyph_shaper: &mut impl GlyphShaper,
+    note_display: NoteDisplay, glyph_shaper: &mut impl GlyphShaper,
 ) -> LoadedRenderDocument {
-    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, reader_overrides, image_sizing_policy, text_composition_policy, glyph_shaper, None)
+    load_document_with_dom_pipeline_impl(provider, uri, root_font_size, col_width, reader_overrides, image_sizing_policy, text_composition_policy, note_display, glyph_shaper, None)
 }
 
 fn load_document_with_dom_pipeline_impl(
     provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, reader_overrides: ReaderStyleOverrides, image_sizing_policy: ImageSizingPolicy, text_composition_policy: html::pipeline::TextCompositionPolicy,
-    glyph_shaper: &mut impl GlyphShaper, mut timings: Option<&mut PipelineTimings>,
+    note_display: NoteDisplay, glyph_shaper: &mut impl GlyphShaper, mut timings: Option<&mut PipelineTimings>,
 ) -> LoadedRenderDocument {
     let load_started = Instant::now();
     let source_bytes = provider.read_bytes(uri).expect("Failed to load HTML");
@@ -82,8 +68,13 @@ fn load_document_with_dom_pipeline_impl(
     let inputs = PipelineInputs {
         source: html.clone(),
         markup_syntax: MarkupSyntax::from_uri(uri),
-        user_styles: vec![READER_FOOTNOTE_CSS.to_owned()],
+        user_styles: Vec::new(),
         reader_overrides,
+        note_flow: match note_display {
+            // Held back from the flow so the reader can present them itself.
+            NoteDisplay::Popup => html::pipeline::NoteFlow::Excluded,
+            NoteDisplay::AsAuthored => html::pipeline::NoteFlow::InFlow,
+        },
         source_revision: SourceRevision::INITIAL,
         base_uri: uri.to_string(),
         resource_revision: ResourceRevision::INITIAL,

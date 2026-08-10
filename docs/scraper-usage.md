@@ -1,7 +1,16 @@
 # `scraper` usage
 
-Survey of everywhere the workspace depends on `scraper`, and what each use is
-for. The goal is to depend on `html-engine` alone and stop doing ad hoc HTML
+> **Resolved.** `scraper` is gone from this workspace. Note bodies are now held
+> out of the reading flow by the engine (`NoteFlow`) rather than by injected
+> CSS, and previews come from `Engine::layout_note` rather than a second parse.
+> What follows is the survey that led there, kept for the reasoning.
+>
+> `html-parse` still depends on `scraper` internally, so it remains in
+> `Cargo.lock` transitively. What was removed is the second, divergent parse --
+> not the crate from the build graph.
+
+Survey of everywhere the workspace depended on `scraper`, and what each use was
+for. The goal was to depend on `html-engine` alone and stop doing ad hoc HTML
 parsing.
 
 ## Summary
