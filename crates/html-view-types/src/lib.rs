@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kurbo::{Point, Size};
@@ -322,8 +323,10 @@ pub trait RendererHost {
     fn request_style(&self);
     fn schedule(&self, delay: Duration, f: Box<dyn FnOnce() + Send>);
     fn schedule_repaint(&self, delay: Duration);
+    fn resource_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>>;
     fn set_clipboard(&self, text: &str) -> Result<(), String>;
-    fn set_clipboard_image(&self, width: usize, height: usize, rgba: Vec<u8>) -> Result<(), String>;
+    fn set_clipboard_image(&self, width: usize, height: usize, rgba: Vec<u8>)
+    -> Result<(), String>;
     fn set_clipboard_svg(&self, _bytes: Vec<u8>) -> Result<(), String> {
         Err("copying SVG images is not supported by this renderer host".to_owned())
     }
@@ -513,6 +516,7 @@ pub struct PagePositions {
     pub positions: VisibleLinePositions,
     pub offset_breaks: Vec<(f64, f64)>,
     pub repeated_table_headers: Vec<RepeatedTableHeader>,
+    pub block_decoration_indices: Vec<usize>,
     pub reached_end: bool,
     pub next_start_offset_y: f64,
 }
@@ -525,6 +529,7 @@ pub struct PagePositions {
 pub struct VisibleLinePositions {
     first_line: usize,
     positions: Vec<LineScreen>,
+    paint_order_indices: Vec<u32>,
 }
 
 impl VisibleLinePositions {
@@ -533,6 +538,7 @@ impl VisibleLinePositions {
         Self {
             first_line,
             positions,
+            paint_order_indices: Vec::new(),
         }
     }
 
@@ -566,7 +572,21 @@ impl VisibleLinePositions {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, LineScreen)> + '_ {
-        self.positions.iter().copied().enumerate().map(|(offset, screen)| (self.first_line + offset, screen))
+        self.positions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(offset, screen)| (self.first_line + offset, screen))
+    }
+
+    /// Visible spatial line indexes in CSS paint order. Pagination prepares
+    /// this once so every paint layer can traverse only the current page.
+    pub fn paint_order_indices(&self) -> &[u32] {
+        &self.paint_order_indices
+    }
+
+    pub fn set_paint_order_indices(&mut self, indices: Vec<u32>) {
+        self.paint_order_indices = indices;
     }
 
     pub fn push(&mut self, screen: LineScreen) {
@@ -581,6 +601,7 @@ impl VisibleLinePositions {
     pub fn clear(&mut self) {
         self.first_line = 0;
         self.positions.clear();
+        self.paint_order_indices.clear();
     }
 
     pub fn into_buffer(mut self) -> Vec<LineScreen> {
@@ -672,9 +693,8 @@ impl ColumnLayout {
         self.col_count = self.max_col_count.map_or(raw_count.max(1.0), |maximum| {
             raw_count.max(1.0).min(f64::from(maximum))
         });
-        self.col_gap = ((self.size.width - self.col_count * self.col_width)
-            / (self.col_count + 1.0))
-            .max(0.0);
+        self.col_gap =
+            ((self.size.width - self.col_count * self.col_width) / (self.col_count + 1.0)).max(0.0);
     }
 
     pub fn commit_column_width(&mut self, base_width: Option<f64>, effective_width: Option<f64>) {
@@ -871,9 +891,7 @@ impl ViewportState {
             start_offset_y: 0.0,
             anchor_end_line,
         };
-        self.continuation = ViewportContinuation::MoreAt(
-            self.continuation.next_start_offset_y(),
-        );
+        self.continuation = ViewportContinuation::MoreAt(self.continuation.next_start_offset_y());
     }
 
     /// Installs the viewport metadata carried by a cached forward page.
@@ -900,15 +918,19 @@ impl ViewportState {
 
     /// Resets transient output before resolving a backward page.
     pub fn begin_backward_preparation(&mut self) {
-        debug_assert!(matches!(self.composition.direction, PaintDirection::Backward));
-        self.continuation = ViewportContinuation::MoreAt(
-            self.continuation.next_start_offset_y(),
-        );
+        debug_assert!(matches!(
+            self.composition.direction,
+            PaintDirection::Backward
+        ));
+        self.continuation = ViewportContinuation::MoreAt(self.continuation.next_start_offset_y());
     }
 
     /// Updates the candidate document offset used to compose backward.
     pub fn set_backward_composition_start(&mut self, start_offset_y: f64) {
-        debug_assert!(matches!(self.composition.direction, PaintDirection::Backward));
+        debug_assert!(matches!(
+            self.composition.direction,
+            PaintDirection::Backward
+        ));
         self.backward.start_offset_y = start_offset_y;
     }
 }
@@ -946,6 +968,7 @@ pub struct VisiblePageGeometry {
     uses_cached_inline_positions: bool,
     offset_breaks: Vec<(f64, f64)>,
     repeated_table_headers: Vec<RepeatedTableHeader>,
+    block_decoration_indices: Option<Vec<usize>>,
 }
 
 impl VisiblePageGeometry {
@@ -975,6 +998,10 @@ impl VisiblePageGeometry {
 
     pub fn repeated_table_headers(&self) -> &[RepeatedTableHeader] {
         &self.repeated_table_headers
+    }
+
+    pub fn block_decoration_indices(&self) -> Option<&[usize]> {
+        self.block_decoration_indices.as_deref()
     }
 }
 
@@ -1022,6 +1049,24 @@ impl VisibleFrame {
         self.geometry_key = Some(key);
     }
 
+    /// Repositions an already paginated page when only horizontal column
+    /// geometry changed. Line membership, vertical positions, and semantic
+    /// boundaries remain valid.
+    pub fn reproject_columns(
+        &mut self,
+        old_column_width: f64,
+        old_column_gap: f64,
+        new_column_width: f64,
+        new_column_gap: f64,
+    ) {
+        for screen in &mut self.page.line_positions.positions {
+            let column = f64::from(screen.col_index);
+            let old_origin = old_column_gap + column * (old_column_width + old_column_gap);
+            let new_origin = new_column_gap + column * (new_column_width + new_column_gap);
+            screen.point.x += new_origin - old_origin;
+        }
+    }
+
     pub fn take_line_positions(&mut self) -> VisibleLinePositions {
         std::mem::take(&mut self.page.line_positions)
     }
@@ -1039,6 +1084,7 @@ impl VisibleFrame {
         self.page.uses_cached_inline_positions = false;
         self.page.offset_breaks.clear();
         self.page.repeated_table_headers.clear();
+        self.page.block_decoration_indices = None;
         previous
     }
 
@@ -1050,7 +1096,12 @@ impl VisibleFrame {
         paint_start_offset_y: f64,
         paint_end_line: Option<usize>,
     ) -> VisibleLinePositions {
-        self.install_page(page, paint_start_offset_y, paint_end_line, InlinePositionMode::Flow)
+        self.install_page(
+            page,
+            paint_start_offset_y,
+            paint_end_line,
+            InlinePositionMode::Flow,
+        )
     }
 
     /// Installs a page that has already been positioned, such as backward
@@ -1081,15 +1132,18 @@ impl VisibleFrame {
             positions,
             offset_breaks,
             repeated_table_headers,
+            block_decoration_indices,
             ..
         } = page;
         let previous_positions = std::mem::replace(&mut self.page.line_positions, positions);
         self.page.start_line = Some(start_line);
         self.page.end_line = paint_end_line;
         self.page.paint_start_offset_y = paint_start_offset_y;
-        self.page.uses_cached_inline_positions = matches!(inline_positions, InlinePositionMode::Recorded);
+        self.page.uses_cached_inline_positions =
+            matches!(inline_positions, InlinePositionMode::Recorded);
         self.page.offset_breaks = offset_breaks;
         self.page.repeated_table_headers = repeated_table_headers;
+        self.page.block_decoration_indices = Some(block_decoration_indices);
         previous_positions
     }
 
@@ -1111,6 +1165,7 @@ impl VisibleFrame {
         self.page.uses_cached_inline_positions = false;
         self.page.offset_breaks.clear();
         self.page.repeated_table_headers.clear();
+        self.page.block_decoration_indices = None;
         self.geometry_key = None;
         self.clear_backend_shaping();
     }
@@ -1166,7 +1221,10 @@ mod renderer_revision_tests {
         let viewport = Size::new(800.0, 600.0);
         let top_left = FootnotePopupAnchor::at_click(Point::new(100.0, 100.0), viewport);
         assert_eq!(top_left.corner, PopupAnchorCorner::TopLeft);
-        assert_eq!(top_left.popup_origin(Size::new(240.0, 160.0)), top_left.point);
+        assert_eq!(
+            top_left.popup_origin(Size::new(240.0, 160.0)),
+            top_left.point
+        );
         assert_eq!(
             FootnotePopupAnchor::at_click(Point::new(700.0, 100.0), viewport).corner,
             PopupAnchorCorner::TopRight
@@ -1208,7 +1266,10 @@ mod renderer_revision_tests {
 
         viewport.begin_backward_at(24.0, Some(7));
 
-        assert!(matches!(viewport.composition().direction(), PaintDirection::Backward));
+        assert!(matches!(
+            viewport.composition().direction(),
+            PaintDirection::Backward
+        ));
         assert_eq!(viewport.composition().end_offset_y(), 24.0);
         assert_eq!(viewport.backward_composition().start_offset_y(), 0.0);
         assert_eq!(viewport.backward_composition().anchor_end_line(), Some(7));
@@ -1225,7 +1286,10 @@ mod renderer_revision_tests {
 
         viewport.install_forward_page(10.0, ViewportContinuation::EndedAt(30.0));
 
-        assert!(matches!(viewport.composition().direction(), PaintDirection::Forward));
+        assert!(matches!(
+            viewport.composition().direction(),
+            PaintDirection::Forward
+        ));
         assert_eq!(viewport.composition().start_offset_y(), 10.0);
         assert_eq!(viewport.composition().end_offset_y(), 10.0);
         assert!(viewport.continuation().reached_end());
@@ -1258,6 +1322,7 @@ mod renderer_revision_tests {
                 source_bottom: 4.0,
                 col_index: 1,
             }],
+            block_decoration_indices: vec![2, 5],
             reached_end: false,
             next_start_offset_y: 50.0,
         };
@@ -1272,6 +1337,7 @@ mod renderer_revision_tests {
         assert_eq!(frame.page().line_positions().first_line(), 4);
         assert_eq!(frame.page().offset_breaks(), vec![(10.0, 20.0)]);
         assert_eq!(frame.page().repeated_table_headers().len(), 1);
+        assert_eq!(frame.page().block_decoration_indices(), Some(&[2, 5][..]));
     }
 
     #[test]

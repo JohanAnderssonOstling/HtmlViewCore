@@ -4,11 +4,7 @@ use std::sync::Arc;
 
 use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
-use crate::{
-    DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore,
-    RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider,
-    TocEntry, ViewportState, load,
-};
+use crate::{DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, ResourceProvider, TocEntry, ViewportState, load};
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
 
@@ -21,25 +17,13 @@ mod spine;
 
 impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
-        NavView {
-            doc: DocQuery::new(&self.page.view.document),
-            viewport: &self.viewport,
-            frame: &self.page.view.frame,
-        }
+        NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame }
     }
 
     fn nav_cx(&mut self) -> (&mut NavigationState, NavContext<'_>) {
         // Disjoint field borrows: navigation state is mutated through the
         // first, everything it reads or writes through the second.
-        (
-            &mut self.nav,
-            NavContext {
-                doc: DocQuery::new(&self.page.view.document),
-                viewport: &mut self.viewport,
-                frame: &self.page.view.frame,
-                host: self.host.as_ref(),
-            },
-        )
+        (&mut self.nav, NavContext { doc: DocQuery::new(&self.page.view.document), viewport: &mut self.viewport, frame: &self.page.view.frame, host: self.host.as_ref() })
     }
 
     pub fn restore_glyph_position(&mut self, glyph_idx: u32) {
@@ -70,11 +54,7 @@ impl RendererCore {
         nav.update_nav_signal(&mut cx);
     }
 
-    pub(crate) fn set_progress_fraction(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        fraction: f32,
-    ) {
+    pub(crate) fn set_progress_fraction(&mut self, glyph_shaper: &mut impl GlyphShaper, fraction: f32) {
         let (doc, in_doc_fraction) = self.nav.document_at_fraction(fraction);
         self.set_position(glyph_shaper, doc, None);
         let glyph_count = self.page.view.document.render_view().text().glyph_count();
@@ -112,9 +92,7 @@ impl RendererCore {
         );
         let mut renderer = Self::new(host, loaded, provider, document_uris, doc_index, config);
 
-        if nav_state.as_deref().is_some_and(|state| {
-            state.trim().starts_with("epubcfi(") && renderer.restore_position_from_cfi(state.trim())
-        }) {
+        if nav_state.as_deref().is_some_and(|state| state.trim().starts_with("epubcfi(") && renderer.restore_position_from_cfi(state.trim())) {
             renderer.update_nav_signal();
             return renderer;
         }
@@ -130,18 +108,8 @@ impl RendererCore {
     }
 
     pub fn build_document_toc_entries_for(document: &LaidOutDocument) -> Vec<TocEntry> {
-        fn convert_nodes(
-            view: html::layout::RenderView<'_>,
-            nodes: &[crate::DocumentTocNode],
-        ) -> Vec<TocEntry> {
-            nodes
-                .iter()
-                .map(|node| TocEntry {
-                    title: view.string(node.title).to_string(),
-                    link: view.string(node.href).to_string(),
-                    children: convert_nodes(view, node.children.as_slice()),
-                })
-                .collect()
+        fn convert_nodes(view: html::layout::RenderView<'_>, nodes: &[crate::DocumentTocNode]) -> Vec<TocEntry> {
+            nodes.iter().map(|node| TocEntry { title: view.string(node.title).to_string(), link: view.string(node.href).to_string(), children: convert_nodes(view, node.children.as_slice()) }).collect()
         }
 
         let view = document.render_view();
@@ -202,9 +170,7 @@ impl RendererCore {
 
     pub fn prev_page(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         let start_offset_y = self.viewport.composition().start_offset_y();
-        if self.page.view.frame.page().start_line() == Some(0)
-            || start_offset_y <= 0.0
-        {
+        if self.page.view.frame.page().start_line() == Some(0) || start_offset_y <= 0.0 {
             if self.nav.location().document() > 0 {
                 self.load_document_at(glyph_shaper, self.nav.location().document() - 1, DocAnchor::End);
                 return;
@@ -214,24 +180,8 @@ impl RendererCore {
             return;
         }
 
-        let back_anchor_end_line = self
-            .page
-            .view
-            .frame
-            .page()
-            .start_line()
-            .and_then(|idx| idx.checked_sub(1));
-        let end_offset_y = back_anchor_end_line
-            .and_then(|anchor_idx| {
-                self.page
-                    .view
-                    .document
-                    .render_view()
-                    .text()
-                    .line(anchor_idx)
-            })
-            .map(|line| line.point().y + line.height())
-            .unwrap_or(start_offset_y);
+        let back_anchor_end_line = self.page.view.frame.page().start_line().and_then(|idx| idx.checked_sub(1));
+        let end_offset_y = back_anchor_end_line.and_then(|anchor_idx| self.page.view.document.render_view().text().line(anchor_idx)).map(|line| line.point().y + line.height()).unwrap_or(start_offset_y);
         self.cache_current_prepared_page();
         if let Some(anchor_idx) = back_anchor_end_line
             && self.restore_prepared_page_ending_at(anchor_idx)
@@ -247,11 +197,7 @@ impl RendererCore {
 
     pub fn next_document(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         if self.nav.location().document() + 1 < self.nav.documents().uris().len() {
-            self.load_document_at(
-                glyph_shaper,
-                self.nav.location().document() + 1,
-                DocAnchor::Start,
-            );
+            self.load_document_at(glyph_shaper, self.nav.location().document() + 1, DocAnchor::Start);
         }
     }
 
@@ -261,11 +207,7 @@ impl RendererCore {
         }
     }
 
-    pub fn relayout_for_column_width(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        column_width: f64,
-    ) -> Result<(), html::pipeline::PipelineError> {
+    pub fn relayout_for_column_width(&mut self, glyph_shaper: &mut impl GlyphShaper, column_width: f64) -> Result<(), html::pipeline::PipelineError> {
         let next = self.next_pipeline_inputs_for_layout(column_width);
         self.apply_pipeline_inputs(next, glyph_shaper)
     }
@@ -298,14 +240,9 @@ impl RendererCore {
         }
         let base_width = base_changed.then_some(rounded);
         let effective_width = effective_changed.then_some(effective);
-        self.page
-            .view
-            .layout
-            .commit_column_width(base_width, effective_width);
+        self.page.view.layout.commit_column_width(base_width, effective_width);
         if base_changed {
-            self.host.emit(RendererEvent::ColumnWidthChanged(
-                self.page.view.layout.base_col_width,
-            ));
+            self.host.emit(RendererEvent::ColumnWidthChanged(self.page.view.layout.base_col_width));
         }
     }
 
@@ -316,7 +253,6 @@ impl RendererCore {
         self.host.emit(RendererEvent::ScaleChanged(scale));
         self.host.request_repaint();
     }
-
 
     pub fn reset_view_state(&mut self) {
         self.viewport = ViewportState::default();

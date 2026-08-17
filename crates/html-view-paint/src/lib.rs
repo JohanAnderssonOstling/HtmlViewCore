@@ -13,8 +13,8 @@ use html::resources::ImagePipeline;
 use html_view_doc::{DocQuery, TextGeometry, scaled_image_size};
 use html_view_select::SelectionView;
 use html_view_types::{
-    AnnotationStyle, BookSearchMatch, BookSearchTarget, InteractionPalette, ReaderPaintPalette, RenderState,
-    RendererAnnotation, RendererEvent, RendererHost, SearchOptions, SearchScope,
+    AnnotationStyle, BookSearchMatch, BookSearchTarget, InteractionPalette, ReaderPaintPalette,
+    RenderState, RendererAnnotation, RendererEvent, RendererHost, SearchOptions, SearchScope,
     VisibleLinePositions,
 };
 use kurbo::{Point, Rect};
@@ -123,7 +123,10 @@ impl HighlightState {
 
     /// Options for restricting a search to the document on screen.
     pub fn current_document_options(&self) -> SearchOptions {
-        SearchOptions { scope: SearchScope::CurrentDocument, ..self.options }
+        SearchOptions {
+            scope: SearchScope::CurrentDocument,
+            ..self.options
+        }
     }
 
     pub fn activate(&mut self) -> bool {
@@ -222,12 +225,18 @@ impl HighlightState {
     }
 
     pub fn current_local_match_start(&self) -> Option<u32> {
-        self.matches.get(self.current_local_match).map(|&(start, _)| start)
+        self.matches
+            .get(self.current_local_match)
+            .map(|&(start, _)| start)
     }
 
     pub fn emit_match_signal(&self, host: &dyn RendererHost) {
         let total = self.book_matches.len();
-        let current = if total == 0 { 0 } else { self.current_match + 1 };
+        let current = if total == 0 {
+            0
+        } else {
+            self.current_match + 1
+        };
         host.emit(RendererEvent::MatchInfo { current, total });
     }
 
@@ -284,7 +293,12 @@ impl AnnotationOverlayState {
     /// Reports the topmost annotation covering `glyph`. Later annotations win,
     /// matching paint order.
     pub fn activate_at_glyph(&self, glyph: u32, host: &dyn RendererHost) -> bool {
-        let Some((id, ..)) = self.visible.iter().rev().find(|(_, start, end, _, _)| glyph >= *start && glyph < *end) else {
+        let Some((id, ..)) = self
+            .visible
+            .iter()
+            .rev()
+            .find(|(_, start, end, _, _)| glyph >= *start && glyph < *end)
+        else {
             return false;
         };
         host.emit(RendererEvent::AnnotationActivated { id: id.clone() });
@@ -311,7 +325,10 @@ impl MediaOverlayHighlightState {
     }
 
     pub fn resolved(target_href: Option<String>, visible: Option<(u32, u32)>) -> Self {
-        Self { target_href, visible }
+        Self {
+            target_href,
+            visible,
+        }
     }
 }
 
@@ -564,8 +581,7 @@ impl<'a> PagePainter<'a> {
                 ContentLayer::Flow,
             );
         }
-        render_state =
-            self.paint_repeated_table_header_lines(cx, ContentLayer::Flow, render_state);
+        render_state = self.paint_repeated_table_header_lines(cx, ContentLayer::Flow, render_state);
         let positions = self
             .geo
             .frame
@@ -579,10 +595,7 @@ impl<'a> PagePainter<'a> {
             positions,
             PaintPass::foreground(ContentLayer::Flow),
         );
-        self.paint_repeated_table_header_decorations(
-            cx,
-            PaintPass::foreground(ContentLayer::Flow),
-        );
+        self.paint_repeated_table_header_decorations(cx, PaintPass::foreground(ContentLayer::Flow));
         for layer in [
             ContentLayer::Positioned,
             ContentLayer::IndependentPositioned,
@@ -648,10 +661,22 @@ impl<'a> PagePainter<'a> {
         mut render_state: RenderState,
         layer: ContentLayer,
     ) -> RenderState {
-        for line_idx in self.geo.doc.text().paint_order_indices().iter().filter_map(|&index| usize::try_from(index).ok()).filter(|&index| (first_line..=end_line).contains(&index)) {
+        let prepared_order = positions.paint_order_indices();
+        let document_order = self.geo.doc.text().paint_order_indices();
+        let paint_order = if prepared_order.is_empty() {
+            document_order
+        } else {
+            prepared_order
+        };
+        for line_idx in paint_order
+            .iter()
+            .filter_map(|&index| usize::try_from(index).ok())
+            .filter(|&index| (first_line..=end_line).contains(&index))
+        {
             if let Some(screen) = positions.get(line_idx)
                 && self
-                    .geo.doc
+                    .geo
+                    .doc
                     .view()
                     .text()
                     .line(line_idx)
@@ -724,7 +749,9 @@ impl<'a> PagePainter<'a> {
                 fragments = next;
             }
             for fragment in fragments {
-                let (range_x0, range_x1) = self.geo.glyph_x_span_in_line(line, fragment.start, fragment.end);
+                let (range_x0, range_x1) =
+                    self.geo
+                        .glyph_x_span_in_line(line, fragment.start, fragment.end);
                 let x0 = screen_point.x + range_x0;
                 let x1 = screen_point.x + range_x1;
                 let (x0, x1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
@@ -763,7 +790,12 @@ impl<'a> PagePainter<'a> {
         let page_end = start_offset_y + self.geo.layout.col_count * self.geo.layout.size.height; // visible doc y end for this page
         let inline_metrics = self.geo.layout.inline_metrics();
         let lines = self.geo.doc.text().lines();
-        for decoration in self.geo.doc.view().fragments().decorations().iter() {
+        let fragments = self.geo.doc.view().fragments();
+        let decorations = match self.geo.frame.page().block_decoration_indices() {
+            Some(indexes) => fragments.decorations_by_indices(indexes),
+            None => fragments.block_decorations(),
+        };
+        for decoration in decorations.iter() {
             if decoration.is_foreground() != pass.is_foreground() {
                 continue;
             }
@@ -779,10 +811,26 @@ impl<'a> PagePainter<'a> {
             let mut rect = decoration.rect();
             if let Some(clip) = decoration.overflow_clip() {
                 let clip_rect = clip.rect();
-                let x0 = if clip.clips_x() { rect.x0.max(clip_rect.x0) } else { rect.x0 };
-                let y0 = if clip.clips_y() { rect.y0.max(clip_rect.y0) } else { rect.y0 };
-                let x1 = if clip.clips_x() { rect.x1.min(clip_rect.x1) } else { rect.x1 };
-                let y1 = if clip.clips_y() { rect.y1.min(clip_rect.y1) } else { rect.y1 };
+                let x0 = if clip.clips_x() {
+                    rect.x0.max(clip_rect.x0)
+                } else {
+                    rect.x0
+                };
+                let y0 = if clip.clips_y() {
+                    rect.y0.max(clip_rect.y0)
+                } else {
+                    rect.y0
+                };
+                let x1 = if clip.clips_x() {
+                    rect.x1.min(clip_rect.x1)
+                } else {
+                    rect.x1
+                };
+                let y1 = if clip.clips_y() {
+                    rect.y1.min(clip_rect.y1)
+                } else {
+                    rect.y1
+                };
                 if x1 <= x0 || y1 <= y0 {
                     continue;
                 }
@@ -891,11 +939,7 @@ impl<'a> PagePainter<'a> {
         }
     }
 
-    fn paint_decoration_segment(
-        &self,
-        cx: &mut impl Painter,
-        segment: DecorationSegment<'_>,
-    ) {
+    fn paint_decoration_segment(&self, cx: &mut impl Painter, segment: DecorationSegment<'_>) {
         let DecorationSegment {
             rect,
             start: seg_start,
@@ -991,10 +1035,26 @@ impl<'a> PagePainter<'a> {
         let mut rect = decoration.rect();
         if let Some(clip) = decoration.overflow_clip() {
             let clip_rect = clip.rect();
-            let x0 = if clip.clips_x() { rect.x0.max(clip_rect.x0) } else { rect.x0 };
-            let y0 = if clip.clips_y() { rect.y0.max(clip_rect.y0) } else { rect.y0 };
-            let x1 = if clip.clips_x() { rect.x1.min(clip_rect.x1) } else { rect.x1 };
-            let y1 = if clip.clips_y() { rect.y1.min(clip_rect.y1) } else { rect.y1 };
+            let x0 = if clip.clips_x() {
+                rect.x0.max(clip_rect.x0)
+            } else {
+                rect.x0
+            };
+            let y0 = if clip.clips_y() {
+                rect.y0.max(clip_rect.y0)
+            } else {
+                rect.y0
+            };
+            let x1 = if clip.clips_x() {
+                rect.x1.min(clip_rect.x1)
+            } else {
+                rect.x1
+            };
+            let y1 = if clip.clips_y() {
+                rect.y1.min(clip_rect.y1)
+            } else {
+                rect.y1
+            };
             if x1 <= x0 || y1 <= y0 {
                 return;
             }
@@ -1003,11 +1063,7 @@ impl<'a> PagePainter<'a> {
         self.paint_inline_decoration_at(cx, &rect, line, screen_point, 0.0, decoration);
     }
 
-    fn paint_repeated_table_header_decorations(
-        &self,
-        cx: &mut impl Painter,
-        pass: PaintPass,
-    ) {
+    fn paint_repeated_table_header_decorations(&self, cx: &mut impl Painter, pass: PaintPass) {
         for header in self.geo.frame.page().repeated_table_headers() {
             for decoration in self.geo.doc.view().fragments().decorations().iter() {
                 if decoration.is_foreground() != pass.is_foreground()
@@ -1019,10 +1075,26 @@ impl<'a> PagePainter<'a> {
                 if let Some(clip) = decoration.overflow_clip() {
                     let clip_rect = clip.rect();
                     rect = Rect::new(
-                        if clip.clips_x() { rect.x0.max(clip_rect.x0) } else { rect.x0 },
-                        if clip.clips_y() { rect.y0.max(clip_rect.y0) } else { rect.y0 },
-                        if clip.clips_x() { rect.x1.min(clip_rect.x1) } else { rect.x1 },
-                        if clip.clips_y() { rect.y1.min(clip_rect.y1) } else { rect.y1 },
+                        if clip.clips_x() {
+                            rect.x0.max(clip_rect.x0)
+                        } else {
+                            rect.x0
+                        },
+                        if clip.clips_y() {
+                            rect.y0.max(clip_rect.y0)
+                        } else {
+                            rect.y0
+                        },
+                        if clip.clips_x() {
+                            rect.x1.min(clip_rect.x1)
+                        } else {
+                            rect.x1
+                        },
+                        if clip.clips_y() {
+                            rect.y1.min(clip_rect.y1)
+                        } else {
+                            rect.y1
+                        },
                     );
                 }
                 let source_x0 = rect.x0.max(header.source_left);
@@ -1100,17 +1172,30 @@ impl<'a> PagePainter<'a> {
         // moving the whole line would detach backgrounds from equivalent block
         // geometry by as much as half a device pixel.
         let point = line_paint_origin(point);
-        let clip = self.geo.doc.text().line_overflow_clip(line_idx).and_then(|clip| {
-            let line_point = self.geo.doc.text().line(line_idx)?.point();
-            let delta = point - line_point;
-            let rect = clip.rect() + delta;
-            Some(Rect::new(
-                if clip.clips_x() { rect.x0 } else { 0.0 },
-                if clip.clips_y() { rect.y0 } else { 0.0 },
-                if clip.clips_x() { rect.x1 } else { self.geo.layout.size.width },
-                if clip.clips_y() { rect.y1 } else { self.geo.layout.size.height },
-            ))
-        });
+        let clip = self
+            .geo
+            .doc
+            .text()
+            .line_overflow_clip(line_idx)
+            .and_then(|clip| {
+                let line_point = self.geo.doc.text().line(line_idx)?.point();
+                let delta = point - line_point;
+                let rect = clip.rect() + delta;
+                Some(Rect::new(
+                    if clip.clips_x() { rect.x0 } else { 0.0 },
+                    if clip.clips_y() { rect.y0 } else { 0.0 },
+                    if clip.clips_x() {
+                        rect.x1
+                    } else {
+                        self.geo.layout.size.width
+                    },
+                    if clip.clips_y() {
+                        rect.y1
+                    } else {
+                        self.geo.layout.size.height
+                    },
+                ))
+            });
         if let Some(clip) = clip {
             cx.push_clip(clip);
         }
@@ -1128,12 +1213,7 @@ impl<'a> PagePainter<'a> {
                 .line(line_idx)
                 .and_then(|line| line.paint_color())
         });
-        self.paint_decorations_for_line(
-            cx,
-            line_idx,
-            point,
-            PaintPass::background(layer),
-        );
+        self.paint_decorations_for_line(cx, line_idx, point, PaintPass::background(layer));
         self.draw_images_for_line(cx, line_idx, point);
         if !html::render::paint_line_text_runs(
             self.geo.doc.document(),
@@ -1152,12 +1232,7 @@ impl<'a> PagePainter<'a> {
                 cx,
             );
         }
-        self.paint_decorations_for_line(
-            cx,
-            line_idx,
-            point,
-            PaintPass::foreground(layer),
-        );
+        self.paint_decorations_for_line(cx, line_idx, point, PaintPass::foreground(layer));
         if clip.is_some() {
             cx.pop_clip();
         }
@@ -1220,16 +1295,27 @@ impl<'a> PagePainter<'a> {
         }
 
         // Binary-search for the first match whose end is past the line's start glyph
-        let first = self.highlight.matches.partition_point(|&(_, end)| end <= line.start());
+        let first = self
+            .highlight
+            .matches
+            .partition_point(|&(_, end)| end <= line.start());
 
         for (i, &(match_start, match_end)) in self.highlight.matches[first..].iter().enumerate() {
             if match_start >= line.end() {
                 break;
             }
             let is_current = first + i == self.highlight.current_local_match;
-            let color = if is_current { self.interaction_palette.active_search_match } else { self.interaction_palette.search_match };
+            let color = if is_current {
+                self.interaction_palette.active_search_match
+            } else {
+                self.interaction_palette.search_match
+            };
 
-            for (start, end) in self.geo.doc.line_text_intersections(line.index(), match_start, match_end) {
+            for (start, end) in
+                self.geo
+                    .doc
+                    .line_text_intersections(line.index(), match_start, match_end)
+            {
                 let (range_x0, range_x1) = self.geo.glyph_x_span_in_line(line, start, end);
                 let x0 = screen_point.x + range_x0;
                 let x1 = screen_point.x + range_x1;
@@ -1251,7 +1337,11 @@ impl<'a> PagePainter<'a> {
         screen: Point,
     ) {
         for (_, range_start, range_end, style, rgba) in &self.annotations.visible {
-            for (start, end) in self.geo.doc.line_text_intersections(line_idx, *range_start, *range_end) {
+            for (start, end) in
+                self.geo
+                    .doc
+                    .line_text_intersections(line_idx, *range_start, *range_end)
+            {
                 let (x0, x1) = self.geo.glyph_x_span_in_line(line, start, end);
                 let (x0, x1) = (screen.x + x0, screen.x + x1);
                 if x1 <= x0 {

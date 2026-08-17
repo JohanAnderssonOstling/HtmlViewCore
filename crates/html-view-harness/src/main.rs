@@ -91,6 +91,15 @@ impl RendererHost for HarnessHost {
         self.state.borrow_mut().repaint = true;
     }
 
+    fn schedule_frame_work(&self, _delay: Duration, work: Box<dyn FnOnce() + Send>) {
+        work();
+        self.state.borrow_mut().repaint = true;
+    }
+
+    fn resource_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
     fn set_clipboard(&self, text: &str) -> Result<(), String> {
         self.clipboard
             .borrow_mut()

@@ -965,6 +965,7 @@ dependencies = [
  "html-style-model",
  "hypher",
  "kurbo",
+ "rayon",
  "rustc_data_structures",
  "taffy",
  "unicode-segmentation",
@@ -1031,6 +1032,7 @@ dependencies = [
  "lightningcss",
  "parcel_selectors",
  "rustc_data_structures",
+ "static-self",
 ]
 
 [[package]]

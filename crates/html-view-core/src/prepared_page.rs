@@ -1,10 +1,8 @@
-//! Speculatively paginated pages held for adjacent-page navigation.
+//! Previously visited pages held for navigation.
 //!
-//! Pagination is the expensive part of turning a page, so the renderer lays out
-//! the next page during idle time and keeps a bounded ring of results keyed by
-//! frame geometry. This module owns the ring and the two markers that keep the
-//! idle-time scheduling from re-running for a page already prefetched; deciding
-//! *when* to prefetch stays with the renderer, which knows about the viewport.
+//! The renderer never populates this cache speculatively. It stores a bounded
+//! ring of pages that were actually visible so backward navigation can reuse
+//! their geometry.
 
 use std::collections::VecDeque;
 
@@ -23,10 +21,7 @@ pub(crate) struct PreparedPage {
 
 impl PreparedPage {
     pub(crate) fn install(self, view: &mut DocumentView, viewport: &mut ViewportState) {
-        viewport.install_forward_page(
-            self.frame.page().paint_start_offset_y(),
-            self.continuation,
-        );
+        viewport.install_forward_page(self.frame.page().paint_start_offset_y(), self.continuation);
         view.frame = self.frame;
     }
 }
@@ -34,20 +29,24 @@ impl PreparedPage {
 #[derive(Default)]
 pub(crate) struct PreparedPageCache {
     pages: VecDeque<PreparedPage>,
-    scheduled_for: Option<FrameGeometryCacheKey>,
-    prefetched_for: Option<FrameGeometryCacheKey>,
 }
 
 impl PreparedPageCache {
     pub(crate) fn new() -> Self {
-        Self { pages: VecDeque::with_capacity(CAPACITY), scheduled_for: None, prefetched_for: None }
+        Self {
+            pages: VecDeque::with_capacity(CAPACITY),
+        }
     }
 
     pub(crate) fn insert(&mut self, mut prepared: PreparedPage) {
         // Native text-run IDs are handles into backend-owned transient storage.
         // Prepared pages outlive that storage, so only retain portable geometry.
         prepared.frame.clear_backend_shaping();
-        if let Some(index) = self.pages.iter().position(|candidate| candidate.key == prepared.key) {
+        if let Some(index) = self
+            .pages
+            .iter()
+            .position(|candidate| candidate.key == prepared.key)
+        {
             self.pages.remove(index);
         }
         self.pages.push_back(prepared);
@@ -56,19 +55,27 @@ impl PreparedPageCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, key: FrameGeometryCacheKey) -> bool {
         self.pages.iter().any(|candidate| candidate.key == key)
     }
 
     pub(crate) fn take(&mut self, key: FrameGeometryCacheKey) -> Option<PreparedPage> {
-        let index = self.pages.iter().position(|candidate| candidate.key == key)?;
+        let index = self
+            .pages
+            .iter()
+            .position(|candidate| candidate.key == key)?;
         self.pages.remove(index)
     }
 
     /// Takes a page that ends on `end_line` under geometry matching `current`
     /// in everything but page offset and paint direction. Backward navigation
     /// knows which line it wants to land on, not the offset that produces it.
-    pub(crate) fn take_ending_at(&mut self, end_line: usize, current: FrameGeometryCacheKey) -> Option<PreparedPage> {
+    pub(crate) fn take_ending_at(
+        &mut self,
+        end_line: usize,
+        current: FrameGeometryCacheKey,
+    ) -> Option<PreparedPage> {
         let index = self.pages.iter().position(|candidate| {
             candidate.frame.page().end_line() == Some(end_line)
                 && candidate.key.layout_revision == current.layout_revision
@@ -82,25 +89,6 @@ impl PreparedPageCache {
         self.pages.remove(index)
     }
 
-    /// Consumes a pending schedule for `key`, marking it prefetched. Returns
-    /// whether the caller should now run the prefetch.
-    pub(crate) fn claim_scheduled(&mut self, key: FrameGeometryCacheKey) -> bool {
-        if self.scheduled_for != Some(key) {
-            return false;
-        }
-        self.scheduled_for = None;
-        self.prefetched_for = Some(key);
-        true
-    }
-
-    pub(crate) fn is_prefetched(&self, key: FrameGeometryCacheKey) -> bool {
-        self.prefetched_for == Some(key)
-    }
-
-    pub(crate) fn mark_scheduled(&mut self, key: FrameGeometryCacheKey) {
-        self.scheduled_for = Some(key);
-    }
-
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.pages.clear();
@@ -109,11 +97,6 @@ impl PreparedPageCache {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &PreparedPage> {
-        self.pages.iter()
     }
 }
 
@@ -144,6 +127,7 @@ mod tests {
                 positions: VisibleLinePositions::default(),
                 offset_breaks: Vec::new(),
                 repeated_table_headers: Vec::new(),
+                block_decoration_indices: Vec::new(),
                 reached_end: false,
                 next_start_offset_y: 0.0,
             },
@@ -175,7 +159,10 @@ mod tests {
 
         let mut other = key(1);
         other.scale_bits = 2f64.to_bits();
-        assert!(!cache.contains(other), "geometry that would paginate differently must not hit");
+        assert!(
+            !cache.contains(other),
+            "geometry that would paginate differently must not hit"
+        );
         assert!(cache.take(other).is_none());
     }
 
@@ -188,7 +175,10 @@ mod tests {
 
         assert!(!cache.contains(key(0)), "the oldest page is evicted");
         for offset in 1..CAPACITY as u64 + 1 {
-            assert!(cache.contains(key(offset)), "page {offset} should still be cached");
+            assert!(
+                cache.contains(key(offset)),
+                "page {offset} should still be cached"
+            );
         }
     }
 
@@ -199,7 +189,11 @@ mod tests {
         cache.insert(page(key(1), Some(20)));
 
         let restored = cache.take(key(1)).expect("the page is cached");
-        assert_eq!(restored.frame.page().end_line(), Some(20), "the newer page wins");
+        assert_eq!(
+            restored.frame.page().end_line(),
+            Some(20),
+            "the newer page wins"
+        );
         assert!(cache.take(key(1)).is_none(), "no duplicate is left behind");
     }
 
@@ -212,7 +206,10 @@ mod tests {
         cache.insert(prepared);
 
         let restored = cache.take(key(1)).expect("the page is cached");
-        assert!(restored.frame.shaping().shaped_lines().is_empty(), "shaped lines index backend-owned storage that a cached page outlives");
+        assert!(
+            restored.frame.shaping().shaped_lines().is_empty(),
+            "shaped lines index backend-owned storage that a cached page outlives"
+        );
         assert!(restored.frame.shaping().native_failures().is_empty());
         assert!(restored.frame.shaping().key().is_none());
     }
@@ -236,19 +233,13 @@ mod tests {
 
         let mut different = key(1);
         different.column_count = 3;
-        assert!(cache.take_ending_at(42, different).is_none(), "a page laid out for another column count cannot be reused");
-        assert!(cache.take_ending_at(41, key(1)).is_none(), "the end line must match exactly");
-    }
-
-    #[test]
-    fn prefetch_is_claimed_once_per_key() {
-        let mut cache = PreparedPageCache::new();
-
-        assert!(!cache.claim_scheduled(key(1)), "nothing was scheduled yet");
-        cache.mark_scheduled(key(1));
-        assert!(cache.claim_scheduled(key(1)), "the scheduled prefetch runs");
-        assert!(!cache.claim_scheduled(key(1)), "and does not run twice");
-        assert!(cache.is_prefetched(key(1)), "the page is now marked prefetched, so it is not rescheduled");
-        assert!(!cache.is_prefetched(key(2)));
+        assert!(
+            cache.take_ending_at(42, different).is_none(),
+            "a page laid out for another column count cannot be reused"
+        );
+        assert!(
+            cache.take_ending_at(41, key(1)).is_none(),
+            "the end line must match exactly"
+        );
     }
 }

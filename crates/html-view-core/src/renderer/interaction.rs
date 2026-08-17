@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use kurbo::{Point, Size};
 
 use crate::prepared_page::PreparedPage;
@@ -11,26 +9,17 @@ impl RendererCore {
         (doc == self.nav.location().document()).then_some(&self.page.view)
     }
 
-    fn visible_view_mut_for_doc(
-        &mut self,
-        doc: usize,
-    ) -> Option<&mut crate::document_view::DocumentView> {
+    fn visible_view_mut_for_doc(&mut self, doc: usize) -> Option<&mut crate::document_view::DocumentView> {
         (doc == self.nav.location().document()).then_some(&mut self.page.view)
     }
 
     /// Hit-tests the current spine item.
     pub fn hit_test_document_glyph(&self, pos: Point) -> Option<crate::DocumentGlyph> {
-        self.page.view.hit_test_glyph(pos).map(|glyph| crate::DocumentGlyph {
-            doc: self.nav.location().document(),
-            glyph,
-        })
+        self.page.view.hit_test_glyph(pos).map(|glyph| crate::DocumentGlyph { doc: self.nav.location().document(), glyph })
     }
 
     pub fn hit_test_document_image(&self, pos: Point) -> Option<crate::DocumentImage> {
-        self.page.view.geometry().hit_test_image(pos).map(|image| crate::DocumentImage {
-            doc: self.nav.location().document(),
-            image,
-        })
+        self.page.view.geometry().hit_test_image(pos).map(|image| crate::DocumentImage { doc: self.nav.location().document(), image })
     }
 
     fn install_prepared_page(&mut self, prepared: PreparedPage) {
@@ -51,11 +40,7 @@ impl RendererCore {
         };
         let frame = std::mem::take(&mut self.page.view.frame);
         let continuation = self.viewport.continuation();
-        self.prepared_pages.insert(PreparedPage {
-            key,
-            frame,
-            continuation,
-        });
+        self.prepared_pages.insert(PreparedPage { key, frame, continuation });
     }
 
     pub(crate) fn restore_prepared_page_ending_at(&mut self, end_line: usize) -> bool {
@@ -65,58 +50,6 @@ impl RendererCore {
         };
         self.install_prepared_page(prepared);
         true
-    }
-
-    fn prefetch_next_prepared_page(&mut self) {
-        let composition = self.viewport.composition();
-        let continuation = self.viewport.continuation();
-        if composition.direction() != PaintDirection::Forward || continuation.reached_end() {
-            return;
-        }
-
-        let mut next_start_offset_y = continuation.next_start_offset_y();
-        if let Some(end_idx) = self.page.view.frame.page().end_line() {
-            let next_idx = end_idx + 1;
-            if let Some(line) = self.page.view.document.render_view().text().line(next_idx) {
-                next_start_offset_y = line.point().y;
-            }
-        }
-        if next_start_offset_y <= composition.start_offset_y() {
-            return;
-        }
-
-        let saved_viewport = self.viewport;
-        self.viewport.begin_forward_at(next_start_offset_y);
-        let key = self.frame_geometry_cache_key();
-        if self.prepared_pages.contains(key) {
-            self.viewport = saved_viewport;
-            return;
-        }
-
-        let current_frame = std::mem::take(&mut self.page.view.frame);
-        self.prepare_forward();
-        self.page.view.frame.set_geometry_key(key);
-        let continuation = self.viewport.continuation();
-        let prepared = PreparedPage {
-            key,
-            frame: std::mem::take(&mut self.page.view.frame),
-            continuation,
-        };
-        self.page.view.frame = current_frame;
-        self.viewport = saved_viewport;
-        self.prepared_pages.insert(prepared);
-    }
-
-    fn schedule_or_prefetch_adjacent_page(&mut self) {
-        let Some(current_key) = self.page.view.frame.geometry_key() else {
-            return;
-        };
-        if self.prepared_pages.claim_scheduled(current_key) {
-            self.prefetch_next_prepared_page();
-        } else if !self.prepared_pages.is_prefetched(current_key) {
-            self.prepared_pages.mark_scheduled(current_key);
-            self.host.schedule_repaint(Duration::from_millis(25));
-        }
     }
 
     pub(crate) fn open_image_at(&self, position: Point) -> bool {
@@ -132,10 +65,7 @@ impl RendererCore {
         let Ok(bytes) = self.provider.read_bytes(uri) else {
             return false;
         };
-        self.host.emit(crate::RendererEvent::ImageOpened {
-            uri: uri.to_owned(),
-            bytes,
-        });
+        self.host.emit(crate::RendererEvent::ImageOpened { uri: uri.to_owned(), bytes });
         true
     }
 
@@ -173,16 +103,8 @@ impl RendererCore {
                 if previous_line != current_line {
                     let lines_overlap = previous_line
                         .zip(current_line)
-                        .and_then(|(previous_line, current_line)| {
-                            Some((
-                                text_view.line(previous_line)?,
-                                text_view.line(current_line)?,
-                            ))
-                        })
-                        .is_some_and(|(previous_line, current_line)| {
-                            previous_line.start() < current_line.end()
-                                && current_line.start() < previous_line.end()
-                        });
+                        .and_then(|(previous_line, current_line)| Some((text_view.line(previous_line)?, text_view.line(current_line)?)))
+                        .is_some_and(|(previous_line, current_line)| previous_line.start() < current_line.end() && current_line.start() < previous_line.end());
                     if !lines_overlap {
                         text.push('\n');
                     }
@@ -198,13 +120,9 @@ impl RendererCore {
         text.trim().to_owned()
     }
 
-    fn apply_image_poll(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        image_poll: crate::resources::ImagePipelinePoll,
-    ) {
+    fn apply_image_poll(&mut self, glyph_shaper: &mut impl GlyphShaper, image_poll: crate::resources::ImagePipelinePoll) {
         if image_poll.decoded {
-            self.request_resource_repaint();
+            self.revisions.invalidate_resources();
         }
 
         if image_poll.dimensions_changed.is_empty() {
@@ -215,22 +133,8 @@ impl RendererCore {
         let (next_inputs, layout_needed) = apply_image_poll_updates(
             &self.page.inputs,
             &image_poll.dimensions_changed,
-            |image_idx| {
-                images.get(image_idx as usize).map(|resource| {
-                    (
-                        resource.width,
-                        resource.height,
-                        resource.width_attr,
-                        resource.height_attr,
-                    )
-                })
-            },
-            |image_idx| {
-                self.page
-                    .images
-                    .get_decoded(image_idx)
-                    .map(html::resources::DecodedImage::dimensions)
-            },
+            |image_idx| images.get(image_idx as usize).map(|resource| (resource.width, resource.height, resource.width_attr, resource.height_attr)),
+            |image_idx| self.page.images.get_decoded(image_idx).map(html::resources::DecodedImage::dimensions),
         );
 
         if !layout_needed {
@@ -239,76 +143,70 @@ impl RendererCore {
 
         let mut next_inputs = next_inputs;
         next_inputs.image_metrics_revision = next_inputs.image_metrics_revision.next();
-        if let Err(error) = self.apply_pipeline_inputs(next_inputs, glyph_shaper) {
+        if let Err(error) = self.apply_pipeline_inputs_without_repaint(next_inputs, glyph_shaper) {
             self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
         }
     }
 
-    /// Updates viewport-dependent layout and incorporates completed image work.
-    pub fn prepare_frame(&mut self, glyph_shaper: &mut impl GlyphShaper, viewport_size: Size) {
+    /// Incorporates completed image work. This may update the document
+    /// pipeline and must be called from an application update, never from a
+    /// render-phase viewport preparation.
+    pub fn update_resources(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         let image_poll = self.page.images.poll();
         self.apply_image_poll(glyph_shaper, image_poll);
-        self.configure_layout_for_viewport(glyph_shaper, viewport_size);
+    }
+
+    /// Updates viewport composition without touching the document pipeline.
+    pub fn prepare_viewport(&mut self, viewport_size: Size) {
+        let previous_geometry = self.page.view.frame.geometry_key();
+        self.configure_layout_for_viewport_impl(viewport_size);
         let requested_geometry = self.frame_geometry_cache_key();
-        if self.page.view.frame.geometry_key() != Some(requested_geometry)
-            && !self.restore_prepared_page(requested_geometry)
-        {
-            match self.viewport.composition().direction() {
-                PaintDirection::Forward => self.prepare_forward(),
-                PaintDirection::Backward => self.prepare_backward(),
+        if previous_geometry != Some(requested_geometry) {
+            if previous_geometry.is_some_and(|previous| can_reproject_width_only(previous, requested_geometry)) {
+                let previous = previous_geometry.expect("width-only reprojection requires installed geometry");
+                self.page.view.frame.reproject_columns(
+                    f64::from_bits(previous.column_width_bits),
+                    f64::from_bits(previous.column_gap_bits),
+                    f64::from_bits(requested_geometry.column_width_bits),
+                    f64::from_bits(requested_geometry.column_gap_bits),
+                );
+            } else if !self.restore_prepared_page(requested_geometry) {
+                match self.viewport.composition().direction() {
+                    PaintDirection::Forward => self.prepare_forward(),
+                    PaintDirection::Backward => self.prepare_backward(),
+                }
             }
-            self.page
-                .view
-                .frame
-                .set_geometry_key(self.frame_geometry_cache_key());
+            self.page.view.frame.set_geometry_key(self.frame_geometry_cache_key());
         }
         self.prefetch_images_for_current_page();
         if self.nav.location().anchor_update_pending() {
-            let view = html_view_navigate::NavView {
-                doc: html_view_doc::DocQuery::new(&self.page.view.document),
-                viewport: &self.viewport,
-                frame: &self.page.view.frame,
-            };
+            let view = html_view_navigate::NavView { doc: html_view_doc::DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
             self.nav.update_nav_anchor_from_layout(view);
             self.update_nav_signal();
             self.nav.mark_anchor_clean();
         }
         self.update_nav_signal();
-        self.schedule_or_prefetch_adjacent_page();
     }
 
-    pub(crate) fn configure_layout_for_viewport(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        viewport_size: Size,
-    ) {
-        let plan = self
-            .page
-            .view
-            .layout
-            .begin_viewport_reconfiguration(viewport_size);
-        let requested_col_width = plan.requested_column_width();
-        let viewport_height = (self.page.view.layout.size.height.is_finite() && self.page.view.layout.size.height > 0.0).then_some(self.page.view.layout.size.height);
-        let media_environment = html::pipeline::MediaEnvironment::screen(requested_col_width, viewport_height).expect("effective viewport dimensions must be finite and positive");
-        let media_environment_changed = self.page.inputs.style_environment.media != media_environment;
-        let accepted_width = if plan.column_width_changed() || media_environment_changed {
-            match self.relayout_for_column_width(glyph_shaper, requested_col_width) {
-                Ok(()) => Some(requested_col_width),
-                Err(error) => {
-                    self.emit_operation_failed(
-                        crate::RendererOperation::UpdateDocument,
-                        error.to_string(),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        self.page
-            .view
-            .layout
-            .finish_viewport_reconfiguration(accepted_width);
+    /// Incorporates resources and then prepares viewport composition.
+    /// Application adapters should prefer the two explicit operations so the
+    /// pipeline-capable resource update cannot leak into a render phase.
+    pub fn prepare_frame(&mut self, glyph_shaper: &mut impl GlyphShaper, viewport_size: Size) {
+        self.update_resources(glyph_shaper);
+        self.prepare_viewport(viewport_size);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_layout_for_viewport(&mut self, _glyph_shaper: &mut impl GlyphShaper, viewport_size: Size) {
+        self.configure_layout_for_viewport_impl(viewport_size);
+    }
+
+    fn configure_layout_for_viewport_impl(&mut self, viewport_size: Size) {
+        self.page.view.layout.begin_viewport_reconfiguration(viewport_size);
+        // Window dimensions affect fragmentainer composition only. Document
+        // layout uses the reader's explicit column-width setting and is
+        // updated only by an explicit renderer command or resource change.
+        self.page.view.layout.finish_viewport_reconfiguration(None);
     }
 
     /// Returns whether a point in renderer-layout coordinates is over the
@@ -320,13 +218,7 @@ impl RendererCore {
         let Some(view) = self.visible_view_for_doc(hit.doc) else {
             return false;
         };
-        if view
-            .document
-            .render_view()
-            .addressing()
-            .link_for_glyph(hit.glyph)
-            .is_none()
-        {
+        if view.document.render_view().addressing().link_for_glyph(hit.glyph).is_none() {
             return false;
         }
         let geometry = view.geometry();
@@ -339,11 +231,7 @@ impl RendererCore {
         let Some(line) = view.document.render_view().text().line(line_idx) else {
             return false;
         };
-        let (x0, x1) = geometry.glyph_x_span_in_line(
-            &line,
-            hit.glyph,
-            hit.glyph.saturating_add(1).min(line.end()),
-        );
+        let (x0, x1) = geometry.glyph_x_span_in_line(&line, hit.glyph, hit.glyph.saturating_add(1).min(line.end()));
         let (x0, x1) = (screen.point.x + x0, screen.point.x + x1);
         position.x >= x0 && position.x <= x1
     }
@@ -365,18 +253,9 @@ impl RendererCore {
     }
 
     pub fn update_selection_at(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        let active_doc = self
-            .page
-            .view
-            .selection
-            .interaction()
-            .is_selecting()
-            .then(|| self.nav.location().document());
+        let active_doc = self.page.view.selection.interaction().is_selecting().then(|| self.nav.location().document());
         let Some(doc) = active_doc else { return false };
-        if self
-            .hit_test_document_glyph(position)
-            .is_none_or(|hit| hit.doc != doc)
-        {
+        if self.hit_test_document_glyph(position).is_none_or(|hit| hit.doc != doc) {
             return false;
         }
         let Some(view) = self.visible_view_mut_for_doc(doc) else {
@@ -404,54 +283,28 @@ impl RendererCore {
         };
 
         let view = self.visible_view_for_doc(doc)?;
-        if let (Some((start, end)), Some(exact_text)) = (
-            view.selection_view().range(),
-            view.selection.content().plain().map(str::to_owned),
-        ) && let Some(cfi_range) =
-            crate::cfi::generate_cfi_range(&view.document, doc, start, end)
+        if let (Some((start, end)), Some(exact_text)) = (view.selection_view().range(), view.selection.content().plain().map(str::to_owned))
+            && let Some(cfi_range) = crate::cfi::generate_cfi_range(&view.document, doc, start, end)
         {
             let prefix_start = start.saturating_sub(48);
             let glyph_count = view.document.render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
-            let prefix = view
-                .doc()
-                .build_selection_text(prefix_start, start)
-                .0
-                .filter(|value| !value.is_empty());
-            let suffix = view
-                .doc()
-                .build_selection_text(end, suffix_end)
-                .0
-                .filter(|value| !value.is_empty());
-            self.host.emit(crate::RendererEvent::SelectionFinished {
-                doc,
-                cfi_range,
-                exact_text,
-                prefix,
-                suffix,
-            });
+            let prefix = view.doc().build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
+            let suffix = view.doc().build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
+            self.host.emit(crate::RendererEvent::SelectionFinished { doc, cfi_range, exact_text, prefix, suffix });
         }
         click.map(|glyph| crate::DocumentGlyph { doc, glyph })
     }
 
     pub fn copy_selection_to_clipboard(&self) -> Result<bool, String> {
-        if let Some(text) = self
-            .note
-            .as_ref()
-            .and_then(|note| note.selection.content().markdown())
-        {
+        if let Some(text) = self.note.as_ref().and_then(|note| note.selection.content().markdown()) {
             self.host.set_clipboard(text)?;
             return Ok(true);
         }
         if self.page.view.table_selection.is_active() {
             return self.copy_table_selection();
         }
-        let text = self
-            .page
-            .view
-            .selection
-            .content()
-            .markdown();
+        let text = self.page.view.selection.content().markdown();
         let Some(text) = text else {
             return Ok(false);
         };
@@ -459,28 +312,26 @@ impl RendererCore {
         Ok(true)
     }
 
-    pub(crate) fn copy_document_image_to_clipboard(
-        &self,
-        hit: crate::DocumentImage,
-    ) -> Result<(), String> {
+    pub(crate) fn copy_document_image_to_clipboard(&self, hit: crate::DocumentImage) -> Result<(), String> {
         if hit.doc != self.nav.location().document() {
             return Err(format!("document {} is not visible", hit.doc));
         }
-        let decoded = self.page.images
-            .get_decoded(hit.image)
-            .ok_or_else(|| format!("image {} is not decoded yet", hit.image))?;
+        let decoded = self.page.images.get_decoded(hit.image).ok_or_else(|| format!("image {} is not decoded yet", hit.image))?;
         match decoded {
-            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(
-                image.width as usize,
-                image.height as usize,
-                image.data.data().to_vec(),
-            ),
-            html::resources::DecodedImage::Svg { bytes, .. } => {
-                self.host.set_clipboard_svg(bytes.to_vec())
-            }
+            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(image.width as usize, image.height as usize, image.data.data().to_vec()),
+            html::resources::DecodedImage::Svg { bytes, .. } => self.host.set_clipboard_svg(bytes.to_vec()),
         }
     }
+}
 
+fn can_reproject_width_only(previous: FrameGeometryCacheKey, requested: FrameGeometryCacheKey) -> bool {
+    previous.layout_revision == requested.layout_revision
+        && previous.viewport_height_bits == requested.viewport_height_bits
+        && previous.column_width_bits == requested.column_width_bits
+        && previous.column_count == requested.column_count
+        && previous.scale_bits == requested.scale_bits
+        && previous.page_offset_bits == requested.page_offset_bits
+        && previous.direction == requested.direction
 }
 
 fn apply_image_poll_updates(
@@ -490,13 +341,10 @@ fn apply_image_poll_updates(
     let mut layout_needed = false;
 
     for image_idx in dimensions_changed {
-        let (resource_width, resource_height, width_attr, height_attr) =
-            match image_metadata(*image_idx) {
-                Some((resource_width, resource_height, width_attr, height_attr)) => {
-                    (resource_width, resource_height, width_attr, height_attr)
-                }
-                None => continue,
-            };
+        let (resource_width, resource_height, width_attr, height_attr) = match image_metadata(*image_idx) {
+            Some((resource_width, resource_height, width_attr, height_attr)) => (resource_width, resource_height, width_attr, height_attr),
+            None => continue,
+        };
         let Some((decoded_width, decoded_height)) = decode_sizes(*image_idx) else {
             continue;
         };
@@ -518,11 +366,7 @@ mod tests {
     use super::apply_image_poll_updates;
 
     fn test_resources() -> Vec<(u32, u32, Option<u32>, Option<u32>)> {
-        vec![
-            (64, 32, None, None),
-            (12, 12, Some(12), Some(12)),
-            (40, 80, Some(40), None),
-        ]
+        vec![(64, 32, None, None), (12, 12, Some(12), Some(12)), (40, 80, Some(40), None)]
     }
 
     fn base_inputs() -> html::pipeline::PipelineInputs {

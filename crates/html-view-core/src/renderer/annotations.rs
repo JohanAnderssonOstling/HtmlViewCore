@@ -22,5 +22,4 @@ impl RendererCore {
         let doc = DocQuery::new(&self.page.view.document);
         self.annotations.resolve(doc, current_doc);
     }
-
 }

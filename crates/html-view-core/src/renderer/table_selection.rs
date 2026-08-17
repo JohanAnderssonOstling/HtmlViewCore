@@ -9,14 +9,18 @@ impl RendererCore {
     }
 
     pub fn begin_table_selection_at(&mut self, position: Point) -> bool {
-        let Some(hit) = self.selection_view().table_hit(position) else { return false };
+        let Some(hit) = self.selection_view().table_hit(position) else {
+            return false;
+        };
         self.page.view.table_selection.begin(hit);
         self.request_overlay_repaint();
         true
     }
 
     pub(crate) fn begin_table_selection_drag(&mut self, position: Point) -> bool {
-        let Some(hit) = self.selection_view().table_hit(position) else { return false };
+        let Some(hit) = self.selection_view().table_hit(position) else {
+            return false;
+        };
         if !self.page.view.table_selection.begin_drag(hit) {
             return false;
         }
@@ -59,9 +63,10 @@ impl RendererCore {
     }
 
     fn copy_to_clipboard(&self, payload: Option<String>) -> Result<bool, String> {
-        let Some(text) = payload else { return Ok(false) };
+        let Some(text) = payload else {
+            return Ok(false);
+        };
         self.host.set_clipboard(&text)?;
         Ok(true)
     }
-
 }

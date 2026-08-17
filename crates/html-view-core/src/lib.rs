@@ -28,22 +28,15 @@ mod prepared_page;
 mod spine_item;
 
 pub mod layout {
-    pub use html::layout::{
-        LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument,
-        ShapeError, ShapedDocument,
-    };
+    pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
 }
 
 pub mod parser {
-    pub use html::pipeline::{
-        BuildPipelineTimings, DocumentFactory, ParsedHtml, parse_html_document,
-    };
+    pub use html::pipeline::{BuildPipelineTimings, DocumentFactory, ParsedHtml, parse_html_document};
 }
 
 pub mod resources {
-    pub use html::resources::{
-        FileSystemProvider, ImagePipelinePoll, ResourceMetadata, ResourceProvider, TocEntry,
-    };
+    pub use html::resources::{FileSystemProvider, ImagePipelinePoll, ResourceMetadata, ResourceProvider, TocEntry};
 }
 
 /// Renderer-neutral text backend contract. UI adapters should use this module
@@ -56,12 +49,10 @@ pub mod text_backend {
 }
 
 pub use html::layout::LaidOutDocument;
-pub use html::render::{Painter, RecordingPainter};
+pub use html::render::{Painter, RecordingPainter, TextRunFragment};
 
 mod session;
-pub use session::{
-    FramePainter, PointerDownOptions, PointerMoveOutcome, PreparedFrame, RendererSession,
-};
+pub use session::{FramePainter, PointerDownOptions, PointerMoveOutcome, PreparedFrame, RendererSession};
 
 const DEFAULT_DOCUMENT_CACHE_CAPACITY: usize = 3;
 
@@ -70,35 +61,17 @@ fn document_text_index(source: &str, uri: &str) -> Option<html::parse::DocumentT
     html::parse::DocumentTextIndex::from_parsed(&parsed).ok()
 }
 
-pub fn search_publication(
-    provider: &dyn ResourceProvider,
-    document_uris: &[String],
-    query: &str,
-    options: SearchOptions,
-) -> Vec<BookSearchMatch> {
+pub fn search_publication(provider: &dyn ResourceProvider, document_uris: &[String], query: &str, options: SearchOptions) -> Vec<BookSearchMatch> {
     search_publication_cancellable(provider, document_uris, query, options, || false)
 }
 
-pub fn search_publication_cancellable(
-    provider: &dyn ResourceProvider,
-    document_uris: &[String],
-    query: &str,
-    options: SearchOptions,
-    cancelled: impl FnMut() -> bool,
-) -> Vec<BookSearchMatch> {
+pub fn search_publication_cancellable(provider: &dyn ResourceProvider, document_uris: &[String], query: &str, options: SearchOptions, cancelled: impl FnMut() -> bool) -> Vec<BookSearchMatch> {
     search_publication_streaming(provider, document_uris, query, options, cancelled, |_| {})
 }
 
 /// Searches a publication cooperatively and reports bounded incremental
 /// batches. The returned vector is retained for non-streaming callers.
-pub fn search_publication_streaming(
-    provider: &dyn ResourceProvider,
-    document_uris: &[String],
-    query: &str,
-    options: SearchOptions,
-    mut cancelled: impl FnMut() -> bool,
-    mut on_batch: impl FnMut(&[BookSearchMatch]),
-) -> Vec<BookSearchMatch> {
+pub fn search_publication_streaming(provider: &dyn ResourceProvider, document_uris: &[String], query: &str, options: SearchOptions, mut cancelled: impl FnMut() -> bool, mut on_batch: impl FnMut(&[BookSearchMatch])) -> Vec<BookSearchMatch> {
     const MAX_RESULTS: usize = 10_000;
     const BATCH_SIZE: usize = 64;
     if query.is_empty() {
@@ -127,17 +100,8 @@ pub fn search_publication_streaming(
             };
             let excerpt_start = start.saturating_sub(42);
             let excerpt_end = (end + 70).min(chars.len());
-            let excerpt = chars[excerpt_start..excerpt_end]
-                .iter()
-                .collect::<String>()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            results.push(BookSearchMatch {
-                doc,
-                target: BookSearchTarget::SourceCfi(crate::cfi::generate_cfi_from_source_position(doc, &position)),
-                excerpt,
-            });
+            let excerpt = chars[excerpt_start..excerpt_end].iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+            results.push(BookSearchMatch { doc, target: BookSearchTarget::SourceCfi(crate::cfi::generate_cfi_from_source_position(doc, &position)), excerpt });
             if results.len() - batch_start >= BATCH_SIZE {
                 on_batch(&results[batch_start..]);
                 batch_start = results.len();
@@ -150,27 +114,10 @@ pub fn search_publication_streaming(
     results
 }
 
-pub fn publication_text_lengths(
-    provider: &dyn ResourceProvider,
-    document_uris: &[String],
-) -> Vec<u64> {
+pub fn publication_text_lengths(provider: &dyn ResourceProvider, document_uris: &[String]) -> Vec<u64> {
     document_uris
         .iter()
-        .map(|uri| {
-            provider
-                .read_string(uri)
-                .ok()
-                .and_then(|source| document_text_index(&source, uri))
-                .map(|index| {
-                    index
-                        .text()
-                        .chars()
-                        .filter(|character| !character.is_whitespace())
-                        .count() as u64
-                })
-                .unwrap_or(1)
-                .max(1)
-        })
+        .map(|uri| provider.read_string(uri).ok().and_then(|source| document_text_index(&source, uri)).map(|index| index.text().chars().filter(|character| !character.is_whitespace()).count() as u64).unwrap_or(1).max(1))
         .collect()
 }
 
@@ -178,13 +125,12 @@ pub fn publication_text_lengths(
 struct FrameScratch {
     line_position_buffers: Vec<Vec<LineScreen>>,
     desired_images: HashSet<u32>,
+    pagination: html_view_paginate::PaginationScratch,
 }
 
 impl FrameScratch {
     fn take_line_position_buffer(&mut self, frame: &mut VisibleFrame) -> Vec<LineScreen> {
-        self.line_position_buffers
-            .pop()
-            .unwrap_or_else(|| frame.take_line_positions().into_buffer())
+        self.line_position_buffers.pop().unwrap_or_else(|| frame.take_line_positions().into_buffer())
     }
 
     fn recycle_line_position_buffer(&mut self, mut buffer: Vec<LineScreen>) {
@@ -206,15 +152,9 @@ mod frame_cache_tests {
     #[test]
     fn visible_line_positions_keep_global_indexes_and_reuse_capacity() {
         let mut buffer = Vec::with_capacity(32);
-        buffer.push(LineScreen {
-            point: Point::new(0.0, 0.0),
-            col_index: 0,
-        });
+        buffer.push(LineScreen { point: Point::new(0.0, 0.0), col_index: 0 });
         let mut positions = VisibleLinePositions::with_buffer(40, buffer);
-        positions.push(LineScreen {
-            point: Point::new(10.0, 20.0),
-            col_index: 1,
-        });
+        positions.push(LineScreen { point: Point::new(10.0, 20.0), col_index: 1 });
 
         assert_eq!(positions.first_line(), 40);
         assert_eq!(positions.last_line(), Some(40));
@@ -284,14 +224,15 @@ impl RendererCore {
             page_offset_bits: geometry.page_offset_bits,
             direction: geometry.direction,
         };
-        FrameDisplayCacheKeys {
-            base: key(self.revisions.base_display, self.revisions.resources),
-            overlay: key(self.revisions.overlay, 0),
-        }
+        FrameDisplayCacheKeys { base: key(self.revisions.base_display, self.revisions.resources), overlay: key(self.revisions.overlay, 0) }
     }
 
     pub fn frame_geometry_cache_key(&self) -> FrameGeometryCacheKey {
-        let composition = self.viewport.composition();
+        self.frame_geometry_cache_key_for(&self.viewport)
+    }
+
+    fn frame_geometry_cache_key_for(&self, viewport: &ViewportState) -> FrameGeometryCacheKey {
+        let composition = viewport.composition();
         FrameGeometryCacheKey {
             layout_revision: self.revisions.layout,
             viewport_width_bits: self.page.view.layout.size.width.to_bits(),
@@ -315,11 +256,6 @@ impl RendererCore {
 
     fn request_overlay_repaint(&mut self) {
         self.revisions.invalidate_overlay();
-        self.host.request_repaint();
-    }
-
-    fn request_resource_repaint(&mut self) {
-        self.revisions.invalidate_resources();
         self.host.request_repaint();
     }
 
@@ -351,24 +287,16 @@ impl RendererCore {
     }
 
     pub(crate) fn emit_operation_failed(&self, operation: RendererOperation, message: String) {
-        self.host
-            .emit(RendererEvent::OperationFailed { operation, message });
+        self.host.emit(RendererEvent::OperationFailed { operation, message });
     }
 
-    pub fn new(
-        host: Rc<dyn RendererHost>,
-        loaded: load::LoadedRenderDocument,
-        provider: Arc<dyn ResourceProvider>,
-        document_uris: Vec<String>,
-        current_doc_index: usize,
-        config: RendererInitialConfig,
-    ) -> Self {
+    pub fn new(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig) -> Self {
         let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
         let image_service = ImageService::new(provider.clone(), ImageService::DEFAULT_BYTE_BUDGET);
-        let image_pipeline =
-            ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
+        image_service.set_completion_waker(host.resource_waker());
+        let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
         let layout = ColumnLayout { col_width: column_width, base_col_width: column_width, scale: config.scale.clamp(0.5, 3.0), max_col_count: config.max_column_count.map(|count| count.max(1)), ..Default::default() };
@@ -379,12 +307,7 @@ impl RendererCore {
         }
         Self {
             host,
-            page: SpineItem {
-                session: loaded.session,
-                inputs: loaded.inputs,
-                images: image_pipeline,
-                view: DocumentView::new(document, layout),
-            },
+            page: SpineItem { session: loaded.session, inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(document, layout) },
             note: None,
             note_document: None,
             provider,
@@ -434,11 +357,15 @@ impl RendererCore {
         next
     }
 
-    fn apply_pipeline_inputs(
-        &mut self,
-        requested_inputs: PipelineInputs,
-        glyph_shaper: &mut impl GlyphShaper,
-    ) -> Result<(), html::pipeline::PipelineError> {
+    fn apply_pipeline_inputs(&mut self, requested_inputs: PipelineInputs, glyph_shaper: &mut impl GlyphShaper) -> Result<(), html::pipeline::PipelineError> {
+        self.apply_pipeline_inputs_impl(requested_inputs, glyph_shaper, true)
+    }
+
+    fn apply_pipeline_inputs_without_repaint(&mut self, requested_inputs: PipelineInputs, glyph_shaper: &mut impl GlyphShaper) -> Result<(), html::pipeline::PipelineError> {
+        self.apply_pipeline_inputs_impl(requested_inputs, glyph_shaper, false)
+    }
+
+    fn apply_pipeline_inputs_impl(&mut self, requested_inputs: PipelineInputs, glyph_shaper: &mut impl GlyphShaper, request_repaint: bool) -> Result<(), html::pipeline::PipelineError> {
         // Before the first frame, `current_glyph_position` resolves to the
         // document's first glyph even when decoration or replaced content
         // precedes it. Relayout at the true document start must preserve the
@@ -456,19 +383,10 @@ impl RendererCore {
         let anchor_cfi = if preserve_document_start { None } else { self.nav.current_cfi(self.nav_view()) };
 
         self.host.set_glyph_document(self.nav.location().document());
-        let update = self
-            .page
-            .session
-            .update(requested_inputs.clone(), glyph_shaper)?;
+        let update = self.page.session.update(requested_inputs.clone(), glyph_shaper)?;
 
-        let document = self.page.session.document().cloned().ok_or_else(|| {
-            html::pipeline::PipelineError(
-                "pipeline update completed without a laid-out document".to_owned(),
-            )
-        })?;
-        self.root_font_size = self
-            .page
-            .install_pipeline_result(document, requested_inputs);
+        let document = self.page.session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
+        self.root_font_size = self.page.install_pipeline_result(document, requested_inputs);
         if update.stage == EarliestStage::None {
             // reset_view_state also clears selection even when all pipeline
             // products were reusable.
@@ -488,34 +406,21 @@ impl RendererCore {
             self.restore_glyph_position(glyph_idx);
         }
 
-        self.host.request_repaint();
+        if request_repaint {
+            self.host.request_repaint();
+        }
         Ok(())
     }
 
     pub fn emit_state_snapshot(&mut self) {
-        self.host.emit(RendererEvent::TitleChanged(
-            self.page
-                .view
-                .document
-                .render_view()
-                .title()
-                .map(str::to_owned),
-        ));
-        self.host.emit(RendererEvent::TocChanged(
-            Self::build_document_toc_entries_for(&self.page.view.document),
-        ));
+        self.host.emit(RendererEvent::TitleChanged(self.page.view.document.render_view().title().map(str::to_owned)));
+        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.view.document)));
         self.nav.history.emit_availability(self.host.as_ref());
-        self.host.emit(RendererEvent::SearchActiveChanged(
-            self.highlight.is_active(),
-        ));
+        self.host.emit(RendererEvent::SearchActiveChanged(self.highlight.is_active()));
         self.highlight.emit_match_signal(self.host.as_ref());
-        self.host.emit(RendererEvent::ColumnWidthChanged(
-            self.page.view.layout.base_col_width,
-        ));
-        self.host
-            .emit(RendererEvent::FontSizeChanged(self.root_font_size));
-        self.host
-            .emit(RendererEvent::ScaleChanged(self.page.view.layout.scale));
+        self.host.emit(RendererEvent::ColumnWidthChanged(self.page.view.layout.base_col_width));
+        self.host.emit(RendererEvent::FontSizeChanged(self.root_font_size));
+        self.host.emit(RendererEvent::ScaleChanged(self.page.view.layout.scale));
         self.update_nav_signal();
     }
 
@@ -541,9 +446,7 @@ impl RendererCore {
                 self.set_cfi_position(&cfi);
             }
             RendererCommand::SetCfiPosition(None) => {}
-            RendererCommand::SetProgressFraction(fraction) => {
-                self.set_progress_fraction(glyph_shaper, fraction)
-            }
+            RendererCommand::SetProgressFraction(fraction) => self.set_progress_fraction(glyph_shaper, fraction),
             RendererCommand::SetDocumentTextLengths(lengths) => {
                 if self.nav.install_document_text_lengths(lengths) {
                     self.update_nav_signal();
@@ -563,10 +466,7 @@ impl RendererCore {
                 if inputs.reader_overrides != overrides {
                     inputs.reader_overrides = overrides;
                     if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
-                        self.emit_operation_failed(
-                            RendererOperation::UpdateDocument,
-                            error.to_string(),
-                        );
+                        self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
                     }
                 }
             }
@@ -581,10 +481,7 @@ impl RendererCore {
                     // the new one and cannot be navigated back into.
                     self.document_cache.clear();
                     if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
-                        self.emit_operation_failed(
-                            RendererOperation::UpdateDocument,
-                            error.to_string(),
-                        );
+                        self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
                     }
                 }
             }
@@ -593,10 +490,7 @@ impl RendererCore {
                 if inputs.layout.image_sizing_policy != policy {
                     inputs.layout.image_sizing_policy = policy;
                     if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
-                        self.emit_operation_failed(
-                            RendererOperation::UpdateDocument,
-                            error.to_string(),
-                        );
+                        self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
                     }
                 }
             }
@@ -605,10 +499,7 @@ impl RendererCore {
                 if inputs.layout.text_composition_policy != policy {
                     inputs.layout.text_composition_policy = policy;
                     if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
-                        self.emit_operation_failed(
-                            RendererOperation::UpdateDocument,
-                            error.to_string(),
-                        );
+                        self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
                     }
                 }
             }
@@ -622,19 +513,9 @@ impl RendererCore {
             RendererCommand::ActivateSearch => self.activate_search(),
             RendererCommand::DeactivateSearch => self.deactivate_search(),
             RendererCommand::SetSearchQuery(query) => self.set_search_query(&query),
-            RendererCommand::SetSearch { query, options } => {
-                self.set_search(glyph_shaper, &query, options)
-            }
-            RendererCommand::SetSearchResults {
-                query,
-                options,
-                results,
-            } => self.set_search_results(glyph_shaper, query, options, results),
-            RendererCommand::AppendSearchResults {
-                query,
-                options,
-                results,
-            } => self.append_search_results(glyph_shaper, query, options, results),
+            RendererCommand::SetSearch { query, options } => self.set_search(glyph_shaper, &query, options),
+            RendererCommand::SetSearchResults { query, options, results } => self.set_search_results(glyph_shaper, query, options, results),
+            RendererCommand::AppendSearchResults { query, options, results } => self.append_search_results(glyph_shaper, query, options, results),
             RendererCommand::NavigateSearch(step) if step > 0 => self.next_match(glyph_shaper),
             RendererCommand::NavigateSearch(_) => self.prev_match(glyph_shaper),
             RendererCommand::SetAnnotations(annotations) => {
@@ -678,18 +559,9 @@ impl RendererCore {
         }
     }
 
-    pub(crate) fn set_position(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        document: usize,
-        glyph: Option<u32>,
-    ) {
+    pub(crate) fn set_position(&mut self, glyph_shaper: &mut impl GlyphShaper, document: usize, glyph: Option<u32>) {
         if document != self.nav.location().document() {
-            self.load_document_at(
-                glyph_shaper,
-                document,
-                glyph.map(DocAnchor::Glyph).unwrap_or(DocAnchor::Start),
-            );
+            self.load_document_at(glyph_shaper, document, glyph.map(DocAnchor::Glyph).unwrap_or(DocAnchor::Start));
         } else if let Some(glyph) = glyph {
             self.restore_glyph_position(glyph);
             self.host.request_repaint();
@@ -723,11 +595,7 @@ impl RendererCore {
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
         let document_count = self.nav.documents().uris().len();
         self.nav.toc_anchors.set_strings_by_doc(anchors_by_doc, document_count);
-        let view = html_view_navigate::NavView {
-            doc: DocQuery::new(&self.page.view.document),
-            viewport: &self.viewport,
-            frame: &self.page.view.frame,
-        };
+        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
     }
 
@@ -745,12 +613,7 @@ impl RendererCore {
         }
     }
 
-    pub fn set_search(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        query: &str,
-        options: SearchOptions,
-    ) {
+    pub fn set_search(&mut self, glyph_shaper: &mut impl GlyphShaper, query: &str, options: SearchOptions) {
         self.highlight.restart(query.to_owned(), options);
         let local_scope = options.scope == SearchScope::CurrentDocument;
         if query.is_empty() {
@@ -759,14 +622,8 @@ impl RendererCore {
             let matches = self.doc().find_matches_with_options(query, options);
             self.highlight.set_local_matches(self.nav.location().document(), matches);
         } else {
-            let results = search_publication(
-                self.provider.as_ref(),
-                self.nav.documents().uris(),
-                query,
-                options,
-            );
-            self.highlight
-                .set_results(query.to_owned(), options, results);
+            let results = search_publication(self.provider.as_ref(), self.nav.documents().uris(), query, options);
+            self.highlight.set_results(query.to_owned(), options, results);
             self.navigate_to_book_match(glyph_shaper);
         }
         self.highlight.emit_results(self.host.as_ref());
@@ -777,13 +634,7 @@ impl RendererCore {
         }
     }
 
-    pub fn set_search_results(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        query: String,
-        options: SearchOptions,
-        results: Vec<BookSearchMatch>,
-    ) {
+    pub fn set_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
         self.highlight.set_results(query, options, results);
         if self.highlight.is_empty() {
             self.request_overlay_repaint();
@@ -793,13 +644,7 @@ impl RendererCore {
         self.highlight.emit_results(self.host.as_ref());
     }
 
-    pub fn append_search_results(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        query: String,
-        options: SearchOptions,
-        results: Vec<BookSearchMatch>,
-    ) {
+    pub fn append_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
         if self.highlight.append_results(query, options, results) {
             self.navigate_to_book_match(glyph_shaper);
         } else {
@@ -815,9 +660,7 @@ impl RendererCore {
         if hit.doc != self.nav.location().document() {
             self.set_position(glyph_shaper, hit.doc, None);
         }
-        let matches = self
-            .doc()
-            .find_matches_with_options(self.highlight.query(), self.highlight.options());
+        let matches = self.doc().find_matches_with_options(self.highlight.query(), self.highlight.options());
         self.highlight.install_visible_matches(matches);
         let occurrence = match hit.target {
             BookSearchTarget::LocalOccurrence(occurrence) => Some(occurrence),

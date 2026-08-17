@@ -1,4 +1,3 @@
-
 use crate::RendererCore;
 
 impl RendererCore {
@@ -20,13 +19,12 @@ impl RendererCore {
         self.viewport.begin_forward_at((line_y - 40.0).max(0.0));
         self.request_overlay_repaint();
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use html_view_doc::find_text_matches;
     use crate::{SearchOptions, SearchScope};
+    use html_view_doc::find_text_matches;
 
     fn options() -> SearchOptions {
         SearchOptions { match_case: false, whole_word: false, match_diacritics: false, scope: SearchScope::WholeBook }

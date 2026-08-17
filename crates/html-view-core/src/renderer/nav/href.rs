@@ -4,35 +4,20 @@ use super::*;
 
 impl RendererCore {
     fn resolve_doc_index_for_path(&self, path: &str) -> Option<usize> {
-        let base_uri = self
-            .nav
-            .documents()
-            .uris()
-            .get(self.nav.location().document())
-            .map(String::as_str)?;
+        let base_uri = self.nav.documents().uris().get(self.nav.location().document()).map(String::as_str)?;
         let resolved = self.provider.resolve(base_uri, path);
 
         // The provider owns resource identity and URI resolution. Navigation
         // accepts only one exact, unambiguous occurrence of that identifier in
         // the spine. It never guesses from the raw href or a partial path.
-        let mut matches = self
-            .nav
-            .documents()
-            .uris()
-            .iter()
-            .enumerate()
-            .filter(|(_, uri)| *uri == &resolved)
-            .map(|(index, _)| index);
+        let mut matches = self.nav.documents().uris().iter().enumerate().filter(|(_, uri)| *uri == &resolved).map(|(index, _)| index);
         let index = matches.next()?;
         matches.next().is_none().then_some(index)
     }
 
     pub(crate) fn resolve_href_target(&self, href: &str) -> Option<(usize, Option<String>)> {
         if let Some(anchor) = href.strip_prefix('#') {
-            return Some((
-                self.nav.location().document(),
-                NavigationState::fragment_part(anchor),
-            ));
+            return Some((self.nav.location().document(), NavigationState::fragment_part(anchor)));
         }
 
         let (path_part, fragment) = href.split_once('#').unwrap_or((href, ""));
@@ -86,17 +71,9 @@ impl RendererCore {
         self.navigate_history_step(glyph_shaper, 1)
     }
 
-    fn navigate_to_location(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        target: html_view_navigate::Location,
-    ) -> bool {
+    fn navigate_to_location(&mut self, glyph_shaper: &mut impl GlyphShaper, target: html_view_navigate::Location) -> bool {
         let html_view_navigate::Location { doc: doc_index, anchor } = target;
-        if doc_index >= self.nav.documents().uris().len()
-            || anchor
-                .as_deref()
-                .is_some_and(|anchor| !self.ensure_navigation_anchor(glyph_shaper, doc_index, anchor))
-        {
+        if doc_index >= self.nav.documents().uris().len() || anchor.as_deref().is_some_and(|anchor| !self.ensure_navigation_anchor(glyph_shaper, doc_index, anchor)) {
             return false;
         }
         if doc_index != self.nav.location().document() {
@@ -124,12 +101,7 @@ impl RendererCore {
     /// Ensures a target anchor exists before navigation mutates the current
     /// document or history cursor. A newly inspected document is retained in
     /// the normal cache for the subsequent committed navigation.
-    fn ensure_navigation_anchor(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        doc_index: usize,
-        anchor: &str,
-    ) -> bool {
+    fn ensure_navigation_anchor(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize, anchor: &str) -> bool {
         if doc_index == self.nav.location().document() {
             return Self::document_has_anchor(&self.page.view.document, anchor);
         }

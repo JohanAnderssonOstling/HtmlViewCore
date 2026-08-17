@@ -4,11 +4,7 @@ use super::*;
 
 impl RendererCore {
     pub(super) fn spine_item(&self, loaded: load::LoadedRenderDocument) -> SpineItem {
-        SpineItem::new(
-            loaded,
-            self.page.view.layout.clone(),
-            self.image_service.clone(),
-        )
+        SpineItem::new(loaded, self.page.view.layout.clone(), self.image_service.clone())
     }
 
     /// Makes `item` the page. Everything addressed by a document -- its
@@ -23,22 +19,9 @@ impl RendererCore {
         self.revisions.invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
         self.revisions.invalidate_resources();
         self.reset_view_state();
-        self.host.emit(RendererEvent::TitleChanged(
-            self.page
-                .view
-                .document
-                .render_view()
-                .title()
-                .map(str::to_owned),
-        ));
-        self.host.emit(RendererEvent::TocChanged(
-            Self::build_document_toc_entries_for(&self.page.view.document),
-        ));
-        let view = NavView {
-            doc: DocQuery::new(&self.page.view.document),
-            viewport: &self.viewport,
-            frame: &self.page.view.frame,
-        };
+        self.host.emit(RendererEvent::TitleChanged(self.page.view.document.render_view().title().map(str::to_owned)));
+        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.view.document)));
+        let view = NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
         self.resolve_visible_annotations();
         self.resolve_media_overlay_highlight();
@@ -55,28 +38,13 @@ impl RendererCore {
         // once it is being put away.
         let current_index = self.nav.location().document();
         let document = self.page.view.document.clone();
-        let session = mem::replace(
-            &mut self.page.session,
-            html::engine::Engine::new(self.provider.clone()),
-        );
+        let session = mem::replace(&mut self.page.session, html::engine::Engine::new(self.provider.clone()));
         let images = SpineItem::image_pipeline_for(&document, self.image_service.clone());
         let layout = self.page.view.layout.clone();
-        self.document_cache.insert_document(
-            current_index,
-            SpineItem {
-                session,
-                inputs: self.page.inputs.clone(),
-                images,
-                view: DocumentView::new(document, layout),
-            },
-        );
+        self.document_cache.insert_document(current_index, SpineItem { session, inputs: self.page.inputs.clone(), images, view: DocumentView::new(document, layout) });
     }
 
-    pub(crate) fn rebased_inputs_for_doc_index(
-        &self,
-        doc_index: usize,
-        source_inputs: &html::pipeline::PipelineInputs,
-    ) -> html::pipeline::PipelineInputs {
+    pub(crate) fn rebased_inputs_for_doc_index(&self, doc_index: usize, source_inputs: &html::pipeline::PipelineInputs) -> html::pipeline::PipelineInputs {
         let mut next_inputs = source_inputs.clone();
         if let Some(uri) = self.nav.documents().uris().get(doc_index) {
             next_inputs.base_uri = uri.clone();
@@ -100,11 +68,7 @@ impl RendererCore {
         next_inputs
     }
 
-    pub(crate) fn load_document_for_index(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        doc_index: usize,
-    ) -> load::LoadedRenderDocument {
+    pub(crate) fn load_document_for_index(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize) -> load::LoadedRenderDocument {
         // Shaping fills this document's glyph registry, and ids only mean
         // something alongside the document they came from.
         self.host.set_glyph_document(doc_index);
@@ -124,12 +88,7 @@ impl RendererCore {
         )
     }
 
-    pub fn load_document_at(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        doc_index: usize,
-        anchor: DocAnchor,
-    ) {
+    pub fn load_document_at(&mut self, glyph_shaper: &mut impl GlyphShaper, doc_index: usize, anchor: DocAnchor) {
         if doc_index >= self.nav.documents().uris().len() {
             return;
         }
