@@ -10,16 +10,33 @@ enum NoteReferenceKind {
 }
 
 impl RendererCore {
-    fn handle_link_click_at(&mut self, glyph_shaper: &mut impl GlyphShaper, glyph_idx: u32, click_position: Option<Point>) -> bool {
+    fn handle_link_click_at(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        glyph_idx: u32,
+        click_position: Option<Point>,
+    ) -> bool {
         let view = self.page.view.document.render_view();
         let addressing = view.addressing();
         let Some(href_idx) = addressing.link_for_glyph(glyph_idx) else {
             return false;
         };
-        let reference_kind = if addressing.is_note_reference(glyph_idx) { NoteReferenceKind::Explicit } else { NoteReferenceKind::Inferred };
+        let reference_kind = if addressing.is_note_reference(glyph_idx) {
+            NoteReferenceKind::Explicit
+        } else {
+            NoteReferenceKind::Inferred
+        };
         let href = view.string(href_idx).to_string();
-        if let Some(mut preview) = self.footnote_preview_for_reference(glyph_shaper, &href, reference_kind) {
-            preview.anchor = click_position.map(|point| crate::FootnotePopupAnchor::at_click(point, self.page.view.layout.size));
+        if let Some((doc, _)) = self.resolve_href_target(&href) {
+            let hit = crate::DocumentGlyph { doc: self.nav.location().document(), glyph: glyph_idx };
+            if self.defer_document_read(doc, NavigationRequest::Click(hit, click_position)) { return true; }
+        }
+        if let Some(mut preview) =
+            self.footnote_preview_for_reference(glyph_shaper, &href, reference_kind)
+        {
+            preview.anchor = click_position.map(|point| {
+                crate::FootnotePopupAnchor::at_click(point, self.page.view.layout.size)
+            });
             self.host.emit(RendererEvent::FootnoteOpened(preview));
             return true;
         }
@@ -30,17 +47,33 @@ impl RendererCore {
     /// Activates a document-qualified click. A trailing slice is promoted to
     /// the reading cursor first, so link resolution, notes, annotations and
     /// emitted CFIs all use the document that actually received the input.
-    pub(crate) fn handle_document_click(&mut self, glyph_shaper: &mut impl GlyphShaper, hit: crate::DocumentGlyph, click_position: Option<Point>) -> bool {
+    pub(crate) fn handle_document_click(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        hit: crate::DocumentGlyph,
+        click_position: Option<Point>,
+    ) -> bool {
+        if self.defer_document_read(hit.doc, NavigationRequest::Click(hit, click_position)) { return true; }
         if hit.doc != self.nav.location().document() {
             self.load_document_at(glyph_shaper, hit.doc, DocAnchor::Glyph(hit.glyph));
         }
-        if self.annotations.activate_at_glyph(hit.glyph, self.host.as_ref()) {
+        if self
+            .annotations
+            .activate_at_glyph(hit.glyph, self.host.as_ref())
+        {
             return true;
         }
         self.handle_link_click_at(glyph_shaper, hit.glyph, click_position)
     }
 
-    pub(crate) fn footnote_preview(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str) -> Option<crate::FootnotePreview> {
+    pub(crate) fn footnote_preview(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        href: &str,
+    ) -> Option<crate::FootnotePreview> {
+        if let Some((doc, _)) = self.resolve_href_target(href) {
+            if self.defer_document_read(doc, NavigationRequest::Preview(href.to_owned())) { return None; }
+        }
         self.footnote_preview_for_reference(glyph_shaper, href, NoteReferenceKind::Inferred)
     }
 
@@ -51,7 +84,12 @@ impl RendererCore {
     ///
     /// There is nothing to preview when notes read in place: the reference
     /// resolves as an ordinary link to text the reader can already see.
-    fn footnote_preview_for_reference(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str, reference_kind: NoteReferenceKind) -> Option<crate::FootnotePreview> {
+    fn footnote_preview_for_reference(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        href: &str,
+        reference_kind: NoteReferenceKind,
+    ) -> Option<crate::FootnotePreview> {
         if self.note_display == crate::NoteDisplay::AsAuthored {
             return None;
         }
@@ -84,27 +122,60 @@ impl RendererCore {
 
         // One authority for what a note is, whichever document it lives in.
         if matches!(reference_kind, NoteReferenceKind::Inferred) && !is_note_target {
+            if let Some(loaded) = freshly_loaded { self.prepared_navigation = Some((doc, loaded)); }
             return None;
         }
 
         // The host decides how wide a note is shown, so it is laid out to that
         // width here rather than to the page's and stretched on arrival.
-        let width = self.host.note_popup_width().filter(|width| width.is_finite() && *width > 0.0).unwrap_or(self.page.view.layout.col_width);
-        let constraints = html::layout::LayoutConstraints::new(width, self.root_font_size as f64).ok()?;
+        let width = self
+            .host
+            .note_popup_width()
+            .filter(|width| width.is_finite() && *width > 0.0)
+            .unwrap_or(self.page.view.layout.col_width);
+        let constraints =
+            html::layout::LayoutConstraints::new(width, self.root_font_size as f64).ok()?;
         let note = match freshly_loaded.as_mut() {
-            Some(loaded) => loaded.session.layout_note(fragment, constraints, glyph_shaper),
-            None if doc == self.nav.location().document() => self.page.session.layout_note(fragment, constraints, glyph_shaper),
-            None => self.document_cache.document_mut(doc)?.session.layout_note(fragment, constraints, glyph_shaper),
-        }?;
+            Some(loaded) => loaded
+                .session
+                .layout_note(fragment, constraints, glyph_shaper),
+            None if doc == self.nav.location().document() => {
+                self.page
+                    .session
+                    .layout_note(fragment, constraints, glyph_shaper)
+            }
+            None => self.document_cache.document_mut(doc)?.session.layout_note(
+                fragment,
+                constraints,
+                glyph_shaper,
+            ),
+        };
+        let Some(note) = note else {
+            if let Some(loaded) = freshly_loaded { self.prepared_navigation = Some((doc, loaded)); }
+            return None;
+        };
         // Held as a view of its own, so selecting and hit testing inside it go
         // through the same code the page uses.
-        self.note = Some(crate::document_view::DocumentView::new(note.clone(), crate::ColumnLayout { col_width: width, base_col_width: width, ..self.page.view.layout }).framed_whole());
+        self.note = Some(
+            crate::document_view::DocumentView::new(
+                note.clone(),
+                crate::ColumnLayout {
+                    col_width: width,
+                    base_col_width: width,
+                    ..self.page.view.layout
+                },
+            )
+            .framed_whole(),
+        );
         self.note_document = Some(doc);
 
         if let Some(loaded) = freshly_loaded {
             let item = self.spine_item(loaded);
             self.document_cache.insert_document(doc, item);
         }
-        Some(crate::FootnotePreview { href: href.to_owned(), anchor: None })
+        Some(crate::FootnotePreview {
+            href: href.to_owned(),
+            anchor: None,
+        })
     }
 }

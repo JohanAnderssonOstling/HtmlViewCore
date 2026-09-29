@@ -17,7 +17,7 @@ use html::layout::GlyphShaper;
 pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
 use html::pipeline::{EarliestStage, PipelineInputs};
 pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy};
-pub use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider, TocEntry};
+pub use html::resources::{BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata, ResourceProvider};
 use html::resources::{ImagePipeline, ImageService};
 
 pub use html_view_cfi as cfi;
@@ -32,18 +32,18 @@ pub mod layout {
 }
 
 pub mod parser {
-    pub use html::pipeline::{BuildPipelineTimings, DocumentFactory, ParsedHtml, parse_html_document};
+    pub use html::pipeline::{DocumentFactory, ParsedHtml, parse_html_document};
 }
 
 pub mod resources {
-    pub use html::resources::{FileSystemProvider, ImagePipelinePoll, ResourceMetadata, ResourceProvider, TocEntry};
+    pub use html::resources::{FileSystemProvider, ImagePipelinePoll, ResourceMetadata, ResourceProvider};
 }
 
 /// Renderer-neutral text backend contract. UI adapters should use this module
 /// rather than importing layout or CSS model types.
 pub mod text_backend {
     pub use html::layout::{
-        CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, OpenTypeFeature, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest,
+        CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, OpenTypeFeature, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest,
         TextStyleSpan,
     };
 }
@@ -56,8 +56,8 @@ pub use session::{FramePainter, PointerDownOptions, PointerMoveOutcome, Prepared
 
 const DEFAULT_DOCUMENT_CACHE_CAPACITY: usize = 3;
 
-fn document_text_index(source: &str, uri: &str) -> Option<html::parse::DocumentTextIndex> {
-    let parsed = html::parse::parse_document(source, html::parse::MarkupSyntax::from_uri(uri)).ok()?;
+fn document_text_index(source: &str, uri: &str, provider: &dyn ResourceProvider) -> Option<html::parse::DocumentTextIndex> {
+    let parsed = html::parse::parse_document(source, load::markup_syntax_for_resource(provider, uri)).ok()?;
     html::parse::DocumentTextIndex::from_parsed(&parsed).ok()
 }
 
@@ -86,7 +86,7 @@ pub fn search_publication_streaming(provider: &dyn ResourceProvider, document_ur
         let Ok(source) = provider.read_string(uri) else {
             continue;
         };
-        let Some(index) = document_text_index(&source, uri) else {
+        let Some(index) = document_text_index(&source, uri, provider) else {
             continue;
         };
         let text = index.text();
@@ -117,7 +117,7 @@ pub fn search_publication_streaming(provider: &dyn ResourceProvider, document_ur
 pub fn publication_text_lengths(provider: &dyn ResourceProvider, document_uris: &[String]) -> Vec<u64> {
     document_uris
         .iter()
-        .map(|uri| provider.read_string(uri).ok().and_then(|source| document_text_index(&source, uri)).map(|index| index.text().chars().filter(|character| !character.is_whitespace()).count() as u64).unwrap_or(1).max(1))
+        .map(|uri| provider.read_string(uri).ok().and_then(|source| document_text_index(&source, uri, provider)).map(|index| index.text().chars().filter(|character| !character.is_whitespace()).count() as u64).unwrap_or(1).max(1))
         .collect()
 }
 
@@ -171,6 +171,20 @@ mod frame_cache_tests {
     }
 }
 
+/// The provider-backed, parse-and-style portion of initial renderer creation.
+/// It contains no UI framework objects or platform text-system handles and can
+/// therefore be built on a host worker before a renderer entity is installed.
+pub struct RendererPreparation {
+    loaded: load::PreparedRenderDocument,
+    provider: Arc<dyn ResourceProvider>,
+    document_uris: Vec<String>,
+    doc_index: usize,
+    glyph_index: u32,
+    nav_state: Option<String>,
+    initial_anchor: Option<String>,
+    config: RendererInitialConfig,
+}
+
 pub(crate) struct RendererCore {
     host: Rc<dyn RendererHost>,
     /// The spine item being read: the document, what is on screen of it, and
@@ -187,6 +201,9 @@ pub(crate) struct RendererCore {
     root_font_size: f32,
     viewport: ViewportState,
     document_cache: DocumentCache,
+    pending_navigation: Option<nav::PendingNavigation>,
+    pending_file_events: std::cell::RefCell<Vec<std::sync::mpsc::Receiver<Result<RendererEvent, String>>>>,
+    prepared_navigation: Option<(usize, load::LoadedRenderDocument)>,
     prepared_pages: PreparedPageCache,
     frame_scratch: FrameScratch,
     revisions: RendererRevisions,
@@ -274,6 +291,15 @@ impl RendererCore {
         Point::new((position.x + dx) / scale, (position.y + dy) / scale)
     }
 
+    /// The inverse of [`Self::to_layout_point`]: layout space back to the
+    /// coordinates the surface is drawn in.
+    pub fn from_layout_point(&self, position: Point) -> Point {
+        let scale = self.page.view.layout.scale;
+        let dx = self.origin.x * (scale - 1.0);
+        let dy = self.origin.y * (scale - 1.0);
+        Point::new(position.x * scale - dx, position.y * scale - dy)
+    }
+
     pub fn activate_link_cursor(&mut self) {
         if self.page.view.selection.activate_link_cursor() {
             self.host.request_style();
@@ -294,7 +320,7 @@ impl RendererCore {
         let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
-        let image_service = ImageService::new(provider.clone(), ImageService::DEFAULT_BYTE_BUDGET);
+        let image_service = ImageService::with_job_spawner(provider.clone(), host.blocking_job_spawner(), ImageService::DEFAULT_BYTE_BUDGET);
         image_service.set_completion_waker(host.resource_waker());
         let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
@@ -315,6 +341,9 @@ impl RendererCore {
             root_font_size,
             viewport: ViewportState::default(),
             document_cache,
+            pending_navigation: None,
+            pending_file_events: Default::default(),
+            prepared_navigation: None,
             prepared_pages: PreparedPageCache::new(),
             frame_scratch: FrameScratch::default(),
             revisions: RendererRevisions::default(),
@@ -453,10 +482,14 @@ impl RendererCore {
                 }
             }
             RendererCommand::SetColumnWidth(width) => self.set_col_width(glyph_shaper, width),
+            RendererCommand::SetColumnViewportPlan { available_width, column_width, column_count, column_gap } => {
+                self.set_column_viewport_plan(glyph_shaper, available_width, column_width, column_count, column_gap)
+            }
             RendererCommand::SetMaxColumnCount(count) => {
                 let count = count.map(|count| count.max(1));
                 if self.page.view.layout.max_col_count != count {
                     self.page.view.layout.max_col_count = count;
+                    self.page.view.layout.finish_viewport_reconfiguration(None);
                     self.host.request_repaint();
                 }
             }
@@ -613,7 +646,13 @@ impl RendererCore {
         }
     }
 
-    pub fn set_search(&mut self, glyph_shaper: &mut impl GlyphShaper, query: &str, options: SearchOptions) {
+    /// Finds and highlights matches without moving the reader.
+    ///
+    /// Setting a query is not navigation: the reader is still typing, and
+    /// jumping the page on each keystroke moves the text out from under them.
+    /// Position changes only through `NavigateSearch`, which the search bar's
+    /// buttons and Enter drive.
+    pub fn set_search(&mut self, _glyph_shaper: &mut impl GlyphShaper, query: &str, options: SearchOptions) {
         self.highlight.restart(query.to_owned(), options);
         let local_scope = options.scope == SearchScope::CurrentDocument;
         if query.is_empty() {
@@ -624,32 +663,27 @@ impl RendererCore {
         } else {
             let results = search_publication(self.provider.as_ref(), self.nav.documents().uris(), query, options);
             self.highlight.set_results(query.to_owned(), options, results);
-            self.navigate_to_book_match(glyph_shaper);
+            self.refresh_visible_search_matches();
         }
         self.highlight.emit_results(self.host.as_ref());
-        if local_scope && !self.highlight.is_empty() {
-            self.navigate_to_current_match();
-        } else if self.highlight.is_empty() {
-            self.request_overlay_repaint();
-        }
+        self.request_overlay_repaint();
     }
 
-    pub fn set_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
+    /// Installs results found off the main thread. Highlights only, for the same
+    /// reason as [`Self::set_search`].
+    pub fn set_search_results(&mut self, _glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
         self.highlight.set_results(query, options, results);
-        if self.highlight.is_empty() {
-            self.request_overlay_repaint();
-        } else {
-            self.navigate_to_book_match(glyph_shaper);
-        }
+        self.refresh_visible_search_matches();
+        self.request_overlay_repaint();
         self.highlight.emit_results(self.host.as_ref());
     }
 
-    pub fn append_search_results(&mut self, glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
-        if self.highlight.append_results(query, options, results) {
-            self.navigate_to_book_match(glyph_shaper);
-        } else {
-            self.request_overlay_repaint();
-        }
+    /// Adds results from a streaming scan. Highlights only, for the same reason
+    /// as [`Self::set_search`]: results arriving late must not yank the page.
+    pub fn append_search_results(&mut self, _glyph_shaper: &mut impl GlyphShaper, query: String, options: SearchOptions, results: Vec<BookSearchMatch>) {
+        self.highlight.append_results(query, options, results);
+        self.refresh_visible_search_matches();
+        self.request_overlay_repaint();
         self.highlight.emit_results(self.host.as_ref());
     }
 
@@ -657,11 +691,23 @@ impl RendererCore {
         let Some(hit) = self.highlight.current_book_match() else {
             return;
         };
+        if self.defer_document_read(hit.doc, nav::NavigationRequest::Search(self.highlight.query().to_owned())) { return; }
         if hit.doc != self.nav.location().document() {
             self.set_position(glyph_shaper, hit.doc, None);
         }
+        if self.refresh_visible_search_matches() {
+            self.navigate_to_current_match();
+        }
+    }
+
+    /// Projects search results onto the loaded document without reading another
+    /// file or changing the viewport. Navigation uses the same source mapping.
+    fn refresh_visible_search_matches(&mut self) -> bool {
         let matches = self.doc().find_matches_with_options(self.highlight.query(), self.highlight.options());
         self.highlight.install_visible_matches(matches);
+        let Some(hit) = self.highlight.current_book_match().filter(|hit| hit.doc == self.nav.location().document()) else {
+            return false;
+        };
         let occurrence = match hit.target {
             BookSearchTarget::LocalOccurrence(occurrence) => Some(occurrence),
             BookSearchTarget::SourceCfi(cfi) => crate::cfi::parse_cfi(&self.page.view.document, &cfi)
@@ -669,10 +715,10 @@ impl RendererCore {
                 .and_then(|glyph| self.highlight.matches().iter().position(|&(start, end)| start <= glyph && glyph < end)),
         };
         let Some(occurrence) = occurrence else {
-            return;
+            return false;
         };
         self.highlight.focus_local_match(occurrence);
-        self.navigate_to_current_match();
+        true
     }
 
     fn navigate_after_match_step(&mut self, glyph_shaper: &mut impl GlyphShaper) {

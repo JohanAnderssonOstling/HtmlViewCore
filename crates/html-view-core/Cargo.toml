@@ -19,3 +19,4 @@ kurbo.workspace = true
 peniko.workspace = true
 unicode-normalization.workspace = true
 smallvec = "1"
+web-time = "1"

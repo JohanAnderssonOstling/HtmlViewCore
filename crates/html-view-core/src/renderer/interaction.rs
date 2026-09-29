@@ -9,17 +9,33 @@ impl RendererCore {
         (doc == self.nav.location().document()).then_some(&self.page.view)
     }
 
-    fn visible_view_mut_for_doc(&mut self, doc: usize) -> Option<&mut crate::document_view::DocumentView> {
+    fn visible_view_mut_for_doc(
+        &mut self,
+        doc: usize,
+    ) -> Option<&mut crate::document_view::DocumentView> {
         (doc == self.nav.location().document()).then_some(&mut self.page.view)
     }
 
     /// Hit-tests the current spine item.
     pub fn hit_test_document_glyph(&self, pos: Point) -> Option<crate::DocumentGlyph> {
-        self.page.view.hit_test_glyph(pos).map(|glyph| crate::DocumentGlyph { doc: self.nav.location().document(), glyph })
+        self.page
+            .view
+            .hit_test_glyph(pos)
+            .map(|glyph| crate::DocumentGlyph {
+                doc: self.nav.location().document(),
+                glyph,
+            })
     }
 
     pub fn hit_test_document_image(&self, pos: Point) -> Option<crate::DocumentImage> {
-        self.page.view.geometry().hit_test_image(pos).map(|image| crate::DocumentImage { doc: self.nav.location().document(), image })
+        self.page
+            .view
+            .geometry()
+            .hit_test_image(pos)
+            .map(|image| crate::DocumentImage {
+                doc: self.nav.location().document(),
+                image,
+            })
     }
 
     fn install_prepared_page(&mut self, prepared: PreparedPage) {
@@ -40,7 +56,11 @@ impl RendererCore {
         };
         let frame = std::mem::take(&mut self.page.view.frame);
         let continuation = self.viewport.continuation();
-        self.prepared_pages.insert(PreparedPage { key, frame, continuation });
+        self.prepared_pages.insert(PreparedPage {
+            key,
+            frame,
+            continuation,
+        });
     }
 
     pub(crate) fn restore_prepared_page_ending_at(&mut self, end_line: usize) -> bool {
@@ -62,10 +82,24 @@ impl RendererCore {
         let Some(uri) = view.document.render_view().image_uri(hit.image) else {
             return false;
         };
+        if let Some(wake) = self.host.resource_waker() {
+            let uri = uri.to_owned();
+            let provider = self.provider.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            self.pending_file_events.borrow_mut().push(receive);
+            self.host.blocking_job_spawner().spawn(Box::new(move || {
+                let result = provider.read_bytes(&uri).map(|bytes| crate::RendererEvent::ImageOpened { uri, bytes }).map_err(|e| e.to_string());
+                if send.send(result).is_ok() { wake(); }
+            }));
+            return true;
+        }
         let Ok(bytes) = self.provider.read_bytes(uri) else {
             return false;
         };
-        self.host.emit(crate::RendererEvent::ImageOpened { uri: uri.to_owned(), bytes });
+        self.host.emit(crate::RendererEvent::ImageOpened {
+            uri: uri.to_owned(),
+            bytes,
+        });
         true
     }
 
@@ -103,8 +137,16 @@ impl RendererCore {
                 if previous_line != current_line {
                     let lines_overlap = previous_line
                         .zip(current_line)
-                        .and_then(|(previous_line, current_line)| Some((text_view.line(previous_line)?, text_view.line(current_line)?)))
-                        .is_some_and(|(previous_line, current_line)| previous_line.start() < current_line.end() && current_line.start() < previous_line.end());
+                        .and_then(|(previous_line, current_line)| {
+                            Some((
+                                text_view.line(previous_line)?,
+                                text_view.line(current_line)?,
+                            ))
+                        })
+                        .is_some_and(|(previous_line, current_line)| {
+                            previous_line.start() < current_line.end()
+                                && current_line.start() < previous_line.end()
+                        });
                     if !lines_overlap {
                         text.push('\n');
                     }
@@ -120,7 +162,11 @@ impl RendererCore {
         text.trim().to_owned()
     }
 
-    fn apply_image_poll(&mut self, glyph_shaper: &mut impl GlyphShaper, image_poll: crate::resources::ImagePipelinePoll) {
+    fn apply_image_poll(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        image_poll: crate::resources::ImagePipelinePoll,
+    ) {
         if image_poll.decoded {
             self.revisions.invalidate_resources();
         }
@@ -133,8 +179,22 @@ impl RendererCore {
         let (next_inputs, layout_needed) = apply_image_poll_updates(
             &self.page.inputs,
             &image_poll.dimensions_changed,
-            |image_idx| images.get(image_idx as usize).map(|resource| (resource.width, resource.height, resource.width_attr, resource.height_attr)),
-            |image_idx| self.page.images.get_decoded(image_idx).map(html::resources::DecodedImage::dimensions),
+            |image_idx| {
+                images.get(image_idx as usize).map(|resource| {
+                    (
+                        resource.width,
+                        resource.height,
+                        resource.width_attr,
+                        resource.height_attr,
+                    )
+                })
+            },
+            |image_idx| {
+                self.page
+                    .images
+                    .get_decoded(image_idx)
+                    .map(html::resources::DecodedImage::dimensions)
+            },
         );
 
         if !layout_needed {
@@ -152,6 +212,15 @@ impl RendererCore {
     /// pipeline and must be called from an application update, never from a
     /// render-phase viewport preparation.
     pub fn update_resources(&mut self, glyph_shaper: &mut impl GlyphShaper) {
+        self.pending_file_events.borrow_mut().retain(|receiver| {
+            match receiver.try_recv() {
+                Ok(Ok(event)) => self.host.emit(event),
+                Ok(Err(message)) => self.emit_operation_failed(crate::RendererOperation::UpdateDocument, message),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.emit_operation_failed(crate::RendererOperation::UpdateDocument, "file worker stopped".into()),
+            }
+            false
+        });
         let image_poll = self.page.images.poll();
         self.apply_image_poll(glyph_shaper, image_poll);
     }
@@ -162,11 +231,24 @@ impl RendererCore {
         self.configure_layout_for_viewport_impl(viewport_size);
         let requested_geometry = self.frame_geometry_cache_key();
         if previous_geometry != Some(requested_geometry) {
-            if previous_geometry.is_some_and(|previous| can_reproject_width_only(previous, requested_geometry)) {
-                let previous = previous_geometry.expect("width-only reprojection requires installed geometry");
+            if previous_geometry
+                .is_some_and(|previous| can_reproject_width_only(previous, requested_geometry))
+            {
+                let previous =
+                    previous_geometry.expect("width-only reprojection requires installed geometry");
                 self.page.view.frame.reproject_columns(
+                    crate::ColumnLayout::leading_offset_for(
+                        f64::from_bits(previous.viewport_width_bits),
+                        f64::from_bits(previous.column_width_bits),
+                        f64::from(previous.column_count),
+                    ),
                     f64::from_bits(previous.column_width_bits),
                     f64::from_bits(previous.column_gap_bits),
+                    crate::ColumnLayout::leading_offset_for(
+                        f64::from_bits(requested_geometry.viewport_width_bits),
+                        f64::from_bits(requested_geometry.column_width_bits),
+                        f64::from(requested_geometry.column_count),
+                    ),
                     f64::from_bits(requested_geometry.column_width_bits),
                     f64::from_bits(requested_geometry.column_gap_bits),
                 );
@@ -176,11 +258,18 @@ impl RendererCore {
                     PaintDirection::Backward => self.prepare_backward(),
                 }
             }
-            self.page.view.frame.set_geometry_key(self.frame_geometry_cache_key());
+            self.page
+                .view
+                .frame
+                .set_geometry_key(self.frame_geometry_cache_key());
         }
         self.prefetch_images_for_current_page();
         if self.nav.location().anchor_update_pending() {
-            let view = html_view_navigate::NavView { doc: html_view_doc::DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
+            let view = html_view_navigate::NavView {
+                doc: html_view_doc::DocQuery::new(&self.page.view.document),
+                viewport: &self.viewport,
+                frame: &self.page.view.frame,
+            };
             self.nav.update_nav_anchor_from_layout(view);
             self.update_nav_signal();
             self.nav.mark_anchor_clean();
@@ -197,12 +286,19 @@ impl RendererCore {
     }
 
     #[cfg(test)]
-    pub(crate) fn configure_layout_for_viewport(&mut self, _glyph_shaper: &mut impl GlyphShaper, viewport_size: Size) {
+    pub(crate) fn configure_layout_for_viewport(
+        &mut self,
+        _glyph_shaper: &mut impl GlyphShaper,
+        viewport_size: Size,
+    ) {
         self.configure_layout_for_viewport_impl(viewport_size);
     }
 
     fn configure_layout_for_viewport_impl(&mut self, viewport_size: Size) {
-        self.page.view.layout.begin_viewport_reconfiguration(viewport_size);
+        self.page
+            .view
+            .layout
+            .begin_viewport_reconfiguration(viewport_size);
         // Window dimensions affect fragmentainer composition only. Document
         // layout uses the reader's explicit column-width setting and is
         // updated only by an explicit renderer command or resource change.
@@ -218,7 +314,13 @@ impl RendererCore {
         let Some(view) = self.visible_view_for_doc(hit.doc) else {
             return false;
         };
-        if view.document.render_view().addressing().link_for_glyph(hit.glyph).is_none() {
+        if view
+            .document
+            .render_view()
+            .addressing()
+            .link_for_glyph(hit.glyph)
+            .is_none()
+        {
             return false;
         }
         let geometry = view.geometry();
@@ -231,7 +333,11 @@ impl RendererCore {
         let Some(line) = view.document.render_view().text().line(line_idx) else {
             return false;
         };
-        let (x0, x1) = geometry.glyph_x_span_in_line(&line, hit.glyph, hit.glyph.saturating_add(1).min(line.end()));
+        let (x0, x1) = geometry.glyph_x_span_in_line(
+            &line,
+            hit.glyph,
+            hit.glyph.saturating_add(1).min(line.end()),
+        );
         let (x0, x1) = (screen.point.x + x0, screen.point.x + x1);
         position.x >= x0 && position.x <= x1
     }
@@ -253,9 +359,18 @@ impl RendererCore {
     }
 
     pub fn update_selection_at(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        let active_doc = self.page.view.selection.interaction().is_selecting().then(|| self.nav.location().document());
+        let active_doc = self
+            .page
+            .view
+            .selection
+            .interaction()
+            .is_selecting()
+            .then(|| self.nav.location().document());
         let Some(doc) = active_doc else { return false };
-        if self.hit_test_document_glyph(position).is_none_or(|hit| hit.doc != doc) {
+        if self
+            .hit_test_document_glyph(position)
+            .is_none_or(|hit| hit.doc != doc)
+        {
             return false;
         }
         let Some(view) = self.visible_view_mut_for_doc(doc) else {
@@ -283,21 +398,42 @@ impl RendererCore {
         };
 
         let view = self.visible_view_for_doc(doc)?;
-        if let (Some((start, end)), Some(exact_text)) = (view.selection_view().range(), view.selection.content().plain().map(str::to_owned))
-            && let Some(cfi_range) = crate::cfi::generate_cfi_range(&view.document, doc, start, end)
+        if let (Some((start, end)), Some(exact_text)) = (
+            view.selection_view().range(),
+            view.selection.content().plain().map(str::to_owned),
+        ) && let Some(cfi_range) =
+            crate::cfi::generate_cfi_range(&view.document, doc, start, end)
         {
             let prefix_start = start.saturating_sub(48);
             let glyph_count = view.document.render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
-            let prefix = view.doc().build_selection_text(prefix_start, start).0.filter(|value| !value.is_empty());
-            let suffix = view.doc().build_selection_text(end, suffix_end).0.filter(|value| !value.is_empty());
-            self.host.emit(crate::RendererEvent::SelectionFinished { doc, cfi_range, exact_text, prefix, suffix });
+            let prefix = view
+                .doc()
+                .build_selection_text(prefix_start, start)
+                .0
+                .filter(|value| !value.is_empty());
+            let suffix = view
+                .doc()
+                .build_selection_text(end, suffix_end)
+                .0
+                .filter(|value| !value.is_empty());
+            self.host.emit(crate::RendererEvent::SelectionFinished {
+                doc,
+                cfi_range,
+                exact_text,
+                prefix,
+                suffix,
+            });
         }
         click.map(|glyph| crate::DocumentGlyph { doc, glyph })
     }
 
     pub fn copy_selection_to_clipboard(&self) -> Result<bool, String> {
-        if let Some(text) = self.note.as_ref().and_then(|note| note.selection.content().markdown()) {
+        if let Some(text) = self
+            .note
+            .as_ref()
+            .and_then(|note| note.selection.content().markdown())
+        {
             self.host.set_clipboard(text)?;
             return Ok(true);
         }
@@ -312,19 +448,35 @@ impl RendererCore {
         Ok(true)
     }
 
-    pub(crate) fn copy_document_image_to_clipboard(&self, hit: crate::DocumentImage) -> Result<(), String> {
+    pub(crate) fn copy_document_image_to_clipboard(
+        &self,
+        hit: crate::DocumentImage,
+    ) -> Result<(), String> {
         if hit.doc != self.nav.location().document() {
             return Err(format!("document {} is not visible", hit.doc));
         }
-        let decoded = self.page.images.get_decoded(hit.image).ok_or_else(|| format!("image {} is not decoded yet", hit.image))?;
+        let decoded = self
+            .page
+            .images
+            .get_decoded(hit.image)
+            .ok_or_else(|| format!("image {} is not decoded yet", hit.image))?;
         match decoded {
-            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(image.width as usize, image.height as usize, image.data.data().to_vec()),
-            html::resources::DecodedImage::Svg { bytes, .. } => self.host.set_clipboard_svg(bytes.to_vec()),
+            html::resources::DecodedImage::Raster { image, .. } => self.host.set_clipboard_image(
+                image.width as usize,
+                image.height as usize,
+                image.data.data().to_vec(),
+            ),
+            html::resources::DecodedImage::Svg { bytes, .. } => {
+                self.host.set_clipboard_svg(bytes.to_vec())
+            }
         }
     }
 }
 
-fn can_reproject_width_only(previous: FrameGeometryCacheKey, requested: FrameGeometryCacheKey) -> bool {
+fn can_reproject_width_only(
+    previous: FrameGeometryCacheKey,
+    requested: FrameGeometryCacheKey,
+) -> bool {
     previous.layout_revision == requested.layout_revision
         && previous.viewport_height_bits == requested.viewport_height_bits
         && previous.column_width_bits == requested.column_width_bits
@@ -335,27 +487,40 @@ fn can_reproject_width_only(previous: FrameGeometryCacheKey, requested: FrameGeo
 }
 
 fn apply_image_poll_updates(
-    pipeline_inputs: &PipelineInputs, dimensions_changed: &[u32], image_metadata: impl Fn(u32) -> Option<(u32, u32, Option<u32>, Option<u32>)>, decode_sizes: impl Fn(u32) -> Option<(u32, u32)>,
+    pipeline_inputs: &PipelineInputs,
+    dimensions_changed: &[u32],
+    image_metadata: impl Fn(u32) -> Option<(u32, u32, Option<u32>, Option<u32>)>,
+    decode_sizes: impl Fn(u32) -> Option<(u32, u32)>,
 ) -> (PipelineInputs, bool) {
     let mut next_inputs = pipeline_inputs.clone();
     let mut layout_needed = false;
 
     for image_idx in dimensions_changed {
-        let (resource_width, resource_height, width_attr, height_attr) = match image_metadata(*image_idx) {
-            Some((resource_width, resource_height, width_attr, height_attr)) => (resource_width, resource_height, width_attr, height_attr),
-            None => continue,
-        };
+        let (resource_width, resource_height, width_attr, height_attr) =
+            match image_metadata(*image_idx) {
+                Some((resource_width, resource_height, width_attr, height_attr)) => {
+                    (resource_width, resource_height, width_attr, height_attr)
+                }
+                None => continue,
+            };
         let Some((decoded_width, decoded_height)) = decode_sizes(*image_idx) else {
             continue;
         };
 
         let uses_intrinsic_width = width_attr.is_none();
         let uses_intrinsic_height = height_attr.is_none();
-        let previous = next_inputs.image_metrics.get(*image_idx).unwrap_or((resource_width, resource_height));
-        if (uses_intrinsic_width && previous.0 != decoded_width) || (uses_intrinsic_height && previous.1 != decoded_height) {
+        let previous = next_inputs
+            .image_metrics
+            .get(*image_idx)
+            .unwrap_or((resource_width, resource_height));
+        if (uses_intrinsic_width && previous.0 != decoded_width)
+            || (uses_intrinsic_height && previous.1 != decoded_height)
+        {
             layout_needed = true;
         }
-        next_inputs.image_metrics.set(*image_idx, decoded_width, decoded_height);
+        next_inputs
+            .image_metrics
+            .set(*image_idx, decoded_width, decoded_height);
     }
 
     (next_inputs, layout_needed)
@@ -366,7 +531,11 @@ mod tests {
     use super::apply_image_poll_updates;
 
     fn test_resources() -> Vec<(u32, u32, Option<u32>, Option<u32>)> {
-        vec![(64, 32, None, None), (12, 12, Some(12), Some(12)), (40, 80, Some(40), None)]
+        vec![
+            (64, 32, None, None),
+            (12, 12, Some(12), Some(12)),
+            (40, 80, Some(40), None),
+        ]
     }
 
     fn base_inputs() -> html::pipeline::PipelineInputs {
@@ -413,7 +582,10 @@ mod tests {
             },
         );
 
-        assert!(!layout_needed, "intrinsic-only image changes should not force layout if no intrinsic dimensions changed");
+        assert!(
+            !layout_needed,
+            "intrinsic-only image changes should not force layout if no intrinsic dimensions changed"
+        );
         assert_eq!(updated.image_metrics.get(0), Some((64, 32)));
         assert_eq!(updated.image_metrics.get(1), Some((16, 16)));
         assert_eq!(updated.image_metrics.get(2), Some((40, 80)));
@@ -454,13 +626,28 @@ mod tests {
         assert!(layout_ab);
         assert!(layout_ba);
 
-        assert_eq!(updated_ab.image_metrics.get(0), updated_ba.image_metrics.get(0));
-        assert_eq!(updated_ab.image_metrics.get(1), updated_ba.image_metrics.get(1));
-        assert_eq!(updated_ab.image_metrics.get(2), updated_ba.image_metrics.get(2));
+        assert_eq!(
+            updated_ab.image_metrics.get(0),
+            updated_ba.image_metrics.get(0)
+        );
+        assert_eq!(
+            updated_ab.image_metrics.get(1),
+            updated_ba.image_metrics.get(1)
+        );
+        assert_eq!(
+            updated_ab.image_metrics.get(2),
+            updated_ba.image_metrics.get(2)
+        );
 
         // A caller applying this batch should only need one revision bump.
-        assert_eq!(updated_ab.image_metrics_revision.next(), base.image_metrics_revision.next());
-        assert_eq!(updated_ba.image_metrics_revision.next(), base.image_metrics_revision.next());
+        assert_eq!(
+            updated_ab.image_metrics_revision.next(),
+            base.image_metrics_revision.next()
+        );
+        assert_eq!(
+            updated_ba.image_metrics_revision.next(),
+            base.image_metrics_revision.next()
+        );
     }
 
     #[test]

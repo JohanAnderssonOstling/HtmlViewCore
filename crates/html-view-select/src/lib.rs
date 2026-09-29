@@ -777,26 +777,50 @@ mod tests {
     };
     use html::layout::LayoutConstraints;
     use html::pipeline::DocumentFactory;
-    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper};
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper};
     use std::collections::HashMap;
 
     #[derive(Default)]
     struct TestGlyphShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
     }
 
     impl GlyphShaper for TestGlyphShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
+        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(glyph);
             }
             let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
-            let glyph = glyph_metrics.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }

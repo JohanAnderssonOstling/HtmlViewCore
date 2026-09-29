@@ -38,13 +38,28 @@ pub(crate) struct SpineItem {
 }
 
 impl SpineItem {
-    pub(crate) fn new(loaded: load::LoadedRenderDocument, layout: ColumnLayout, image_service: ImageService) -> Self {
+    pub(crate) fn new(
+        loaded: load::LoadedRenderDocument,
+        layout: ColumnLayout,
+        image_service: ImageService,
+    ) -> Self {
         let images = Self::image_pipeline_for(&loaded.document, image_service);
-        Self { session: loaded.session, inputs: loaded.inputs, images, view: DocumentView::new(loaded.document, layout) }
+        Self {
+            session: loaded.session,
+            inputs: loaded.inputs,
+            images,
+            view: DocumentView::new(loaded.document, layout),
+        }
     }
 
-    pub(crate) fn image_pipeline_for(document: &LaidOutDocument, image_service: ImageService) -> ImagePipeline {
-        ImagePipeline::with_service(Arc::new(document.render_view().images().to_vec()), image_service)
+    pub(crate) fn image_pipeline_for(
+        document: &LaidOutDocument,
+        image_service: ImageService,
+    ) -> ImagePipeline {
+        ImagePipeline::with_service(
+            Arc::new(document.render_view().images().to_vec()),
+            image_service,
+        )
     }
 
     /// Replaces the document while keeping the item's identity, for a relayout
@@ -54,7 +69,11 @@ impl SpineItem {
     }
 
     /// Installs the inseparable products of one successful pipeline update.
-    pub(crate) fn install_pipeline_result(&mut self, document: LaidOutDocument, inputs: PipelineInputs) -> f32 {
+    pub(crate) fn install_pipeline_result(
+        &mut self,
+        document: LaidOutDocument,
+        inputs: PipelineInputs,
+    ) -> f32 {
         self.view.document = document;
         self.inputs = inputs;
         self.root_font_size()

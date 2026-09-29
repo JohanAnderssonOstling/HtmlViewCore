@@ -22,7 +22,11 @@ pub(crate) struct DocumentCache {
 
 impl DocumentCache {
     pub(crate) fn new(capacity: usize) -> Self {
-        Self { documents: HashMap::new(), document_order: VecDeque::new(), capacity }
+        Self {
+            documents: HashMap::new(),
+            document_order: VecDeque::new(),
+            capacity,
+        }
     }
 
     pub(crate) fn is_disabled(&self) -> bool {
@@ -39,7 +43,8 @@ impl DocumentCache {
         cached.images.deactivate();
 
         if self.documents.contains_key(&doc_index) {
-            self.document_order.retain(|cached_index| *cached_index != doc_index);
+            self.document_order
+                .retain(|cached_index| *cached_index != doc_index);
         }
 
         self.documents.insert(doc_index, cached);
@@ -53,7 +58,8 @@ impl DocumentCache {
     }
 
     pub(crate) fn take_document(&mut self, doc_index: usize) -> Option<CachedDocument> {
-        self.document_order.retain(|cached_index| *cached_index != doc_index);
+        self.document_order
+            .retain(|cached_index| *cached_index != doc_index);
         self.documents.remove(&doc_index)
     }
 

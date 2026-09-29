@@ -5,7 +5,11 @@ use crate::RendererCore;
 
 impl RendererCore {
     pub(crate) fn selection_view(&self) -> SelectionView<'_> {
-        SelectionView::new(self.text_geometry(), &self.page.view.selection, &self.page.view.table_selection)
+        SelectionView::new(
+            self.text_geometry(),
+            &self.page.view.selection,
+            &self.page.view.table_selection,
+        )
     }
 
     pub fn begin_table_selection_at(&mut self, position: Point) -> bool {

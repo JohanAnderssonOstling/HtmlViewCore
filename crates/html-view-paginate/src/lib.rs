@@ -780,9 +780,6 @@ impl<'a> Paginator<'a> {
         range_lines: &mut Vec<usize>,
         child_pairs: &mut Vec<(Option<usize>, usize)>,
     ) {
-        if !self.book_optimized {
-            return;
-        }
         let root = self.doc.view();
         let boxes = root.boxes();
         let lines = root.text().lines();
@@ -825,8 +822,9 @@ impl<'a> Paginator<'a> {
                         || boxes.forces_break_after(descendant))
             });
             if (boxes.avoids_break_inside(box_idx)
-                || tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figure"))
-                || is_semantic_sidebar(boxes, box_idx))
+                || (self.book_optimized
+                    && (tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figure"))
+                        || is_semantic_sidebar(boxes, box_idx))))
                 && !has_forced_inside
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && let Some(event) = self.keep_range_event(trigger_line, point.y, bottom)
@@ -905,8 +903,9 @@ impl<'a> Paginator<'a> {
 
                 if boxes.avoids_break_after(previous)
                     || boxes.avoids_break_before(next)
-                    || previous_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))
-                    || next_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))
+                    || (self.book_optimized
+                        && (previous_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))
+                            || next_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))))
                 {
                     let group_top = previous_point.y.min(next_point.y);
                     let group_bottom = previous_bottom.max(next_bottom);
@@ -916,11 +915,13 @@ impl<'a> Paginator<'a> {
                     {
                         events.push(event);
                     }
-                } else if previous_tag.is_some_and(|tag| {
-                    ["h1", "h2", "h3", "h4", "h5", "h6"]
-                        .iter()
-                        .any(|heading| tag.eq_ignore_ascii_case(heading))
-                }) {
+                } else if self.book_optimized
+                    && previous_tag.is_some_and(|tag| {
+                        ["h1", "h2", "h3", "h4", "h5", "h6"]
+                            .iter()
+                            .any(|heading| tag.eq_ignore_ascii_case(heading))
+                    })
+                {
                     range_lines.clear();
                     collect_lines_in_range(lines_by_y, next_point.y, next_bottom, range_lines);
                     let required_bottom = range_lines
@@ -943,22 +944,23 @@ impl<'a> Paginator<'a> {
             group_start = group_end;
         }
 
-        semantic_keeps::semantic_keep_ranges(
-            self.doc,
-            anchors,
-            semantic_ranges,
-            lines_by_y,
-            range_lines,
-            child_pairs,
-        );
-        events.extend(
-            semantic_ranges
-                .iter()
-                .filter_map(|&(trigger_line, top, bottom)| {
-                    self.keep_range_event(trigger_line, top, bottom)
-                }),
-        );
-
+        if self.book_optimized {
+            semantic_keeps::semantic_keep_ranges(
+                self.doc,
+                anchors,
+                semantic_ranges,
+                lines_by_y,
+                range_lines,
+                child_pairs,
+            );
+            events.extend(
+                semantic_ranges
+                    .iter()
+                    .filter_map(|&(trigger_line, top, bottom)| {
+                        self.keep_range_event(trigger_line, top, bottom)
+                    }),
+            );
+        }
         events.sort_by(|left, right| {
             left.trigger_line
                 .cmp(&right.trigger_line)
@@ -979,9 +981,6 @@ impl<'a> Paginator<'a> {
         authored_boundary: &mut HashSet<usize>,
         merged: &mut Vec<ForcedBreakEvent>,
     ) {
-        if !self.book_optimized {
-            return;
-        }
         let boxes = self.doc.boxes();
         let lines = self.doc.text().lines();
         authored_boundary.clear();
@@ -1026,7 +1025,8 @@ impl<'a> Paginator<'a> {
             }
         }
         for box_idx in anchors.boxes() {
-            if is_semantic_page_start(boxes, box_idx)
+            if self.book_optimized
+                && is_semantic_page_start(boxes, box_idx)
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && !authored_boundary.contains(&trigger_line)
                 && let Some(point) = boxes.point(box_idx)
@@ -1452,7 +1452,7 @@ impl Paginator<'_> {
 mod tests {
     use super::*;
     use html::layout::{
-        FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, LaidOutDocument,
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, LaidOutDocument,
         LayoutConstraints,
     };
     use html::pipeline::DocumentFactory;
@@ -1464,16 +1464,39 @@ mod tests {
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
     }
 
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(
+        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(
             &mut self,
-            registry: &mut GlyphRegistry<'a>,
             ch: char,
             font_size: f32,
             _weight: u16,
@@ -1493,7 +1516,7 @@ mod tests {
                 font_size * 0.75,
             )
             .map_err(html::layout::ShapeError::rejected_metric)?;
-            let glyph = registry.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }

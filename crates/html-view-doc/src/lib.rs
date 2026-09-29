@@ -5,7 +5,7 @@
 //! independence checkable by the compiler instead of by convention, and lets
 //! the renderer pass document access around as an ordinary parameter.
 
-use kurbo::Point;
+use kurbo::{Point, Rect};
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -724,6 +724,37 @@ impl<'a> TextGeometry<'a> {
         if x0 <= x1 { (x0, x1) } else { (x1, x0) }
     }
 
+    /// The rectangle a glyph range occupies on the page now, in screen
+    /// coordinates.
+    ///
+    /// The inverse of [`Self::hit_test_glyph`], and computed the same way the
+    /// selection is painted: over the visible lines the range crosses, taking
+    /// each line's painted horizontal span. A caller that has to keep out of
+    /// the reader's way — a note panel placed beside the passage it annotates —
+    /// needs the box rather than the click that made it, because a selection
+    /// spanning four lines is nowhere near the point where the mouse came up.
+    ///
+    /// `None` when no part of the range is on this page: it was scrolled past,
+    /// or it lives in another column that is not currently shown.
+    pub fn glyph_range_bounds(&self, start: u32, end: u32) -> Option<Rect> {
+        if start >= end {
+            return None;
+        }
+        let lines = self.doc.text().lines();
+        let mut bounds: Option<Rect> = None;
+        for (line_idx, screen) in self.frame.page().line_positions().iter() {
+            let Some(line) = lines.get(line_idx) else {
+                continue;
+            };
+            for (fragment_start, fragment_end) in self.doc.line_text_intersections(line_idx, start, end) {
+                let (x0, x1) = self.glyph_x_span_in_line(&line, fragment_start, fragment_end);
+                let rect = Rect::new(screen.point.x + x0, screen.point.y, screen.point.x + x1, screen.point.y + line.height());
+                bounds = Some(bounds.map_or(rect, |existing: Rect| existing.union(rect)));
+            }
+        }
+        bounds.filter(|rect| rect.width() > 0.0 || rect.height() > 0.0)
+    }
+
     pub fn hit_test_glyph(&self, pos: Point) -> Option<u32> {
         // find nearest glyph index for a screen position
         let lines = self.doc.text().lines();
@@ -732,7 +763,7 @@ impl<'a> TextGeometry<'a> {
         }
 
         let max_col = self.layout.col_count as i32 - 1;
-        let target_col = (((pos.x - self.layout.col_gap) / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col); // hit-test only within column
+        let target_col = ((pos.x / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col); // hit-test only within column
 
         let mut best_idx: Option<usize> = None;
         let mut best_vertical_dist = f64::INFINITY;
@@ -836,7 +867,7 @@ impl<'a> TextGeometry<'a> {
         }
 
         let max_col = self.layout.col_count as i32 - 1;
-        let target_col = (((pos.x - self.layout.col_gap) / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col);
+        let target_col = ((pos.x / (self.layout.col_width + self.layout.col_gap)).floor() as i32).clamp(0, max_col);
 
         let fragments = self.doc.view().fragments();
         for (line_idx, screen) in self.frame.page().line_positions().iter() {
@@ -863,7 +894,7 @@ impl<'a> TextGeometry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, LayoutConstraints};
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, LayoutConstraints};
     use html::pipeline::DocumentFactory;
     use html_view_types::{SearchScope, SearchOptions as Opts};
     use std::collections::HashMap;
@@ -871,20 +902,44 @@ mod tests {
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
     }
 
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(&mut self, registry: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _weight: u16, _slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
+        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, _weight: u16, _slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(glyph);
             }
             let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
-            let glyph = registry.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }

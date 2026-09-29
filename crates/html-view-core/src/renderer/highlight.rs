@@ -10,12 +10,23 @@ impl RendererCore {
             return;
         };
         // Only scroll if the match is not already on screen
-        let is_visible = self.page.view.frame.page().line_positions().contains(line_idx);
+        let is_visible = self
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .contains(line_idx);
         if is_visible {
             self.request_overlay_repaint();
             return;
         }
-        let line_y = self.doc().text().line(line_idx).map(|line| line.point().y).unwrap_or_default();
+        let line_y = self
+            .doc()
+            .text()
+            .line(line_idx)
+            .map(|line| line.point().y)
+            .unwrap_or_default();
         self.viewport.begin_forward_at((line_y - 40.0).max(0.0));
         self.request_overlay_repaint();
     }
@@ -27,14 +38,55 @@ mod tests {
     use html_view_doc::find_text_matches;
 
     fn options() -> SearchOptions {
-        SearchOptions { match_case: false, whole_word: false, match_diacritics: false, scope: SearchScope::WholeBook }
+        SearchOptions {
+            match_case: false,
+            whole_word: false,
+            match_diacritics: false,
+            scope: SearchScope::WholeBook,
+        }
     }
 
     #[test]
     fn matching_options_cover_case_words_and_diacritics() {
-        assert_eq!(find_text_matches("Café CAFE cafeteria", "cafe", options()).len(), 3);
-        assert_eq!(find_text_matches("Café CAFE cafeteria", "cafe", SearchOptions { whole_word: true, ..options() }).len(), 2);
-        assert_eq!(find_text_matches("Café CAFE", "cafe", SearchOptions { match_case: true, ..options() }).len(), 0);
-        assert_eq!(find_text_matches("Café CAFE", "cafe", SearchOptions { match_diacritics: true, ..options() }).len(), 1);
+        assert_eq!(
+            find_text_matches("Café CAFE cafeteria", "cafe", options()).len(),
+            3
+        );
+        assert_eq!(
+            find_text_matches(
+                "Café CAFE cafeteria",
+                "cafe",
+                SearchOptions {
+                    whole_word: true,
+                    ..options()
+                }
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            find_text_matches(
+                "Café CAFE",
+                "cafe",
+                SearchOptions {
+                    match_case: true,
+                    ..options()
+                }
+            )
+            .len(),
+            0
+        );
+        assert_eq!(
+            find_text_matches(
+                "Café CAFE",
+                "cafe",
+                SearchOptions {
+                    match_diacritics: true,
+                    ..options()
+                }
+            )
+            .len(),
+            1
+        );
     }
 }

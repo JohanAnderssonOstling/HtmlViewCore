@@ -15,7 +15,14 @@ use kurbo::{Point, Size};
 pub use peniko::Color;
 
 use html::pipeline::EarliestStage;
-pub use html::resources::TocEntry;
+/// A document-derived navigation entry exposed by the renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TocEntry {
+    pub title: String,
+    pub link: String,
+    pub children: Vec<TocEntry>,
+}
+use html::resources::{BlockingJobSpawner, InlineJobSpawner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnotationStyle {
@@ -206,6 +213,7 @@ pub enum RendererCommand {
     SetProgressFraction(f32),
     SetDocumentTextLengths(Vec<u64>),
     SetColumnWidth(f64),
+    SetColumnViewportPlan { available_width: f64, column_width: f64, column_count: u8, column_gap: f64 },
     SetMaxColumnCount(Option<u8>),
     SetFontSize(f32),
     SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides),
@@ -323,6 +331,14 @@ pub trait RendererHost {
     fn request_style(&self);
     fn schedule(&self, delay: Duration, f: Box<dyn FnOnce() + Send>);
     fn schedule_repaint(&self, delay: Duration);
+    /// Supplies finite blocking/CPU work to the platform without coupling the
+    /// renderer to its thread pool, async runtime, or Web Worker machinery.
+    ///
+    /// Synchronous hosts and tests may keep the inline default. Interactive
+    /// hosts should return a shared background implementation.
+    fn blocking_job_spawner(&self) -> Arc<dyn BlockingJobSpawner> {
+        Arc::new(InlineJobSpawner)
+    }
     fn resource_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>>;
     fn set_clipboard(&self, text: &str) -> Result<(), String>;
     fn set_clipboard_image(&self, width: usize, height: usize, rgba: Vec<u8>)
@@ -478,6 +494,7 @@ pub struct VisibleShapedLineFragment {
     pub shaped: html::layout::ShapedLine,
 }
 
+#[derive(Clone, Copy)]
 pub enum DocAnchor {
     Start,
     End,
@@ -685,16 +702,20 @@ impl ColumnLayout {
     /// Finishes viewport reconfiguration after the caller has accepted or
     /// rejected the width-dependent document relayout.
     pub fn finish_viewport_reconfiguration(&mut self, accepted_width: Option<f64>) {
-        const MIN_GAP: f64 = 20.0;
         if let Some(width) = accepted_width {
             self.col_width = width;
         }
-        let raw_count = ((self.size.width + MIN_GAP) / (self.col_width + MIN_GAP)).floor();
+        let raw_count = (self.size.width / self.col_width).floor();
         self.col_count = self.max_col_count.map_or(raw_count.max(1.0), |maximum| {
             raw_count.max(1.0).min(f64::from(maximum))
         });
-        self.col_gap =
-            ((self.size.width - self.col_count * self.col_width) / (self.col_count + 1.0)).max(0.0);
+        // Side margins belong to the host. Spread slack between multiple
+        // columns; a lone column is centered by `col_x` instead.
+        self.col_gap = if self.col_count > 1.0 {
+            ((self.size.width - self.col_count * self.col_width) / (self.col_count - 1.0)).max(0.0)
+        } else {
+            0.0
+        };
     }
 
     pub fn commit_column_width(&mut self, base_width: Option<f64>, effective_width: Option<f64>) {
@@ -704,6 +725,10 @@ impl ColumnLayout {
         if let Some(width) = effective_width {
             self.col_width = width;
         }
+        // Width, count, and gap are one piece of viewport geometry. Keeping a
+        // previous gap after a new width was committed left a wide blank band
+        // between columns even though the new width could consume it.
+        self.finish_viewport_reconfiguration(None);
     }
 
     pub fn update_scale(&mut self, requested: f64) -> Option<f64> {
@@ -723,10 +748,17 @@ impl ColumnLayout {
         layout
     }
 
-    /// Compute x-coordinate for a column given a local x offset
+    /// A single column gets equal slack on both sides. Multiple columns
+    /// start at the host-provided outer margin and use slack only as gaps.
+    #[inline]
+    pub fn leading_offset_for(viewport_width: f64, column_width: f64, column_count: f64) -> f64 {
+        if column_count == 1.0 { ((viewport_width - column_width) / 2.0).max(0.0) } else { 0.0 }
+    }
+
+    /// Compute x-coordinate for a column given a local x offset.
     #[inline]
     pub fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
-        self.col_gap + col_index * (self.col_width + self.col_gap) + local_x
+        Self::leading_offset_for(self.size.width, self.col_width, self.col_count) + col_index * (self.col_width + self.col_gap) + local_x
     }
 
     pub fn resolve_point_at(
@@ -1054,15 +1086,17 @@ impl VisibleFrame {
     /// boundaries remain valid.
     pub fn reproject_columns(
         &mut self,
+        old_leading_offset: f64,
         old_column_width: f64,
         old_column_gap: f64,
+        new_leading_offset: f64,
         new_column_width: f64,
         new_column_gap: f64,
     ) {
         for screen in &mut self.page.line_positions.positions {
             let column = f64::from(screen.col_index);
-            let old_origin = old_column_gap + column * (old_column_width + old_column_gap);
-            let new_origin = new_column_gap + column * (new_column_width + new_column_gap);
+            let old_origin = old_leading_offset + column * (old_column_width + old_column_gap);
+            let new_origin = new_leading_offset + column * (new_column_width + new_column_gap);
             screen.point.x += new_origin - old_origin;
         }
     }
@@ -1215,6 +1249,48 @@ pub enum BookSearchTarget {
 #[cfg(test)]
 mod renderer_revision_tests {
     use super::*;
+
+    #[test]
+    fn multiple_column_slack_stays_between_columns_and_single_column_is_centered() {
+        let mut layout = ColumnLayout {
+            col_width: 300.0,
+            base_col_width: 300.0,
+            max_col_count: Some(2),
+            ..Default::default()
+        };
+        layout.begin_viewport_reconfiguration(Size::new(800.0, 600.0));
+        layout.finish_viewport_reconfiguration(None);
+        assert_eq!(layout.col_count, 2.0);
+        assert_eq!(layout.col_gap, 200.0);
+        assert_eq!(layout.col_x(0.0, 0.0), 0.0);
+        assert_eq!(layout.col_x(1.0, 0.0), 500.0);
+
+        layout.max_col_count = Some(1);
+        layout.finish_viewport_reconfiguration(None);
+        assert_eq!(layout.col_gap, 0.0);
+        assert_eq!(layout.col_x(0.0, 0.0), 250.0);
+        assert_eq!(layout.col_x(0.0, 300.0), 550.0);
+
+        layout.max_col_count = Some(2);
+        layout.col_width = 600.0;
+        layout.base_col_width = 600.0;
+        layout.begin_viewport_reconfiguration(Size::new(1200.0, 600.0));
+        layout.finish_viewport_reconfiguration(None);
+        assert_eq!(layout.col_count, 2.0);
+        assert_eq!(layout.col_gap, 0.0);
+    }
+
+    #[test]
+    fn resizing_a_single_column_reprojects_its_centered_lines() {
+        let mut positions = VisibleLinePositions::with_buffer(0, Vec::new());
+        positions.push(LineScreen { point: Point::new(250.0, 12.0), col_index: 0 });
+        let mut frame = VisibleFrame::default();
+        frame.install_whole_document(1, positions);
+
+        frame.reproject_columns(250.0, 300.0, 0.0, 350.0, 300.0, 0.0);
+        let (_, line) = frame.page().line_positions().iter().next().unwrap();
+        assert_eq!(line.point, Point::new(350.0, 12.0));
+    }
 
     #[test]
     fn popup_anchor_corner_opens_into_the_roomiest_viewport_quadrant() {

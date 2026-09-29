@@ -85,14 +85,12 @@ impl RendererHost for HarnessHost {
 
     fn request_style(&self) {}
 
-    fn schedule(&self, _delay: Duration, _work: Box<dyn FnOnce() + Send>) {}
-
-    fn schedule_repaint(&self, _delay: Duration) {
+    fn schedule(&self, _delay: Duration, work: Box<dyn FnOnce() + Send>) {
+        work();
         self.state.borrow_mut().repaint = true;
     }
 
-    fn schedule_frame_work(&self, _delay: Duration, work: Box<dyn FnOnce() + Send>) {
-        work();
+    fn schedule_repaint(&self, _delay: Duration) {
         self.state.borrow_mut().repaint = true;
     }
 

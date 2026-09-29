@@ -33,7 +33,6 @@ impl RendererHost for RecordingHost {
         callback();
     }
     fn schedule_repaint(&self, _delay: Duration) {}
-    fn schedule_frame_work(&self, _delay: Duration, work: Box<dyn FnOnce() + Send>) { work(); }
     fn resource_waker(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> { None }
     fn set_clipboard(&self, _text: &str) -> Result<(), String> {
         Ok(())

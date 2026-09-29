@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, ShapeError};
+use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, ShapeError};
 
 /// A rasterized glyph: coverage, and where to put it relative to the baseline
 /// origin the renderer paints at.
@@ -39,12 +39,13 @@ struct GlyphKey {
 }
 
 /// One document's glyph registry as the harness sees it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DocumentGlyphs {
     /// What each id the renderer holds was shaped from.
     keys: Vec<GlyphKey>,
     /// Ids already handed out, so a repeated character keeps its id.
     ids: HashMap<GlyphKey, GlyphId>,
+    resources: GlyphResourceStore,
 }
 
 /// Which document the renderer is shaping or painting, shared with the host it
@@ -67,7 +68,9 @@ pub struct FontShaper {
     bold: Option<fontdue::Font>,
     italic: Option<fontdue::Font>,
     active: ActiveDocument,
-    documents: RefCell<HashMap<usize, DocumentGlyphs>>,
+    documents: HashMap<usize, DocumentGlyphs>,
+    document_checkpoint: Option<(usize, Option<DocumentGlyphs>)>,
+    append_checkpoint: Option<(usize, DocumentGlyphs)>,
     /// Rasters are what a glyph looks like, which is the same in any document.
     rasters: RefCell<HashMap<GlyphKey, Rc<GlyphRaster>>>,
 }
@@ -80,7 +83,9 @@ impl FontShaper {
             bold: load_face("serif:bold").ok(),
             italic: load_face("serif:italic").ok(),
             active,
-            documents: RefCell::new(HashMap::new()),
+            documents: HashMap::new(),
+            document_checkpoint: None,
+            append_checkpoint: None,
             rasters: RefCell::new(HashMap::new()),
         })
     }
@@ -96,7 +101,7 @@ impl FontShaper {
     /// The coverage bitmap for a glyph the renderer is painting, rasterized
     /// once and kept. The id is read against the document being painted.
     pub fn raster(&self, glyph: GlyphId) -> Option<Rc<GlyphRaster>> {
-        let key = *self.documents.borrow().get(&self.active.get())?.keys.get(glyph as usize)?;
+        let key = *self.documents.get(&self.active.get())?.keys.get(glyph as usize)?;
         Some(self.rasterize(key))
     }
 
@@ -141,14 +146,55 @@ impl GlyphShaper for FontShaper {
         // A registry starts over with the document it belongs to, and only
         // that document's table goes with it. Rasters are keyed by what was
         // drawn rather than by id, so they survive.
-        self.documents.borrow_mut().insert(self.active.get(), DocumentGlyphs::default());
+        self.documents.insert(self.active.get(), DocumentGlyphs::default());
     }
 
-    fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
+    fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+        &mut self.documents.entry(self.active.get()).or_default().resources
+    }
+
+    fn begin_document_shaping(&mut self) {
+        assert!(self.document_checkpoint.is_none());
+        let document = self.active.get();
+        self.document_checkpoint = Some((document, self.documents.insert(document, DocumentGlyphs::default())));
+    }
+
+    fn commit_document_shaping(&mut self) {
+        self.document_checkpoint = None;
+    }
+
+    fn rollback_document_shaping(&mut self) {
+        if let Some((document, previous)) = self.document_checkpoint.take() {
+            if let Some(previous) = previous {
+                self.documents.insert(document, previous);
+            } else {
+                self.documents.remove(&document);
+            }
+        }
+    }
+
+    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+        assert!(self.append_checkpoint.is_none());
+        let document = self.active.get();
+        self.append_checkpoint = Some((document, self.documents.entry(document).or_default().clone()));
+        Ok(())
+    }
+
+    fn commit_append_shaping(&mut self) {
+        self.append_checkpoint = None;
+    }
+
+    fn rollback_append_shaping(&mut self) {
+        if let Some((document, previous)) = self.append_checkpoint.take() {
+            self.documents.insert(document, previous);
+        }
+    }
+
+    fn shape_glyph(&mut self, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
         let key = GlyphKey { ch, size_bits: font_size.to_bits(), bold: font_weight >= 600, italic: !matches!(font_slant, FontSlant::Normal) };
         let document = self.active.get();
-        if let Some(&glyph) = self.documents.borrow().get(&document).and_then(|glyphs| glyphs.ids.get(&key))
-            && glyph_metrics.contains(glyph)
+        if let Some(&glyph) = self.documents.get(&document).and_then(|glyphs| glyphs.ids.get(&key))
+            && self.documents.get(&document).is_some_and(|glyphs| glyphs.resources.contains(glyph))
         {
             return Ok(glyph);
         }
@@ -158,9 +204,8 @@ impl GlyphShaper for FontShaper {
         let line = face.horizontal_line_metrics(font_size).unwrap_or(fontdue::LineMetrics { ascent: font_size * 0.8, descent: -font_size * 0.2, line_gap: 0.0, new_line_size: font_size });
         let metric = GlyphMetric::try_new(ch, advance.max(0.0), line.ascent.max(0.0), (-line.descent).max(0.0), 0.0).map_err(ShapeError::rejected_metric)?;
 
-        let glyph = glyph_metrics.register(metric)?;
-        let mut documents = self.documents.borrow_mut();
-        let glyphs = documents.entry(document).or_default();
+        let glyphs = self.documents.entry(document).or_default();
+        let glyph = glyphs.resources.register(metric)?;
         if glyphs.keys.len() <= glyph as usize {
             glyphs.keys.resize(glyph as usize + 1, key);
         }

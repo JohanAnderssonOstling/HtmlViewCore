@@ -27,7 +27,13 @@ pub(crate) struct DocumentView {
 
 impl DocumentView {
     pub(crate) fn new(document: LaidOutDocument, layout: ColumnLayout) -> Self {
-        Self { document, layout, frame: VisibleFrame::default(), selection: SelectionState::default(), table_selection: TableSelectionState::default() }
+        Self {
+            document,
+            layout,
+            frame: VisibleFrame::default(),
+            selection: SelectionState::default(),
+            table_selection: TableSelectionState::default(),
+        }
     }
 
     pub(crate) fn doc(&self) -> DocQuery<'_> {
@@ -66,7 +72,10 @@ impl DocumentView {
                 let Some(line) = text.line(line_idx) else {
                     continue;
                 };
-                positions.push(crate::LineScreen { point: line.point(), col_index: 0 });
+                positions.push(crate::LineScreen {
+                    point: line.point(),
+                    col_index: 0,
+                });
             }
             text.line_count()
         };
@@ -100,7 +109,9 @@ impl DocumentView {
 
     pub(crate) fn selection_text(&self) -> Option<String> {
         let (start, end) = self.selection_view().range()?;
-        self.selection_view().build_semantic_selection_text(start, end).0
+        self.selection_view()
+            .build_semantic_selection_text(start, end)
+            .0
     }
 
     pub(crate) fn update_selection_text(&mut self) {
@@ -109,7 +120,13 @@ impl DocumentView {
             return;
         };
         let (plain, ordinary) = self.doc().build_selection_text(start, end);
-        let markdown = if self.selection.interaction().is_semantic() { self.selection_view().build_semantic_selection_text(start, end).1 } else { ordinary };
+        let markdown = if self.selection.interaction().is_semantic() {
+            self.selection_view()
+                .build_semantic_selection_text(start, end)
+                .1
+        } else {
+            ordinary
+        };
         self.selection.install_text(plain, markdown);
     }
 }

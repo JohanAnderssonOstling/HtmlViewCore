@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use html::layout::GlyphShaper;
 use html::layout::{LaidOutDocument, LayoutTimings};
-use html::pipeline::BuildPipelineTimings;
 use html::resources::ResourceProvider;
 use html::engine::Engine;
 use html::pipeline::{
@@ -17,6 +17,17 @@ pub struct LoadedRenderDocument {
     pub session: Engine,
     pub inputs: PipelineInputs,
     pub document: LaidOutDocument,
+    pub source: String,
+}
+
+/// Initial document state prepared without a platform glyph shaper.
+///
+/// This value is `Send` as long as the resource provider is `Send`, so UI
+/// adapters can construct it on their worker executor and finish shaping on
+/// the thread that owns their text system.
+pub struct PreparedRenderDocument {
+    pub session: Engine,
+    pub inputs: PipelineInputs,
     pub source: String,
 }
 
@@ -50,6 +61,18 @@ pub fn note_flow_for(note_display: NoteDisplay) -> html::pipeline::NoteFlow {
     match note_display {
         NoteDisplay::Popup => html::pipeline::NoteFlow::Excluded,
         NoteDisplay::AsAuthored => html::pipeline::NoteFlow::InFlow,
+    }
+}
+
+/// EPUB manifest media types take precedence over filenames: XHTML chapters
+/// are often named `.html`, where HTML parsing would swallow `<a id="..."/>`
+/// page markers and color subsequent text as links.
+pub fn markup_syntax_for_resource(provider: &dyn ResourceProvider, uri: &str) -> MarkupSyntax {
+    let media_type = provider.metadata(uri).ok().and_then(|metadata| metadata.media_type);
+    match media_type.as_deref().map(|value| value.split(';').next().unwrap_or(value).trim()) {
+        Some(value) if value.eq_ignore_ascii_case("application/xhtml+xml") || value.eq_ignore_ascii_case("application/xml") || value.eq_ignore_ascii_case("text/xml") => MarkupSyntax::Xml,
+        Some(value) if value.eq_ignore_ascii_case("text/html") => MarkupSyntax::Html,
+        _ => MarkupSyntax::from_uri(uri),
     }
 }
 
@@ -97,6 +120,55 @@ pub fn load_document_with_settings(
     load_document_with_dom_pipeline_impl(provider, uri, settings, glyph_shaper, None)
 }
 
+pub fn prepare_document_with_settings(
+    provider: Arc<dyn ResourceProvider>,
+    uri: &str,
+    settings: DocumentLoadSettings,
+) -> Result<PreparedRenderDocument, String> {
+    let DocumentLoadSettings {
+        root_font_size,
+        column_width,
+        reader_overrides,
+        image_sizing_policy,
+        text_composition_policy,
+        note_display,
+    } = settings;
+    let source_bytes = provider
+        .read_bytes(uri)
+        .map_err(|error| format!("failed to load HTML resource {uri}: {error}"))?;
+    let transport_encoding = provider.metadata(uri).ok().and_then(|metadata| metadata.charset);
+    let source = html::pipeline::decode_html_bytes(&source_bytes, transport_encoding.as_deref());
+    let layout_constraints = PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
+    let inputs = PipelineInputs {
+        source: source.clone(),
+        markup_syntax: markup_syntax_for_resource(provider.as_ref(), uri),
+        user_styles: Vec::new(),
+        reader_overrides,
+        note_flow: note_flow_for(note_display),
+        source_revision: SourceRevision::INITIAL,
+        base_uri: uri.to_string(),
+        resource_revision: ResourceRevision::INITIAL,
+        stylesheet_revision: StylesheetRevision::INITIAL,
+        style_environment: StyleEnvironment { root_font_size: root_font_size.max(1.0).round() as u32, media: html::pipeline::MediaEnvironment::screen(column_width, None).ok_or_else(|| "column width must be finite and positive".to_owned())?, direction: 0 },
+        font_environment: FontEnvironmentRevision::INITIAL,
+        image_metrics_revision: ImageMetricsRevision::INITIAL,
+        layout: layout_constraints,
+        image_metrics: Default::default(),
+        paint: PaintSettingsRevision::INITIAL,
+    };
+    let mut session = Engine::new(provider);
+    session.prepare_through_style(inputs.clone()).map_err(|error| error.to_string())?;
+    Ok(PreparedRenderDocument { session, inputs, source })
+}
+
+pub fn finish_prepared_document(
+    mut prepared: PreparedRenderDocument,
+    glyph_shaper: &mut impl GlyphShaper,
+) -> Result<LoadedRenderDocument, String> {
+    let document = prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
+    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs, document, source: prepared.source })
+}
+
 fn load_document_with_dom_pipeline_impl(
     provider: Arc<dyn ResourceProvider>,
     uri: &str,
@@ -125,7 +197,7 @@ fn load_document_with_dom_pipeline_impl(
     let layout_constraints = PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
     let inputs = PipelineInputs {
         source: html.clone(),
-        markup_syntax: MarkupSyntax::from_uri(uri),
+        markup_syntax: markup_syntax_for_resource(provider.as_ref(), uri),
         user_styles: Vec::new(),
         reader_overrides,
         note_flow: note_flow_for(note_display),
@@ -163,7 +235,6 @@ pub struct PipelineTimings {
     pub load_external_css: Duration,
     pub collect_inline_css: Duration,
     pub build_document_pipeline: Duration,
-    pub document_pipeline: BuildPipelineTimings,
     pub set_metadata: Duration,
     pub probe_image_dimensions: Duration,
     pub shape_text: Duration,
@@ -202,14 +273,6 @@ impl PipelineTimings {
         self.build_anchor_glyphs += other.build_anchor_glyphs;
         self.layout_total += other.layout_total;
         self.build_anchor_positions += other.build_anchor_positions;
-        self.document_pipeline.build_dom_tree += other.document_pipeline.build_dom_tree;
-        self.document_pipeline.parse_default_css += other.document_pipeline.parse_default_css;
-        self.document_pipeline.parse_author_css += other.document_pipeline.parse_author_css;
-        self.document_pipeline.resolve_css_imports += other.document_pipeline.resolve_css_imports;
-        self.document_pipeline.prepare_style_rules += other.document_pipeline.prepare_style_rules;
-        self.document_pipeline.resolve_styles += other.document_pipeline.resolve_styles;
-        self.document_pipeline.build_layout_inputs += other.document_pipeline.build_layout_inputs;
-        self.document_pipeline.rebuild_document_toc += other.document_pipeline.rebuild_document_toc;
         self.layout_detail.clear_layout_output += other.layout_detail.clear_layout_output;
         self.layout_detail.layout_tree_traversal += other.layout_detail.layout_tree_traversal;
         self.layout_detail.root_box_layout += other.layout_detail.root_box_layout;
@@ -236,20 +299,61 @@ impl PipelineTimings {
 
 #[cfg(test)]
 mod tests {
+    use html::document::NodeRef;
     use html::layout::LayoutConstraints;
     use html::layout::GlyphShaper;
     use html::pipeline::DocumentFactory;
-    use html::resources::{FileSystemProvider, ResourceProvider};
-    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry};
+    use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider};
+    use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct TypedChapterProvider {
+        media_type: Option<&'static str>,
+    }
+
+    impl ResourceProvider for TypedChapterProvider {
+        fn read_bytes(&self, _uri: &str) -> std::io::Result<Vec<u8>> {
+            Ok(br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p><a id="page1"/>Ordinary text</p></body></html>"#.to_vec())
+        }
+
+        fn metadata(&self, _uri: &str) -> std::io::Result<ResourceMetadata> {
+            Ok(ResourceMetadata { media_type: self.media_type.map(str::to_owned), charset: None })
+        }
+
+        fn exists(&self, _uri: &str) -> bool { true }
+        fn resolve(&self, _base: &str, href: &str) -> String { href.to_owned() }
+        fn list_html_candidates(&self, _root: &str) -> std::io::Result<Vec<String>> { Ok(vec!["chapter.html".to_owned()]) }
+    }
+
+    #[test]
+    fn declared_xhtml_keeps_self_closing_page_marker_empty_in_html_named_chapter() {
+        let provider = TypedChapterProvider { media_type: Some("application/xhtml+xml") };
+        let syntax = super::markup_syntax_for_resource(&provider, "chapter.html");
+        assert_eq!(syntax, html::parse::MarkupSyntax::Xml);
+        let source = String::from_utf8(provider.read_bytes("chapter.html").unwrap()).unwrap();
+        let document = html::parse::parse_document(&source, syntax).unwrap().build_dom();
+        let root = document.element_ref(document.dom_root().unwrap()).unwrap();
+        let body = root.children().find_map(|id| document.element_ref(id).filter(|element| element.tag() == "body")).unwrap();
+        let paragraph = body.children().find_map(|id| document.element_ref(id).filter(|element| element.tag() == "p")).unwrap();
+        let mut children = paragraph.children();
+        let marker = document.element_ref(children.next().unwrap()).unwrap();
+        assert_eq!(marker.tag(), "a");
+        assert!(marker.children().next().is_none());
+        assert!(matches!(document.node_ref(children.next().unwrap()), Some(NodeRef::Text(text)) if text.text() == "Ordinary text"));
+
+        assert_eq!(super::markup_syntax_for_resource(&TypedChapterProvider { media_type: Some("text/html") }, "chapter.xhtml"), html::parse::MarkupSyntax::Html);
+        assert_eq!(super::markup_syntax_for_resource(&TypedChapterProvider { media_type: None }, "chapter.xhtml"), html::parse::MarkupSyntax::Xml);
+    }
 
     #[derive(Default)]
     struct TestGlyphShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
     }
 
     struct DocumentMemoryProfile {
@@ -261,16 +365,38 @@ mod tests {
     impl GlyphShaper for TestGlyphShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
+        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, html::layout::ShapeError> {
             let _ = (font_weight, font_slant, color, family);
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(glyph);
             }
             let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(html::layout::ShapeError::rejected_metric)?;
-            let glyph = glyph_metrics.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
@@ -280,6 +406,23 @@ mod tests {
         let mut factory = DocumentFactory::new();
         let mut glyph_shaper = TestGlyphShaper::default();
         factory.parse_with_new_pipeline(html, None).shape(&mut glyph_shaper).expect("test shaper must register every glyph").layout(LayoutConstraints::new(600.0, 20.0).unwrap())
+    }
+
+    #[test]
+    fn initial_preparation_crosses_a_worker_boundary_before_platform_shaping() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("html-view-preparation-{nonce}.html"));
+        fs::write(&path, "<html><head><style>p { color: red }</style></head><body><p>Prepared text</p></body></html>").unwrap();
+        let uri = path.to_string_lossy().into_owned();
+        let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
+        let prepared = std::thread::spawn(move || super::prepare_document_with_settings(provider, &uri, super::DocumentLoadSettings::book(16.0, 600.0)))
+            .join()
+            .expect("preparation worker should not panic")
+            .expect("document should prepare");
+        let mut shaper = TestGlyphShaper::default();
+        let loaded = super::finish_prepared_document(prepared, &mut shaper).expect("platform shaping should finish");
+        assert!(loaded.document.render_view().text().glyph_count() > 0);
+        let _ = fs::remove_file(path);
     }
 
     fn li_boxes(document: &html::layout::LaidOutDocument) -> Vec<usize> {
@@ -454,14 +597,6 @@ mod tests {
         print_stage("load external css", totals.load_external_css, processed);
         print_stage("collect inline css", totals.collect_inline_css, processed);
         print_stage("build document pipeline", totals.build_document_pipeline, processed);
-        print_stage("document: dom tree", totals.document_pipeline.build_dom_tree, processed);
-        print_stage("document: parse default css", totals.document_pipeline.parse_default_css, processed);
-        print_stage("document: parse author css", totals.document_pipeline.parse_author_css, processed);
-        print_stage("document: resolve css imports", totals.document_pipeline.resolve_css_imports, processed);
-        print_stage("document: prepare style rules", totals.document_pipeline.prepare_style_rules, processed);
-        print_stage("document: resolve styles", totals.document_pipeline.resolve_styles, processed);
-        print_stage("document: build layout inputs", totals.document_pipeline.build_layout_inputs, processed);
-        print_stage("document: rebuild toc", totals.document_pipeline.rebuild_document_toc, processed);
         print_stage("set metadata", totals.set_metadata, processed);
         print_stage("probe image dims", totals.probe_image_dimensions, processed);
         print_stage("shape text", totals.shape_text, processed);

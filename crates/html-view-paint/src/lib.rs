@@ -290,6 +290,15 @@ impl AnnotationOverlayState {
         }
     }
 
+    /// The glyph range an annotation occupies in the document on screen, if it
+    /// is one of the annotations resolved onto this page.
+    pub fn glyph_range(&self, id: &str) -> Option<(u32, u32)> {
+        self.visible
+            .iter()
+            .find(|(annotation_id, ..)| annotation_id == id)
+            .map(|(_, start, end, _, _)| (*start, *end))
+    }
+
     /// Reports the topmost annotation covering `glyph`. Later annotations win,
     /// matching paint order.
     pub fn activate_at_glyph(&self, glyph: u32, host: &dyn RendererHost) -> bool {

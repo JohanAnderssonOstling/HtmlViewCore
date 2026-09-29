@@ -1,10 +1,14 @@
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 use kurbo::{Point, Size};
 
-use crate::{FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter, RendererCommand, RendererCore, RendererHost, RendererOperation, RendererRevisions, ResourceProvider, TocEntry};
+use crate::{
+    FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter,
+    RendererCommand, RendererCore, RendererHost, RendererOperation, RendererRevisions,
+    ResourceProvider, TocEntry,
+};
 
 /// The high-level renderer API used by UI backends.
 ///
@@ -33,7 +37,11 @@ pub struct PointerMoveOutcome {
 
 impl<S: GlyphShaper> RendererSession<S> {
     pub(crate) fn from_core(core: RendererCore, glyph_shaper: S) -> Self {
-        Self { core, glyph_shaper, pointer_down_position: None }
+        Self {
+            core,
+            glyph_shaper,
+            pointer_down_position: None,
+        }
     }
 
     /// A note as a paintable scene: `paint` it through any [`Painter`], and
@@ -99,13 +107,56 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.footnote_preview(&mut self.glyph_shaper, href)
     }
 
-    pub fn from_provider_with_nav(host: Rc<dyn RendererHost>, mut glyph_shaper: S, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, start_index: usize, nav_state: Option<&str>, config: crate::RendererInitialConfig) -> Self {
+    pub fn from_provider_with_nav(
+        host: Rc<dyn RendererHost>,
+        mut glyph_shaper: S,
+        provider: Arc<dyn ResourceProvider>,
+        document_uris: Vec<String>,
+        start_index: usize,
+        nav_state: Option<&str>,
+        config: crate::RendererInitialConfig,
+    ) -> Self {
         let started = Instant::now();
-        let core = RendererCore::from_provider_with_nav(host, &mut glyph_shaper, provider, document_uris, start_index, nav_state, config);
-        println!("HTML_CORE_STARTUP phase=core_ready elapsed_ms={}", started.elapsed().as_millis());
+        let core = RendererCore::from_provider_with_nav(
+            host,
+            &mut glyph_shaper,
+            provider,
+            document_uris,
+            start_index,
+            nav_state,
+            config,
+        );
+        println!(
+            "HTML_CORE_STARTUP phase=core_ready elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         let session = Self::from_core(core, glyph_shaper);
-        println!("HTML_CORE_STARTUP phase=session_ready elapsed_ms={}", started.elapsed().as_millis());
+        println!(
+            "HTML_CORE_STARTUP phase=session_ready elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         session
+    }
+
+    pub fn from_preparation(
+        host: Rc<dyn RendererHost>,
+        mut glyph_shaper: S,
+        prepared: crate::RendererPreparation,
+    ) -> Result<Self, String> {
+        let core = RendererCore::from_preparation(host, &mut glyph_shaper, prepared)?;
+        Ok(Self::from_core(core, glyph_shaper))
+    }
+
+    /// Where the current selection sits on screen, for a caller placing a
+    /// panel that must not cover it. `None` when nothing is selected, or when
+    /// the selection is not on the page now shown.
+    pub fn selection_bounds(&self) -> Option<kurbo::Rect> {
+        self.core.selection_bounds()
+    }
+
+    /// Where an annotation sits on screen, for the same reason.
+    pub fn annotation_bounds(&self, id: &str) -> Option<kurbo::Rect> {
+        self.core.annotation_bounds(id)
     }
 
     pub fn document(&self) -> &LaidOutDocument {
@@ -133,8 +184,9 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.apply(&mut self.glyph_shaper, command);
     }
 
+    /// Builds the navigation list from headings in the current document.
     pub fn toc(&self) -> std::io::Result<Option<Vec<TocEntry>>> {
-        self.core.provider.toc()
+        Ok(Some(self.document_toc()))
     }
 
     pub fn document_toc(&self) -> Vec<TocEntry> {
@@ -166,7 +218,8 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn set_position(&mut self, document: usize, glyph: Option<u32>) {
-        self.core.set_position(&mut self.glyph_shaper, document, glyph);
+        self.core
+            .set_position(&mut self.glyph_shaper, document, glyph);
     }
 
     pub fn set_cfi_position(&mut self, cfi: &str) -> bool {
@@ -190,7 +243,7 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn previous_line(&mut self) {
-        self.core.prev_line();
+        self.core.prev_line(&mut self.glyph_shaper);
     }
 
     pub fn scroll_vertical(&mut self, delta_y: f64) -> bool {
@@ -235,6 +288,12 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn change_column_width(&mut self, delta: f64) {
         self.set_column_width(self.column_width() + delta);
+    }
+
+    /// Updates the horizontal space supplied by the host while retaining the
+    /// user's preferred column width.
+    pub fn set_available_width(&mut self, width: f64) -> bool {
+        self.core.set_available_width(&mut self.glyph_shaper, width)
     }
 
     pub fn scale(&self) -> f64 {
@@ -286,7 +345,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         match result {
             Ok(handled) => handled,
             Err(message) => {
-                self.core.emit_operation_failed(RendererOperation::CopySelection, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopySelection, message);
                 true
             }
         }
@@ -301,7 +361,8 @@ impl<S: GlyphShaper> RendererSession<S> {
             return false;
         };
         if let Err(message) = self.core.copy_document_image_to_clipboard(image) {
-            self.core.emit_operation_failed(RendererOperation::CopyImage, message);
+            self.core
+                .emit_operation_failed(RendererOperation::CopyImage, message);
         }
         true
     }
@@ -320,18 +381,24 @@ impl<S: GlyphShaper> RendererSession<S> {
             && let Some(image) = self.core.hit_test_document_image(position)
         {
             if let Err(message) = self.core.copy_document_image_to_clipboard(image) {
-                self.core.emit_operation_failed(RendererOperation::CopyImage, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopyImage, message);
             }
             return true;
         }
         if self.core.open_image_at(position) {
             return true;
         }
-        self.core.begin_selection_at(position, options.selection_mode)
+        self.core
+            .begin_selection_at(position, options.selection_mode)
     }
 
     /// Updates both link hover state and an active selection.
-    pub fn pointer_move(&mut self, position: Point, mode: crate::SelectionMode) -> PointerMoveOutcome {
+    pub fn pointer_move(
+        &mut self,
+        position: Point,
+        mode: crate::SelectionMode,
+    ) -> PointerMoveOutcome {
         let was_over_link = self.core.page.view.selection.link_cursor_active();
         let over_link = self.core.link_at(position);
         if over_link {
@@ -339,8 +406,13 @@ impl<S: GlyphShaper> RendererSession<S> {
         } else {
             self.core.deactivate_link_cursor();
         }
-        let handled = self.core.update_table_selection_drag(position) || self.core.update_selection_at(position, mode);
-        PointerMoveOutcome { handled, over_link, link_hover_changed: was_over_link != over_link }
+        let handled = self.core.update_table_selection_drag(position)
+            || self.core.update_selection_at(position, mode);
+        PointerMoveOutcome {
+            handled,
+            over_link,
+            link_hover_changed: was_over_link != over_link,
+        }
     }
 
     /// Finishes selection and activates a link if the interaction remained a click.
@@ -352,7 +424,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         let Some(hit) = self.core.finish_document_selection() else {
             return false;
         };
-        self.core.handle_document_click(&mut self.glyph_shaper, hit, click_position)
+        self.core
+            .handle_document_click(&mut self.glyph_shaper, hit, click_position)
     }
 
     pub fn pointer_leave(&mut self) {
@@ -404,7 +477,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         match self.core.copy_table_at(position) {
             Ok(handled) => handled,
             Err(message) => {
-                self.core.emit_operation_failed(RendererOperation::CopySelection, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopySelection, message);
                 true
             }
         }
@@ -414,7 +488,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         match self.core.copy_table_unstyled_html_at(position) {
             Ok(handled) => handled,
             Err(message) => {
-                self.core.emit_operation_failed(RendererOperation::CopySelection, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopySelection, message);
                 true
             }
         }
@@ -424,7 +499,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         match self.core.copy_table_styled_html_at(position) {
             Ok(handled) => handled,
             Err(message) => {
-                self.core.emit_operation_failed(RendererOperation::CopySelection, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopySelection, message);
                 true
             }
         }
@@ -434,7 +510,8 @@ impl<S: GlyphShaper> RendererSession<S> {
         match self.core.copy_table_selection() {
             Ok(handled) => handled,
             Err(message) => {
-                self.core.emit_operation_failed(RendererOperation::CopySelection, message);
+                self.core
+                    .emit_operation_failed(RendererOperation::CopySelection, message);
                 true
             }
         }
@@ -442,13 +519,15 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     /// Prepares layout and returns a frame that can be painted exactly once.
     pub fn prepare_frame(&mut self, viewport_size: Size) -> PreparedFrame<'_, S> {
-        self.core.prepare_frame(&mut self.glyph_shaper, viewport_size);
+        self.core
+            .prepare_frame(&mut self.glyph_shaper, viewport_size);
         self.prepared_frame()
     }
 
     /// Incorporates completed resources. This operation may update document
     /// layout and must run from application state update code.
     pub fn update_resources(&mut self) {
+        self.core.finish_pending_navigation(&mut self.glyph_shaper);
         self.core.update_resources(&mut self.glyph_shaper);
     }
 
@@ -460,7 +539,10 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     fn prepared_frame(&mut self) -> PreparedFrame<'_, S> {
-        PreparedFrame { core: &mut self.core, glyph_shaper: &self.glyph_shaper }
+        PreparedFrame {
+            core: &mut self.core,
+            glyph_shaper: &self.glyph_shaper,
+        }
     }
 }
 
@@ -484,13 +566,22 @@ impl<'a, S> PreparedFrame<'a, S> {
 
     /// Emits the frame into independently cacheable layers while preserving
     /// the renderer's established z-order.
-    pub fn paint_all_layers(self, base_before_overlay: &mut impl Painter, overlay: &mut impl Painter, base_after_overlay: &mut impl Painter) {
+    pub fn paint_all_layers(
+        self,
+        base_before_overlay: &mut impl Painter,
+        overlay: &mut impl Painter,
+        base_after_overlay: &mut impl Painter,
+    ) {
         self.core.paint_base_before_overlay(base_before_overlay);
         self.core.paint_interaction_overlay(overlay);
         self.core.paint_base_after_overlay(base_after_overlay);
     }
 
-    pub fn paint_base_layers(self, base_before_overlay: &mut impl Painter, base_after_overlay: &mut impl Painter) {
+    pub fn paint_base_layers(
+        self,
+        base_before_overlay: &mut impl Painter,
+        base_after_overlay: &mut impl Painter,
+    ) {
         self.core.paint_base_before_overlay(base_before_overlay);
         self.core.paint_base_after_overlay(base_after_overlay);
     }
@@ -517,7 +608,11 @@ impl FramePainter<'_> {
 
     /// Paints the page, lets a host place the open note's base scene, then
     /// paints the note selection through the same interaction renderer.
-    pub fn paint_with_note_selection<P: Painter>(self, painter: &mut P, paint_note_base: impl FnOnce(&mut P)) {
+    pub fn paint_with_note_selection<P: Painter>(
+        self,
+        painter: &mut P,
+        paint_note_base: impl FnOnce(&mut P),
+    ) {
         self.core.paint_frame(painter);
         self.core.select_note_glyph_document();
         paint_note_base(painter);
@@ -531,7 +626,9 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::text_backend::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, ShapedLine, TextShapeRequest};
+    use crate::text_backend::{
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, ShapedLine, TextShapeRequest,
+    };
     use crate::{FileSystemProvider, Painter, RecordingPainter, RendererEvent};
     use kurbo::Rect;
     use peniko::{Color, Image};
@@ -541,6 +638,12 @@ mod tests {
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: GlyphResourceStore,
+        append_checkpoint: Option<(
+            HashMap<(char, u32), GlyphId>,
+            GlyphResourceStore,
+            HashMap<u32, usize>,
+        )>,
         line_shape_calls: usize,
         reject_lines: bool,
         active_line_runs: HashMap<u32, usize>,
@@ -549,30 +652,86 @@ mod tests {
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, crate::layout::ShapeError> {
+        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((
+                self.glyphs.clone(),
+                self.glyph_store.clone(),
+                self.active_line_runs.clone(),
+            ));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store, active_line_runs)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+                self.active_line_runs = active_line_runs;
+            }
+        }
+
+        fn shape_glyph(
+            &mut self,
+            ch: char,
+            font_size: f32,
+            _font_weight: u16,
+            _font_slant: FontSlant,
+            _color: u32,
+            _family: Option<&str>,
+        ) -> Result<GlyphId, crate::layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(glyph);
             }
-            let metric = GlyphMetric::try_new(ch, font_size * 0.5, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(crate::layout::ShapeError::rejected_metric)?;
-            let glyph = glyph_metrics.register(metric)?;
+            let metric = GlyphMetric::try_new(
+                ch,
+                font_size * 0.5,
+                font_size * 0.75,
+                font_size * 0.25,
+                font_size * 0.75,
+            )
+            .map_err(crate::layout::ShapeError::rejected_metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
 
-        fn shape_line(&mut self, request: TextShapeRequest<'_>) -> Result<Option<ShapedLine>, crate::layout::ShapeError> {
+        fn shape_line(
+            &mut self,
+            request: TextShapeRequest<'_>,
+        ) -> Result<Option<ShapedLine>, crate::layout::ShapeError> {
             self.line_shape_calls += 1;
             if self.reject_lines {
                 return Ok(None);
             }
-            let raw_caret_stops = (0..=request.text().chars().count()).map(|index| index as f32 * 8.0).collect::<Vec<_>>();
-            let caret_stops = request.adjusted_caret_stops(&raw_caret_stops).expect("test placements are valid");
+            let raw_caret_stops = (0..=request.text().chars().count())
+                .map(|index| index as f32 * 8.0)
+                .collect::<Vec<_>>();
+            let caret_stops = request
+                .adjusted_caret_stops(&raw_caret_stops)
+                .expect("test placements are valid");
             let cluster_boundaries = vec![true; caret_stops.len()].into();
             let run = self.active_line_runs.len() as u32;
             self.active_line_runs.insert(run, request.line_index());
-            Ok(Some(ShapedLine { line_index: request.line_index(), text_range: request.text_range(), run, ascent: 12.0, caret_stops, cluster_boundaries }))
+            Ok(Some(ShapedLine {
+                line_index: request.line_index(),
+                text_range: request.text_range(),
+                run,
+                ascent: 12.0,
+                caret_stops,
+                cluster_boundaries,
+            }))
         }
 
         fn begin_line_shaping(&mut self) {
@@ -633,10 +792,19 @@ mod tests {
         }
 
         fn set_clipboard(&self, _text: &str) -> Result<(), String> {
-            if self.fail_clipboard.get() { Err("test clipboard failure".to_owned()) } else { Ok(()) }
+            if self.fail_clipboard.get() {
+                Err("test clipboard failure".to_owned())
+            } else {
+                Ok(())
+            }
         }
 
-        fn set_clipboard_image(&self, _width: usize, _height: usize, _rgba: Vec<u8>) -> Result<(), String> {
+        fn set_clipboard_image(
+            &self,
+            _width: usize,
+            _height: usize,
+            _rgba: Vec<u8>,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -647,42 +815,115 @@ mod tests {
 
     #[test]
     fn session_owns_navigation_shaping_and_pointer_choreography() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-session-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let first = fixture.join("one.html");
         let second = fixture.join("two.html");
-        std::fs::write(&first, "<html><body><a href=\"two.html#target\">Next</a></body></html>").unwrap();
-        std::fs::write(&second, "<html><body><h1 id=\"target\">Target</h1></body></html>").unwrap();
+        std::fs::write(
+            &first,
+            "<html><body><a href=\"two.html#target\">Next</a></body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "<html><body><h1 id=\"target\">Target</h1></body></html>",
+        )
+        .unwrap();
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-        let uris = vec![first.to_string_lossy().into_owned(), second.to_string_lossy().into_owned()];
+        let uris = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host.clone(), TestShaper::default(), provider, uris, 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host.clone(),
+            TestShaper::default(),
+            provider,
+            uris,
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
 
-        renderer.prepare_frame(Size::new(600.0, 800.0)).paint(&mut RecordingPainter::default());
+        renderer
+            .prepare_frame(Size::new(600.0, 800.0))
+            .paint(&mut RecordingPainter::default());
         let root = renderer.core.page.view.document.render_view();
         let text = root.text();
         let addressing = root.addressing();
-        let linked_glyph = (0..text.glyph_count() as u32).find(|glyph| addressing.link_for_glyph(*glyph).is_some()).expect("fixture should contain a linked glyph");
-        let line_idx = renderer.core.doc().find_line_for_glyph(linked_glyph).unwrap();
-        let screen = renderer.core.page.view.frame.page().line_positions().get(line_idx).unwrap();
-        let line = renderer.core.page.view.document.render_view().text().line(line_idx).expect("linked line should be present");
-        let position = Point::new(screen.point.x + renderer.core.text_geometry().glyph_x_in_line(&line, linked_glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let linked_glyph = (0..text.glyph_count() as u32)
+            .find(|glyph| addressing.link_for_glyph(*glyph).is_some())
+            .expect("fixture should contain a linked glyph");
+        let line_idx = renderer
+            .core
+            .doc()
+            .find_line_for_glyph(linked_glyph)
+            .unwrap();
+        let screen = renderer
+            .core
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(line_idx)
+            .unwrap();
+        let line = renderer
+            .core
+            .page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(line_idx)
+            .expect("linked line should be present");
+        let position = Point::new(
+            screen.point.x
+                + renderer
+                    .core
+                    .text_geometry()
+                    .glyph_x_in_line(&line, linked_glyph)
+                + 0.1,
+            screen.point.y + line.height() / 2.0,
+        );
 
         let hover = renderer.pointer_move(position, crate::SelectionMode::Plain);
         assert!(hover.over_link);
         assert!(hover.link_hover_changed);
         assert!(renderer.pointer_down(position, PointerDownOptions::default()));
         let click_selection = renderer.core.page.view.selection.clone();
-        renderer.core.page.view.selection.select_range(linked_glyph, linked_glyph + 1, crate::SelectionMode::Plain);
+        renderer.core.page.view.selection.select_range(
+            linked_glyph,
+            linked_glyph + 1,
+            crate::SelectionMode::Plain,
+        );
         renderer.core.page.view.update_selection_text();
         assert!(renderer.selection_contains_point(position));
-        assert!(!renderer.selection_contains_point(Point::new(position.x, position.y + line.height() * 2.0)));
+        assert!(
+            !renderer
+                .selection_contains_point(Point::new(position.x, position.y + line.height() * 2.0))
+        );
         renderer.core.page.view.selection = click_selection;
         renderer.core.page.view.update_selection_text();
-        let selected_text = renderer.core.page.view.selection.content().plain().map(str::to_owned);
-        renderer.core.page.view.selection.install_text(selected_text, Some("Next".to_owned()));
+        let selected_text = renderer
+            .core
+            .page
+            .view
+            .selection
+            .content()
+            .plain()
+            .map(str::to_owned);
+        renderer
+            .core
+            .page
+            .view
+            .selection
+            .install_text(selected_text, Some("Next".to_owned()));
         host.fail_clipboard.set(true);
         assert!(renderer.copy_selection());
         assert!(host.events.borrow().iter().any(|event| matches!(
@@ -709,8 +950,30 @@ mod tests {
     }
 
     #[test]
-    fn viewport_resize_does_not_relayout_percentage_height_document() {
+    fn initial_cross_spine_target_is_selected_during_worker_preparation() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let fixture = std::env::temp_dir().join(format!("html-view-target-preparation-{nonce}"));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let first = fixture.join("one.html");
+        let second = fixture.join("two.html");
+        std::fs::write(&first, "<html><body>First</body></html>").unwrap();
+        std::fs::write(&second, "<html><body><h1 id=\"target\">Prepared target</h1></body></html>").unwrap();
+        let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
+        let uris = vec![first.to_string_lossy().into_owned(), second.to_string_lossy().into_owned()];
+        let preparation = crate::RendererPreparation::from_provider_with_nav_and_target(provider, uris, 0, Some("0:12"), Some("two.html#target"), crate::RendererInitialConfig::default()).unwrap();
+        assert_eq!(preparation.doc_index, 1, "the target document must be chosen before UI-thread shaping");
+        assert_eq!(preparation.initial_anchor.as_deref(), Some("target"));
+        let renderer = RendererSession::from_preparation(Rc::new(TestHost::default()), TestShaper::default(), preparation).unwrap();
+        assert_eq!(renderer.core.nav.location().document(), 1);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn viewport_resize_does_not_relayout_percentage_height_document() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-percentage-height-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.xht");
@@ -726,21 +989,40 @@ mod tests {
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         renderer.apply(RendererCommand::SetFontSize(16.0));
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
-        renderer.apply(RendererCommand::SetImageSizingPolicy(html::pipeline::ImageSizingPolicy::WebCompatible));
-        renderer.apply(RendererCommand::SetTextCompositionPolicy(html::pipeline::TextCompositionPolicy::WebCompatible));
+        renderer.apply(RendererCommand::SetImageSizingPolicy(
+            html::pipeline::ImageSizingPolicy::WebCompatible,
+        ));
+        renderer.apply(RendererCommand::SetTextCompositionPolicy(
+            html::pipeline::TextCompositionPolicy::WebCompatible,
+        ));
         let layout_revision = renderer.revisions().layout;
         renderer.prepare_frame(Size::new(800.0, 600.0));
-        assert_eq!(renderer.revisions().layout, layout_revision, "viewport preparation must not relayout height-dependent HTML");
+        assert_eq!(
+            renderer.revisions().layout,
+            layout_revision,
+            "viewport preparation must not relayout height-dependent HTML"
+        );
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn positioned_background_paints_after_an_earlier_inline_image() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-positioned-cover-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.xht");
@@ -757,16 +1039,35 @@ mod tests {
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
-        renderer.apply(RendererCommand::SetImageSizingPolicy(html::pipeline::ImageSizingPolicy::WebCompatible));
-        renderer.apply(RendererCommand::SetTextCompositionPolicy(html::pipeline::TextCompositionPolicy::WebCompatible));
+        renderer.apply(RendererCommand::SetImageSizingPolicy(
+            html::pipeline::ImageSizingPolicy::WebCompatible,
+        ));
+        renderer.apply(RendererCommand::SetTextCompositionPolicy(
+            html::pipeline::TextCompositionPolicy::WebCompatible,
+        ));
         let mut painter = RecordingPainter::default();
-        renderer.prepare_frame(Size::new(800.0, 600.0)).paint(&mut painter);
+        renderer
+            .prepare_frame(Size::new(800.0, 600.0))
+            .paint(&mut painter);
 
         assert!(
-            painter.fills.iter().any(|(rect, color)| { *color == Color::rgba8(0, 128, 0, 255) && (rect.width() - 300.0).abs() < 0.01 && (rect.height() - 100.0).abs() < 0.01 && rect.y0 > 100.0 }),
+            painter.fills.iter().any(|(rect, color)| {
+                *color == Color::rgba8(0, 128, 0, 255)
+                    && (rect.width() - 300.0).abs() < 0.01
+                    && (rect.height() - 100.0).abs() < 0.01
+                    && rect.y0 > 100.0
+            }),
             "the positioned cover must retain the vertical translation of its later containing block; fills={:?}",
             painter.fills
         );
@@ -775,62 +1076,147 @@ mod tests {
 
     #[test]
     fn identical_prepared_frame_reuses_authoritative_shaped_lines() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-line-cache-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
-        std::fs::write(&document, "<html><body><p>Kerning AV and office ligatures.</p><p>Second line.</p></body></html>").unwrap();
+        std::fs::write(
+            &document,
+            "<html><body><p>Kerning AV and office ligatures.</p><p>Second line.</p></body></html>",
+        )
+        .unwrap();
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
 
-        renderer.prepare_frame(Size::new(600.0, 800.0)).paint(&mut RecordingPainter::default());
+        renderer
+            .prepare_frame(Size::new(600.0, 800.0))
+            .paint(&mut RecordingPainter::default());
         let first_calls = renderer.glyph_shaper().line_shape_calls;
-        assert_eq!(first_calls, 0, "view preparation must consume document-authoritative shaping");
-        renderer.prepare_frame(Size::new(600.0, 800.0)).paint(&mut RecordingPainter::default());
-        assert_eq!(renderer.glyph_shaper().line_shape_calls, first_calls, "an unchanged cached frame must not reshape its lines");
-        renderer.prepare_frame(Size::new(620.0, 800.0)).paint(&mut RecordingPainter::default());
-        assert_eq!(renderer.glyph_shaper().line_shape_calls, first_calls, "a position-only width resize must reuse shaped visible lines");
+        assert_eq!(
+            first_calls, 0,
+            "view preparation must consume document-authoritative shaping"
+        );
+        renderer
+            .prepare_frame(Size::new(600.0, 800.0))
+            .paint(&mut RecordingPainter::default());
+        assert_eq!(
+            renderer.glyph_shaper().line_shape_calls,
+            first_calls,
+            "an unchanged cached frame must not reshape its lines"
+        );
+        renderer
+            .prepare_frame(Size::new(620.0, 800.0))
+            .paint(&mut RecordingPainter::default());
+        assert_eq!(
+            renderer.glyph_shaper().line_shape_calls,
+            first_calls,
+            "a position-only width resize must reuse shaped visible lines"
+        );
         renderer.change_column_width(-20.0);
-        renderer.prepare_frame(Size::new(620.0, 800.0)).paint(&mut RecordingPainter::default());
-        assert_eq!(renderer.glyph_shaper().line_shape_calls, first_calls, "a layout-changing resize must not invoke a second shaping owner");
+        renderer
+            .prepare_frame(Size::new(620.0, 800.0))
+            .paint(&mut RecordingPainter::default());
+        assert_eq!(
+            renderer.glyph_shaper().line_shape_calls,
+            first_calls,
+            "a layout-changing resize must not invoke a second shaping owner"
+        );
 
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn pagination_prepares_only_the_requested_page() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-prepared-page-runs-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
-        let paragraphs = (0..40).map(|index| format!("<p style='margin:0;height:24px'>Page line {index}</p>")).collect::<String>();
-        std::fs::write(&document, format!("<html><body style='margin:0'>{paragraphs}</body></html>")).unwrap();
+        let paragraphs = (0..40)
+            .map(|index| format!("<p style='margin:0;height:24px'>Page line {index}</p>"))
+            .collect::<String>();
+        std::fs::write(
+            &document,
+            format!("<html><body style='margin:0'>{paragraphs}</body></html>"),
+        )
+        .unwrap();
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host.clone(), TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host.clone(),
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         let viewport = Size::new(320.0, 96.0);
 
         renderer.prepare_frame(viewport);
-        assert!(!renderer.core.viewport.continuation().reached_end(), "the fixture must span multiple pages");
+        assert!(
+            !renderer.core.viewport.continuation().reached_end(),
+            "the fixture must span multiple pages"
+        );
         let first_page_start = renderer.core.page.view.frame.page().start_line();
         let active_shape_calls = renderer.glyph_shaper.line_shape_calls;
-        assert_eq!(active_shape_calls, 0, "visible pages consume document-authoritative shaping");
+        assert_eq!(
+            active_shape_calls, 0,
+            "visible pages consume document-authoritative shaping"
+        );
         for fragment in renderer.core.page.view.frame.shaping().shaped_lines() {
-            assert_eq!(renderer.glyph_shaper.active_line_runs.get(&fragment.shaped.run), Some(&fragment.shaped.line_index));
+            assert_eq!(
+                renderer
+                    .glyph_shaper
+                    .active_line_runs
+                    .get(&fragment.shaped.run),
+                Some(&fragment.shaped.line_index)
+            );
         }
 
-        assert!(renderer.core.prepared_pages.is_empty(), "no adjacent page should be materialized");
-        assert_eq!(renderer.core.page.view.frame.page().start_line(), first_page_start);
+        assert!(
+            renderer.core.prepared_pages.is_empty(),
+            "no adjacent page should be materialized"
+        );
+        assert_eq!(
+            renderer.core.page.view.frame.page().start_line(),
+            first_page_start
+        );
 
         renderer.next_page();
         renderer.prepare_frame(viewport);
-        assert_ne!(renderer.core.page.view.frame.page().start_line(), first_page_start);
-        assert_eq!(renderer.glyph_shaper.line_shape_calls, active_shape_calls, "paginating the requested page must not invoke view-owned shaping");
+        assert_ne!(
+            renderer.core.page.view.frame.page().start_line(),
+            first_page_start
+        );
+        assert_eq!(
+            renderer.glyph_shaper.line_shape_calls, active_shape_calls,
+            "paginating the requested page must not invoke view-owned shaping"
+        );
         for fragment in renderer.core.page.view.frame.shaping().shaped_lines() {
-            assert_eq!(renderer.glyph_shaper.active_line_runs.get(&fragment.shaped.run), Some(&fragment.shaped.line_index));
+            assert_eq!(
+                renderer
+                    .glyph_shaper
+                    .active_line_runs
+                    .get(&fragment.shaped.run),
+                Some(&fragment.shaped.line_index)
+            );
         }
 
         std::fs::remove_dir_all(fixture).unwrap();
@@ -838,59 +1224,135 @@ mod tests {
 
     #[test]
     fn viewport_resize_never_relayouts_html() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-height-resize-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let ordinary_path = fixture.join("ordinary.html");
         let dependent_path = fixture.join("dependent.html");
-        std::fs::write(&ordinary_path, "<html><body><p>ordinary book text</p></body></html>").unwrap();
+        std::fs::write(
+            &ordinary_path,
+            "<html><body><p>ordinary book text</p></body></html>",
+        )
+        .unwrap();
         std::fs::write(&dependent_path, "<html><head><style>html,body,main{height:100%;margin:0}</style></head><body><main>height-sensitive</main></body></html>").unwrap();
 
         let make_renderer = |path: &std::path::Path| {
             let mut config = crate::RendererInitialConfig::default();
             config.column_width = 300.0;
-            RendererSession::from_provider_with_nav(Rc::new(TestHost::default()), TestShaper::default(), Arc::new(FileSystemProvider::new()), vec![path.to_string_lossy().into_owned()], 0, Some("0:0"), config)
+            RendererSession::from_provider_with_nav(
+                Rc::new(TestHost::default()),
+                TestShaper::default(),
+                Arc::new(FileSystemProvider::new()),
+                vec![path.to_string_lossy().into_owned()],
+                0,
+                Some("0:0"),
+                config,
+            )
         };
 
         let mut ordinary = make_renderer(&ordinary_path);
         ordinary.prepare_frame(Size::new(320.0, 400.0));
         let ordinary_revision = ordinary.revisions().layout;
         ordinary.prepare_frame(Size::new(320.0, 500.0));
-        assert_eq!(ordinary.revisions().layout, ordinary_revision, "height-independent prose must only be repaginated");
-        let page_range = (ordinary.core.page.view.frame.page().start_line(), ordinary.core.page.view.frame.page().end_line());
+        assert_eq!(
+            ordinary.revisions().layout,
+            ordinary_revision,
+            "height-independent prose must only be repaginated"
+        );
+        let page_range = (
+            ordinary.core.page.view.frame.page().start_line(),
+            ordinary.core.page.view.frame.page().end_line(),
+        );
         let first_line = page_range.0.expect("ordinary fixture has a visible line");
-        let old_x = ordinary.core.page.view.frame.page().line_positions().get(first_line).expect("first line is positioned").point.x;
+        let old_x = ordinary
+            .core
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(first_line)
+            .expect("first line is positioned")
+            .point
+            .x;
         let old_geometry = ordinary.core.page.view.frame.geometry_key();
         ordinary.prepare_frame(Size::new(340.0, 500.0));
-        let new_x = ordinary.core.page.view.frame.page().line_positions().get(first_line).expect("first line remains positioned").point.x;
+        let new_x = ordinary
+            .core
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(first_line)
+            .expect("first line remains positioned")
+            .point
+            .x;
         let new_geometry = ordinary.core.page.view.frame.geometry_key();
-        assert_eq!((ordinary.core.page.view.frame.page().start_line(), ordinary.core.page.view.frame.page().end_line()), page_range, "width-only geometry must retain page membership");
-        assert!((new_x - old_x - 10.0).abs() < 0.01, "the installed page should be reprojected into the new 10px column gap; old_x={old_x}, new_x={new_x}, old_geometry={old_geometry:?}, new_geometry={new_geometry:?}");
+        assert_eq!(
+            (
+                ordinary.core.page.view.frame.page().start_line(),
+                ordinary.core.page.view.frame.page().end_line()
+            ),
+            page_range,
+            "width-only geometry must retain page membership"
+        );
+        assert!(
+            (new_x - old_x - 10.0).abs() < 0.01,
+            "the installed page should be reprojected into the new 10px column gap; old_x={old_x}, new_x={new_x}, old_geometry={old_geometry:?}, new_geometry={new_geometry:?}"
+        );
 
         let mut dependent = make_renderer(&dependent_path);
         dependent.prepare_frame(Size::new(320.0, 400.0));
         let dependent_revision = dependent.revisions().layout;
         dependent.prepare_frame(Size::new(320.0, 500.0));
-        assert_eq!(dependent.revisions().layout, dependent_revision, "height-dependent HTML must retain its existing layout during resize");
+        assert_eq!(
+            dependent.revisions().layout,
+            dependent_revision,
+            "height-dependent HTML must retain its existing layout during resize"
+        );
         dependent.prepare_frame(Size::new(320.0, 500.0));
-        assert_eq!(dependent.revisions().layout, dependent_revision, "settling at the new viewport must not trigger delayed relayout");
+        assert_eq!(
+            dependent.revisions().layout,
+            dependent_revision,
+            "settling at the new viewport must not trigger delayed relayout"
+        );
         dependent.prepare_frame(Size::new(180.0, 500.0));
-        assert_eq!(dependent.revisions().layout, dependent_revision, "a resize narrower than the laid-out column must not trigger HTML relayout");
+        assert_eq!(
+            dependent.revisions().layout,
+            dependent_revision,
+            "a resize narrower than the laid-out column must not trigger HTML relayout"
+        );
 
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn selection_boundary_affinity_preserves_the_gap_around_an_inline_image() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let fixture = std::env::temp_dir().join(format!("html-view-inline-image-selection-{nonce}"));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture =
+            std::env::temp_dir().join(format!("html-view-inline-image-selection-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
         std::fs::write(&document, "<html><body style='margin:0'><p style='margin:0;white-space:nowrap'>a<img src='missing.png' style='width:20px;height:10px'>b</p></body></html>").unwrap();
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
         let view = renderer.core.page.view.document.render_view().text();
@@ -902,12 +1364,28 @@ mod tests {
             .expect("text on both sides of an inline image should remain independently positioned on one line");
         let line = view.line(line_idx).unwrap();
         let boundary = before_range.end;
-        let before_image = renderer.core.text_geometry().glyph_x_in_line_trailing(&line, boundary);
-        let after_image = renderer.core.text_geometry().glyph_x_in_line(&line, boundary);
-        assert!(after_image > before_image, "leading and trailing affinity must preserve the replaced-content gap");
+        let before_image = renderer
+            .core
+            .text_geometry()
+            .glyph_x_in_line_trailing(&line, boundary);
+        let after_image = renderer
+            .core
+            .text_geometry()
+            .glyph_x_in_line(&line, boundary);
+        assert!(
+            after_image > before_image,
+            "leading and trailing affinity must preserve the replaced-content gap"
+        );
         assert_eq!(
-            renderer.core.doc().line_text_intersections(line_idx, before_range.start, after_range.end).collect::<Vec<_>>(),
-            vec![(before_range.start, before_range.end), (after_range.start, after_range.end)],
+            renderer
+                .core
+                .doc()
+                .line_text_intersections(line_idx, before_range.start, after_range.end)
+                .collect::<Vec<_>>(),
+            vec![
+                (before_range.start, before_range.end),
+                (after_range.start, after_range.end)
+            ],
             "interaction overlays must preserve the replaced-content gap instead of merging both text fragments",
         );
 
@@ -916,7 +1394,10 @@ mod tests {
 
     #[test]
     fn nested_atomic_selection_intersects_only_its_owning_line() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-atomic-selection-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
@@ -924,27 +1405,71 @@ mod tests {
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
         let view = renderer.core.page.view.document.render_view().text();
-        let glyph_for = |target| (0..view.glyph_count() as u32).find(|index| view.glyph_at(*index as usize).and_then(|glyph| view.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == target)).expect("fixture character must exist");
-        let outer_line = renderer.core.doc().find_line_for_glyph(glyph_for('A')).unwrap();
+        let glyph_for = |target| {
+            (0..view.glyph_count() as u32)
+                .find(|index| {
+                    view.glyph_at(*index as usize)
+                        .and_then(|glyph| view.glyph_metric(glyph))
+                        .is_some_and(|metric| metric.ch() == target)
+                })
+                .expect("fixture character must exist")
+        };
+        let outer_line = renderer
+            .core
+            .doc()
+            .find_line_for_glyph(glyph_for('A'))
+            .unwrap();
         let nested = glyph_for('I');
         let nested_line = renderer.core.doc().find_line_for_glyph(nested).unwrap();
 
         assert_ne!(outer_line, nested_line);
-        assert_eq!(renderer.core.doc().line_text_intersections(outer_line, nested, nested + 1).next(), None);
-        assert_eq!(renderer.core.doc().line_text_intersections(nested_line, nested, nested + 1).next(), Some((nested, nested + 1)));
-        assert_eq!(renderer.core.doc().find_line_for_glyph(glyph_for('B')), Some(outer_line));
-        assert_eq!(renderer.core.visible_text(), "AINNERB", "speakable text must merge nested atomic lines back into source reading order");
+        assert_eq!(
+            renderer
+                .core
+                .doc()
+                .line_text_intersections(outer_line, nested, nested + 1)
+                .next(),
+            None
+        );
+        assert_eq!(
+            renderer
+                .core
+                .doc()
+                .line_text_intersections(nested_line, nested, nested + 1)
+                .next(),
+            Some((nested, nested + 1))
+        );
+        assert_eq!(
+            renderer.core.doc().find_line_for_glyph(glyph_for('B')),
+            Some(outer_line)
+        );
+        assert_eq!(
+            renderer.core.visible_text(),
+            "AINNERB",
+            "speakable text must merge nested atomic lines back into source reading order"
+        );
 
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn native_line_rejection_uses_the_emergency_glyph_path_instead_of_hiding_text() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-native-rejection-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
@@ -952,19 +1477,38 @@ mod tests {
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let shaper = TestShaper { reject_lines: true, ..TestShaper::default() };
-        let mut renderer = RendererSession::from_provider_with_nav(host, shaper, provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
+        let shaper = TestShaper {
+            reject_lines: true,
+            ..TestShaper::default()
+        };
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            shaper,
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
         let mut painter = NativeFallbackPainter::default();
-        renderer.prepare_frame(Size::new(600.0, 800.0)).paint(&mut painter);
+        renderer
+            .prepare_frame(Size::new(600.0, 800.0))
+            .paint(&mut painter);
 
         assert_eq!(painter.text_runs, 0);
-        assert!(!painter.recording.glyphs.is_empty(), "a rejected native line must retain visible emergency glyph output");
+        assert!(
+            !painter.recording.glyphs.is_empty(),
+            "a rejected native line must retain visible emergency glyph output"
+        );
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn view_does_not_reissue_document_shaping_requests() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-native-line-features-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let document = fixture.join("document.html");
@@ -992,9 +1536,23 @@ mod tests {
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
         let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(host, TestShaper::default(), provider, vec![document.to_string_lossy().into_owned()], 0, Some("0:0"), crate::RendererInitialConfig::default());
-        renderer.prepare_frame(Size::new(600.0, 1000.0)).paint(&mut RecordingPainter::default());
-        assert_eq!(renderer.glyph_shaper().line_shape_calls, 0, "view preparation must not create a second document-shaping pipeline");
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host,
+            TestShaper::default(),
+            provider,
+            vec![document.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
+        renderer
+            .prepare_frame(Size::new(600.0, 1000.0))
+            .paint(&mut RecordingPainter::default());
+        assert_eq!(
+            renderer.glyph_shaper().line_shape_calls,
+            0,
+            "view preparation must not create a second document-shaping pipeline"
+        );
 
         std::fs::remove_dir_all(fixture).unwrap();
     }
