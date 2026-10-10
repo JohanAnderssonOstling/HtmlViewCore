@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
 use crate::{DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, RendererPreparation, ResourceProvider, TocEntry, ViewportState, load};
+use html::resources::ImageLoader;
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
 
@@ -19,6 +20,12 @@ mod pending;
 pub(crate) use pending::{PendingNavigation, NavigationRequest};
 
 impl RendererPreparation {
+    /// Supply image I/O separately from the synchronous text provider.
+    pub fn with_image_loader(mut self, loader: Arc<dyn ImageLoader>) -> Self {
+        self.image_loader = Some(loader);
+        self
+    }
+
     pub fn from_provider_with_nav(
         provider: Arc<dyn ResourceProvider>,
         document_uris: Vec<String>,
@@ -62,7 +69,7 @@ impl RendererPreparation {
                 note_display: config.note_display,
             },
         )?;
-        Ok(Self { loaded, provider, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config })
+        Ok(Self { loaded, provider, image_loader: None, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config })
     }
 
     fn resolve_initial_target(
@@ -184,10 +191,10 @@ impl RendererCore {
         glyph_shaper: &mut impl GlyphShaper,
         prepared: RendererPreparation,
     ) -> Result<Self, String> {
-        let RendererPreparation { loaded, provider, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config } = prepared;
+        let RendererPreparation { loaded, provider, image_loader, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config } = prepared;
         let restoring_position = nav_state.is_some();
         let loaded = load::finish_prepared_document(loaded, glyph_shaper)?;
-        let mut renderer = Self::new(host, loaded, provider, document_uris, doc_index, config);
+        let mut renderer = Self::new_with_image_loader(host, loaded, provider, document_uris, doc_index, config, image_loader);
 
         if let Some(anchor) = initial_anchor {
             renderer.navigate_to_href(glyph_shaper, &format!("#{anchor}"));

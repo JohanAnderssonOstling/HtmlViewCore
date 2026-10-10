@@ -18,7 +18,7 @@ pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
 use html::pipeline::{EarliestStage, PipelineInputs};
 pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy};
 pub use html::resources::{BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata, ResourceProvider};
-use html::resources::{ImagePipeline, ImageService};
+use html::resources::{ImageLoader, ImagePipeline, ImageService};
 
 pub use html_view_cfi as cfi;
 
@@ -177,6 +177,7 @@ mod frame_cache_tests {
 pub struct RendererPreparation {
     loaded: load::PreparedRenderDocument,
     provider: Arc<dyn ResourceProvider>,
+    image_loader: Option<Arc<dyn ImageLoader>>,
     document_uris: Vec<String>,
     doc_index: usize,
     glyph_index: u32,
@@ -316,11 +317,20 @@ impl RendererCore {
         self.host.emit(RendererEvent::OperationFailed { operation, message });
     }
 
+    #[cfg(test)]
     pub fn new(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig) -> Self {
+        Self::new_with_image_loader(host, loaded, provider, document_uris, current_doc_index, config, None)
+    }
+
+    fn new_with_image_loader(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig, image_loader: Option<Arc<dyn ImageLoader>>) -> Self {
         let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
-        let image_service = ImageService::with_job_spawner(provider.clone(), host.blocking_job_spawner(), ImageService::DEFAULT_BYTE_BUDGET);
+        let jobs = host.blocking_job_spawner();
+        let image_service = match image_loader {
+            Some(loader) => ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET),
+            None => ImageService::with_job_spawner(provider.clone(), jobs, ImageService::DEFAULT_BYTE_BUDGET),
+        };
         image_service.set_completion_waker(host.resource_waker());
         let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
