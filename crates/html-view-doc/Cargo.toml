@@ -11,3 +11,4 @@ kurbo.workspace = true
 html-view-cfi.workspace = true
 html-view-types.workspace = true
 unicode-normalization.workspace = true
+unicode-segmentation = "1.12"

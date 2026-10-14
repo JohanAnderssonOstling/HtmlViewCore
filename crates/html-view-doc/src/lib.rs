@@ -18,6 +18,7 @@ enum GlyphAffinity {
 use html::layout::{LaidOutDocument, RenderTableCell};
 use html_view_types::{ColumnLayout, FormatState, RendererAnnotation, SearchOptions, VisibleFrame};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy)]
 pub struct DocQuery<'a> {
@@ -91,15 +92,8 @@ impl<'a> DocQuery<'a> {
         let tag = self.box_tag(box_idx);
         let style = self.boxes().text_format(box_idx);
 
-        let mut state = FormatState {
-            italic: matches!(
-                style.font_style,
-                html::layout::FontStyle::Italic | html::layout::FontStyle::Oblique
-            ),
-            bold: style.font_weight >= 600,
-            strike: style.text_decoration.line_through(),
-            ..FormatState::default()
-        };
+        let mut state =
+            FormatState { italic: matches!(style.font_style, html::layout::FontStyle::Italic | html::layout::FontStyle::Oblique), bold: style.font_weight >= 600, strike: style.text_decoration.line_through(), ..FormatState::default() };
 
         if tag_is_one_of(&tag, &["em", "i"]) {
             state.italic = true;
@@ -185,6 +179,34 @@ impl<'a> DocQuery<'a> {
             return (None, None);
         }
         (Some(plain), Some(markdown))
+    }
+
+    /// A Unicode word at a layout character, spanning inline runs and wrapped
+    /// lines, but never joining text from separate block containers.
+    pub fn word_range_at(self, glyph: u32) -> Option<Range<u32>> {
+        let hit = self.text().text_runs().find(|run| run.glyphs().contains(&glyph))?;
+        let block = self.block_ancestor(hit.box_idx());
+        let mut text = String::new();
+        let mut positions = Vec::new();
+        let mut target_byte = None;
+        for run in self.text().text_runs().filter(|run| self.block_ancestor(run.box_idx()) == block) {
+            for index in run.glyphs() {
+                let metric = self.text().glyph_at(index as usize).and_then(|id| self.text().glyph_metric(id))?;
+                if index == glyph {
+                    target_byte = Some(text.len());
+                }
+                positions.push(index);
+                text.push(metric.ch());
+            }
+        }
+        let target = target_byte?;
+        let segment = text
+            .unicode_word_indices()
+            .find(|(offset, word)| *offset <= target && target < *offset + word.len())
+            .or_else(|| text.grapheme_indices(true).find(|(offset, cluster)| *offset <= target && target < *offset + cluster.len() && !cluster.chars().all(char::is_whitespace)))?;
+        let first = text[..segment.0].chars().count();
+        let count = segment.1.chars().count();
+        Some(positions[first]..positions[first + count - 1] + 1)
     }
 
     pub fn find_line_for_glyph(self, glyph_idx: u32) -> Option<usize> {
@@ -445,7 +467,6 @@ impl<'a> DocQuery<'a> {
         }
         Some(lo)
     }
-
 
     pub fn best_anchor_from_glyphs(self, glyph_limit: u32, filter: Option<&HashSet<u16>>) -> Option<u16> {
         let mut best: Option<(u16, u32)> = None;
@@ -755,6 +776,26 @@ impl<'a> TextGeometry<'a> {
         bounds.filter(|rect| rect.width() > 0.0 || rect.height() > 0.0)
     }
 
+    /// Caret positions at the two ends, rather than the bounding box of a
+    /// multiline selection. Only boundaries on the current page are returned.
+    pub fn selection_endpoints(&self, start: u32, end: u32) -> (Option<Point>, Option<Point>) {
+        let mut leading = None;
+        let mut trailing = None;
+        if start >= end {
+            return (leading, trailing);
+        }
+        for (line_idx, screen) in self.frame.page().line_positions().iter() {
+            let Some(line) = self.doc.text().line(line_idx) else { continue };
+            if self.doc.line_text_intersections(line_idx, start, start + 1).next().is_some() {
+                leading = Some(Point::new(screen.point.x + self.glyph_x_in_line(&line, start), screen.point.y + line.height()));
+            }
+            if self.doc.line_text_intersections(line_idx, end - 1, end).next().is_some() {
+                trailing = Some(Point::new(screen.point.x + self.glyph_x_in_line_trailing(&line, end), screen.point.y + line.height()));
+            }
+        }
+        (leading, trailing)
+    }
+
     pub fn hit_test_glyph(&self, pos: Point) -> Option<u32> {
         // find nearest glyph index for a screen position
         let lines = self.doc.text().lines();
@@ -896,7 +937,7 @@ mod tests {
     use super::*;
     use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, LayoutConstraints};
     use html::pipeline::DocumentFactory;
-    use html_view_types::{SearchScope, SearchOptions as Opts};
+    use html_view_types::{SearchOptions as Opts, SearchScope};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -948,11 +989,7 @@ mod tests {
     fn layout(html: &str) -> LaidOutDocument {
         let mut factory = DocumentFactory::new();
         let mut shaper = TestShaper::default();
-        factory
-            .parse_with_new_pipeline(html, None)
-            .shape(&mut shaper)
-            .expect("the test shaper registers every glyph")
-            .layout(LayoutConstraints::new(600.0, 16.0).expect("constraints must be valid"))
+        factory.parse_with_new_pipeline(html, None).shape(&mut shaper).expect("the test shaper registers every glyph").layout(LayoutConstraints::new(600.0, 16.0).expect("constraints must be valid"))
     }
 
     fn options() -> Opts {
@@ -992,6 +1029,23 @@ mod tests {
         assert!(markdown.contains("Title"), "the heading text survives: {markdown:?}");
         assert!(markdown.contains("*soft*"), "em becomes emphasis: {markdown:?}");
         assert!(markdown.contains("**hard**"), "strong becomes bold: {markdown:?}");
+    }
+
+    #[test]
+    fn touch_words_span_inline_runs_preserve_unicode_and_stop_at_blocks() {
+        let document = layout("<p>ca<em>fe\u{301}</em> can't 中文</p><p>next</p>");
+        let doc = DocQuery::new(&document);
+        for (character, expected) in [('f', "cafe\u{301}"), ('\u{301}', "cafe\u{301}"), ('\'', "can't"), ('n', "can't")] {
+            let range = doc.word_range_at(glyph_of(doc, character)).unwrap();
+            assert_eq!(doc.glyph_text(&[range]), expected);
+        }
+        let document = layout("<p>alpha</p><p>beta</p>");
+        let doc = DocQuery::new(&document);
+        assert_eq!(doc.glyph_text(&[doc.word_range_at(glyph_of(doc, 'a')).unwrap()]), "alpha");
+        assert_eq!(doc.glyph_text(&[doc.word_range_at(glyph_of(doc, 'b')).unwrap()]), "beta");
+        let document = layout("<p>one two</p>");
+        let doc = DocQuery::new(&document);
+        assert!(doc.word_range_at(glyph_of(doc, ' ')).is_none());
     }
 
     #[test]
@@ -1099,10 +1153,7 @@ mod tests {
         for (start, end) in matches {
             assert_eq!(end - start, 5, "each match spans the query length");
             let range = start..end;
-            assert_eq!(
-                doc.glyph_text(std::slice::from_ref(&range)).to_lowercase(),
-                "alpha"
-            );
+            assert_eq!(doc.glyph_text(std::slice::from_ref(&range)).to_lowercase(), "alpha");
         }
     }
 

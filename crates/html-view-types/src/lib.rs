@@ -73,6 +73,8 @@ pub struct InteractionPalette {
     pub active_search_match: Color,
     pub annotation: Color,
     pub active_annotation: Color,
+    /// The passage being read aloud.
+    pub reading: Color,
 }
 
 impl Default for InteractionPalette {
@@ -83,6 +85,7 @@ impl Default for InteractionPalette {
             active_search_match: Color::rgba8(190, 116, 55, 164),
             annotation: Color::rgba8(236, 204, 91, 104),
             active_annotation: Color::rgba8(196, 126, 57, 148),
+            reading: Color::rgba8(151, 188, 159, 56),
         }
     }
 }
@@ -246,6 +249,7 @@ pub enum RendererCommand {
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),
+    SetReadingTarget(Option<html::layout::ReadingTarget>),
     RequestVisibleText,
     CopySelection,
     CopySelectionCitation {
@@ -313,6 +317,7 @@ pub enum RendererEvent {
 pub enum RendererOperation {
     CopySelection,
     CopyImage,
+    CopyEquationLatex,
     UpdateDocument,
 }
 
@@ -321,6 +326,7 @@ impl fmt::Display for RendererOperation {
         formatter.write_str(match self {
             Self::CopySelection => "copy selection",
             Self::CopyImage => "copy image",
+            Self::CopyEquationLatex => "copy equation as LaTeX",
             Self::UpdateDocument => "update document rendering",
         })
     }

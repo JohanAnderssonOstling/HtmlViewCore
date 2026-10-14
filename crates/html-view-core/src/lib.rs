@@ -13,12 +13,13 @@ use crate::document_cache::DocumentCache;
 use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPageCache;
 use crate::spine_item::SpineItem;
+use html::document::ImageSource;
 use html::layout::GlyphShaper;
 pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
 use html::pipeline::{EarliestStage, PipelineInputs};
 pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy};
 pub use html::resources::{BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata, ResourceProvider};
-use html::resources::{ImagePipeline, ImageService};
+use html::resources::{ImageLoader, ImagePipeline, ImageService};
 
 pub use html_view_cfi as cfi;
 
@@ -26,6 +27,7 @@ mod document_cache;
 mod document_view;
 mod prepared_page;
 mod spine_item;
+mod mathml;
 
 pub mod layout {
     pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
@@ -49,6 +51,7 @@ pub mod text_backend {
 }
 
 pub use html::layout::LaidOutDocument;
+pub use html::layout::{ReadingFragment, ReadingTarget};
 pub use html::render::{Painter, RecordingPainter, TextRunFragment};
 
 mod session;
@@ -177,6 +180,7 @@ mod frame_cache_tests {
 pub struct RendererPreparation {
     loaded: load::PreparedRenderDocument,
     provider: Arc<dyn ResourceProvider>,
+    image_loader: Option<Arc<dyn ImageLoader>>,
     document_uris: Vec<String>,
     doc_index: usize,
     glyph_index: u32,
@@ -316,11 +320,20 @@ impl RendererCore {
         self.host.emit(RendererEvent::OperationFailed { operation, message });
     }
 
+    #[cfg(test)]
     pub fn new(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig) -> Self {
+        Self::new_with_image_loader(host, loaded, provider, document_uris, current_doc_index, config, None)
+    }
+
+    fn new_with_image_loader(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig, image_loader: Option<Arc<dyn ImageLoader>>) -> Self {
         let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
-        let image_service = ImageService::with_job_spawner(provider.clone(), host.blocking_job_spawner(), ImageService::DEFAULT_BYTE_BUDGET);
+        let jobs = host.blocking_job_spawner();
+        let image_service = match image_loader {
+            Some(loader) => ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET),
+            None => ImageService::with_job_spawner(provider.clone(), jobs, ImageService::DEFAULT_BYTE_BUDGET),
+        };
         image_service.set_completion_waker(host.resource_waker());
         let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
@@ -415,7 +428,26 @@ impl RendererCore {
         let update = self.page.session.update(requested_inputs.clone(), glyph_shaper)?;
 
         let document = self.page.session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
+        // Typography preparation can regenerate MathML SVGs. Replace only
+        // the image pipeline when their source bytes actually changed.
+        let math_changed = self.page.view.document.render_view().images().iter()
+            .zip(document.render_view().images()).any(|(old, new)| {
+                matches!((&old.source, &new.source),
+                    (ImageSource::MathMl { svg: old, .. }, ImageSource::MathMl { svg: new, .. }) if old != new)
+            });
+        if math_changed {
+            self.page.images = crate::spine_item::SpineItem::image_pipeline_for(&document, self.image_service.clone());
+        }
         self.root_font_size = self.page.install_pipeline_result(document, requested_inputs);
+        if update.stage == EarliestStage::Paint {
+            // Paint changes preserve pagination, selection and reading position.
+            // Revisions invalidate the displayed colors without discarding geometry.
+            self.revisions.invalidate_pipeline_from(EarliestStage::Paint);
+            if request_repaint {
+                self.host.request_repaint();
+            }
+            return Ok(());
+        }
         if update.stage == EarliestStage::None {
             // reset_view_state also clears selection even when all pipeline
             // products were reusable.
@@ -424,6 +456,7 @@ impl RendererCore {
             self.revisions.invalidate_pipeline_from(update.stage);
         }
         self.reset_view_state();
+        self.resolve_media_overlay_highlight();
         if update.anchors_preserved {
             if let Some(glyph_idx) = anchor_glyph {
                 self.restore_glyph_position(glyph_idx);
@@ -568,6 +601,11 @@ impl RendererCore {
             }
             RendererCommand::SetMediaOverlayTarget(target_href) => {
                 self.media_overlay.set_target(target_href);
+                self.resolve_media_overlay_highlight();
+                self.request_overlay_repaint();
+            }
+            RendererCommand::SetReadingTarget(target) => {
+                self.media_overlay.set_reading_target(target);
                 self.resolve_media_overlay_highlight();
                 self.request_overlay_repaint();
             }

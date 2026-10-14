@@ -8,7 +8,9 @@
 //! The overlay state types live here too -- what to highlight and how to draw it
 //! are the same concern.
 
+use html::layout::ReadingTarget;
 use html::render::Painter;
+use std::ops::Range;
 use html::resources::ImagePipeline;
 use html_view_doc::{DocQuery, TextGeometry, scaled_image_size};
 use html_view_select::SelectionView;
@@ -30,6 +32,8 @@ pub struct AnnotationOverlayState {
 pub struct MediaOverlayHighlightState {
     target_href: Option<String>,
     visible: Option<(u32, u32)>,
+    reading_target: Option<ReadingTarget>,
+    reading_ranges: Vec<Range<u32>>,
 }
 
 #[derive(Default)]
@@ -327,7 +331,18 @@ impl MediaOverlayHighlightState {
     pub fn set_target(&mut self, target_href: Option<String>) {
         self.target_href = target_href;
         self.visible = None;
+        self.reading_target = None;
+        self.reading_ranges.clear();
     }
+
+    pub fn reading_target(&self) -> Option<&ReadingTarget> { self.reading_target.as_ref() }
+
+    pub fn set_reading_target(&mut self, target: Option<ReadingTarget>) {
+        self.set_target(None);
+        self.reading_target = target;
+    }
+
+    pub fn set_reading_ranges(&mut self, ranges: Vec<Range<u32>>) { self.reading_ranges = ranges; }
 
     pub fn visible(&self) -> Option<(u32, u32)> {
         self.visible
@@ -337,6 +352,7 @@ impl MediaOverlayHighlightState {
         Self {
             target_href,
             visible,
+            ..Self::default()
         }
     }
 }
@@ -729,7 +745,7 @@ impl<'a> PagePainter<'a> {
             );
         }
         selected_ranges.sort_by_key(|range| range.start);
-        let mut merged: Vec<std::ops::Range<u32>> = Vec::new();
+        let mut merged: Vec<Range<u32>> = Vec::new();
         for range in selected_ranges {
             if let Some(previous) = merged.last_mut()
                 && range.start <= previous.end
@@ -1284,7 +1300,13 @@ impl<'a> PagePainter<'a> {
                     hash,
                     width,
                     height,
-                } => cx.draw_svg(bytes, hash, (*width, *height), rect),
+                } => {
+                    if self.geo.doc.view().image_mathml(frag.image_idx()).is_some() {
+                        cx.draw_math_svg(bytes, hash, (*width, *height), rect, frag.text_color());
+                    } else {
+                        cx.draw_svg(bytes, hash, (*width, *height), rect);
+                    }
+                }
             }
         } else {
             cx.fill_rect(rect, placeholder);
@@ -1362,7 +1384,13 @@ impl<'a> PagePainter<'a> {
                     AnnotationStyle::Highlight => {
                         Rect::new(x0, screen.y, x1, screen.y + line.height())
                     }
-                    AnnotationStyle::Underline | AnnotationStyle::Squiggly => Rect::new(
+                    AnnotationStyle::Squiggly => {
+                        for rect in squiggly_rects(x0, x1, screen.y + line.height()) {
+                            painter.fill_rect(rect, color);
+                        }
+                        continue;
+                    }
+                    AnnotationStyle::Underline => Rect::new(
                         x0,
                         screen.y + line.height() - thickness,
                         x1,
@@ -1380,30 +1408,37 @@ impl<'a> PagePainter<'a> {
         }
     }
 
-    pub fn paint_media_overlay_for_line(
-        &self,
-        painter: &mut impl Painter,
-        line: &html::layout::RenderLine,
-        screen: Point,
-    ) {
-        let Some((range_start, range_end)) = self.media_overlay.visible else {
-            return;
-        };
-        for (start, end) in
-            self.geo
-                .doc
-                .line_text_intersections(line.index(), range_start, range_end)
-        {
-            let (x0, x1) = self.geo.glyph_x_span_in_line(line, start, end);
-            let (x0, x1) = (screen.x + x0, screen.x + x1);
-            if x1 > x0 {
-                painter.fill_rect(
-                    Rect::new(x0, screen.y, x1, screen.y + line.height()),
-                    Color::rgba8(82, 139, 255, 54),
-                );
+    pub fn paint_media_overlay_for_line(&self, painter: &mut impl Painter, line: &html::layout::RenderLine, screen: Point) {
+        let visible_range = self.media_overlay.visible.map(|(start, end)| start..end);
+        let ranges = if self.media_overlay.reading_target.is_some() { self.media_overlay.reading_ranges.as_slice() } else { visible_range.as_slice() };
+        for range in ranges {
+            let (range_start, range_end) = (range.start, range.end);
+            for (start, end) in self.geo.doc.line_text_intersections(line.index(), range_start, range_end) {
+                let (x0, x1) = self.geo.glyph_x_span_in_line(line, start, end);
+                let (x0, x1) = (screen.x + x0, screen.x + x1);
+                if x1 > x0 {
+                    painter.fill_rect(Rect::new(x0, screen.y, x1, screen.y + line.height()), self.interaction_palette.reading);
+                }
             }
         }
     }
+}
+
+/// Subpixel strips trace a wave using the portable painter's rectangle
+/// primitive. Keep the whole stroke inside the line's lower edge.
+fn squiggly_rects(x0: f64, x1: f64, bottom: f64) -> impl Iterator<Item = Rect> {
+    const STEP: f64 = 0.5;
+    const AMPLITUDE: f64 = 1.5;
+    const THICKNESS: f64 = 1.5;
+    const WAVELENGTH: f64 = 6.0;
+    let count = ((x1 - x0).max(0.0) / STEP).ceil() as usize;
+    (0..count).map(move |index| {
+        let left = x0 + index as f64 * STEP;
+        let right = (left + STEP).min(x1);
+        let phase = ((left + right) / 2.0 - x0) * std::f64::consts::TAU / WAVELENGTH;
+        let center = bottom - AMPLITUDE - THICKNESS / 2.0 + AMPLITUDE * phase.sin();
+        Rect::new(left, center - THICKNESS / 2.0, right, center + THICKNESS / 2.0)
+    })
 }
 
 #[cfg(test)]
@@ -1416,6 +1451,18 @@ mod render_tests {
 
         assert_eq!(origin.x, 31.609_375);
         assert_eq!(origin.y, 7.4);
+    }
+
+    #[test]
+    fn squiggly_stroke_waves_and_stays_inside_its_text_range() {
+        let rects: Vec<_> = squiggly_rects(10.25, 28.4, 40.0).collect();
+        assert_eq!(rects.first().unwrap().x0, 10.25);
+        assert_eq!(rects.last().unwrap().x1, 28.4);
+        assert!(rects.iter().all(|rect| rect.y0 >= 35.5 && rect.y1 <= 40.0));
+        assert!(rects.windows(2).all(|pair| pair[0].x1 == pair[1].x0));
+        assert!(rects.iter().any(|rect| rect.y0 > 38.0));
+        assert!(rects.iter().any(|rect| rect.y0 < 36.0));
+        assert!(squiggly_rects(10.0, 10.0, 40.0).next().is_none());
     }
 
     #[test]
