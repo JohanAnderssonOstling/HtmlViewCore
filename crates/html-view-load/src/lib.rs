@@ -16,7 +16,12 @@ use html_view_types::NoteDisplay;
 pub struct LoadedRenderDocument {
     pub session: Engine,
     pub inputs: PipelineInputs,
-    pub document: LaidOutDocument,
+}
+
+impl LoadedRenderDocument {
+    pub fn document(&self) -> &LaidOutDocument {
+        self.session.document().expect("loaded chapter has a published layout")
+    }
 }
 
 /// Initial document state prepared without a platform glyph shaper.
@@ -133,8 +138,8 @@ pub fn finish_prepared_document(
     mut prepared: PreparedRenderDocument,
     glyph_shaper: &mut impl GlyphShaper,
 ) -> Result<LoadedRenderDocument, String> {
-    let document = prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
-    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs, document })
+    prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
+    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs })
 }
 
 /// Decode the source and build the same inputs for worker preparation and
@@ -189,11 +194,10 @@ fn load_document_with_dom_pipeline_impl(
     let start = Instant::now();
     let mut session = Engine::new(provider);
     session.update(inputs.clone(), glyph_shaper).expect("initial pipeline update should succeed");
-    let document = session.document().expect("pipeline session should own a laid-out document").clone();
     if let Some(timings) = timings {
         timings.layout_total += start.elapsed();
     }
-    LoadedRenderDocument { session, inputs, document }
+    LoadedRenderDocument { session, inputs }
 }
 
 pub fn load_document(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> LoadedRenderDocument {
@@ -395,7 +399,7 @@ mod tests {
             .expect("document should prepare");
         let mut shaper = TestGlyphShaper::default();
         let loaded = super::finish_prepared_document(prepared, &mut shaper).expect("platform shaping should finish");
-        assert!(loaded.document.render_view().text().glyph_count() > 0);
+        assert!(loaded.document().render_view().text().glyph_count() > 0);
         let _ = fs::remove_file(path);
     }
 
@@ -627,7 +631,7 @@ mod tests {
                 }
             };
 
-            let mut report = document.document.memory_usage_report();
+            let mut report = document.document().memory_usage_report();
             report.sort_by_bytes_desc();
             let total = report.total_bytes();
             processed += 1;

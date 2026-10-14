@@ -16,7 +16,7 @@ impl RendererCore {
         glyph_idx: u32,
         click_position: Option<Point>,
     ) -> bool {
-        let view = self.page.view.document.render_view();
+        let view = self.page.view.document().render_view();
         let addressing = view.addressing();
         let Some(href_idx) = addressing.link_for_glyph(glyph_idx) else {
             return false;
@@ -113,9 +113,9 @@ impl RendererCore {
         // document's renderer resources changes that document.
         let is_note_target = {
             let laid_out = match freshly_loaded.as_ref() {
-                Some(loaded) => &loaded.document,
-                None if doc == self.nav.location().document() => &self.page.view.document,
-                None => &self.document_cache.document(doc)?.view.document,
+                Some(loaded) => loaded.document(),
+                None if doc == self.nav.location().document() => self.page.view.document(),
+                None => &self.document_cache.document(doc)?.view.document(),
             };
             laid_out.render_view().addressing().is_note_target(fragment)
         };
@@ -141,10 +141,10 @@ impl RendererCore {
                 .layout_note(fragment, constraints, glyph_shaper),
             None if doc == self.nav.location().document() => {
                 self.page
-                    .session
+                    .session()
                     .layout_note(fragment, constraints, glyph_shaper)
             }
-            None => self.document_cache.document_mut(doc)?.session.layout_note(
+            None => self.document_cache.document_mut(doc)?.session().layout_note(
                 fragment,
                 constraints,
                 glyph_shaper,
@@ -158,7 +158,7 @@ impl RendererCore {
         // through the same code the page uses.
         self.note = Some(
             crate::document_view::DocumentView::new(
-                note.clone(),
+                note,
                 crate::ColumnLayout {
                     col_width: width,
                     base_col_width: width,

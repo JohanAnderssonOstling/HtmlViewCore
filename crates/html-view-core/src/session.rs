@@ -166,7 +166,7 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn document(&self) -> &LaidOutDocument {
-        &self.core.page.view.document
+        self.core.page.view.document()
     }
 
     pub fn glyph_shaper(&self) -> &S {
@@ -216,7 +216,7 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn document_toc(&self) -> Vec<TocEntry> {
-        RendererCore::build_document_toc_entries_for(&self.core.page.view.document)
+        RendererCore::build_document_toc_entries_for(self.core.page.view.document())
     }
 
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
@@ -246,7 +246,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             .line_positions()
             .iter()
             .filter_map(|(index, _)| {
-                view.document
+                view.document()
                     .render_view()
                     .text()
                     .line(index)
@@ -254,7 +254,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             })
             .min()
             .unwrap_or(0);
-        let addressing = view.document.render_view().addressing();
+        let addressing = view.document().render_view().addressing();
         let items = addressing.reading_targets_in(0..u32::MAX);
         let index = items
             .iter()
@@ -279,7 +279,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             .line_positions()
             .iter()
             .filter_map(|(index, _)| {
-                view.document
+                view.document()
                     .render_view()
                     .text()
                     .line(index)
@@ -287,7 +287,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             })
             .min()
             .unwrap_or(0);
-        let addressing = view.document.render_view().addressing();
+        let addressing = view.document().render_view().addressing();
         let mut fragments = Vec::new();
         for fragment in full {
             let Some(first) = fragment.target.glyph_ranges.first() else {
@@ -314,7 +314,7 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn reading_target_cfi(&self, target: &ReadingTarget) -> Option<String> {
         crate::cfi::generate_cfi(
-            &self.core.page.view.document,
+            self.core.page.view.document(),
             self.core.nav.location().document(),
             target.glyph_ranges.first()?.start,
         )
@@ -338,7 +338,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             .line_positions()
             .iter()
             .filter_map(|(index, _)| {
-                view.document
+                view.document()
                     .render_view()
                     .text()
                     .line(index)
@@ -346,8 +346,8 @@ impl<S: GlyphShaper> RendererSession<S> {
             })
             .min()
             .unwrap_or(0);
-        let text = view.document.render_view().text();
-        let addressing = view.document.render_view().addressing();
+        let text = view.document().render_view().text();
+        let addressing = view.document().render_view().addressing();
         let paginator = self.core.paginator();
         let mut scratch = PaginationScratch::default();
         let mut offset = if whole_document {
@@ -584,14 +584,14 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn equation_at(&self, position: Point) -> bool {
         self.core.hit_test_document_image(position).is_some_and(|image| {
-            self.core.page.view.document.render_view().image_mathml(image.image).is_some()
+            self.core.page.view.document().render_view().image_mathml(image.image).is_some()
         })
     }
 
     /// Convert the retained equation only on request; no LaTeX cache is kept.
     pub fn copy_equation_latex_at(&self, position: Point) -> bool {
         let Some(image) = self.core.hit_test_document_image(position) else { return false };
-        let view = self.core.page.view.document.render_view();
+        let view = self.core.page.view.document().render_view();
         let Some(markup) = view.image_mathml(image.image) else { return false };
         let result = crate::mathml::to_latex(markup)
             .and_then(|latex| self.core.host.set_clipboard(&latex));
@@ -708,7 +708,7 @@ impl<S: GlyphShaper> RendererSession<S> {
         let view = &self.core.page.view;
         let (start, end) = view.selection_view().range()?;
         let cfi = crate::cfi::generate_cfi_range(
-            &view.document,
+            view.document(),
             self.core.nav.location().document(),
             start,
             end,
@@ -1256,8 +1256,8 @@ mod tests {
         assert!(renderer.copy_equation_latex_at(equation));
         assert!(host.events.borrow().iter().any(|event| matches!(event,
             RendererEvent::OperationFailed { operation: RendererOperation::CopyEquationLatex, .. })));
-        let old_source = renderer.core.page.view.document.render_view().images()[0].source.clone();
-        let old_width = renderer.core.page.view.document.render_view().images()[0].width;
+        let old_source = renderer.core.page.view.document().render_view().images()[0].source.clone();
+        let old_width = renderer.core.page.view.document().render_view().images()[0].width;
         renderer.apply(RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
             foreground: Some(0xeeeeeeff), ..Default::default()
         }));
@@ -1268,9 +1268,9 @@ mod tests {
         renderer.apply(RendererCommand::SetFontSize(32.0));
         renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut RecordingPainter::default());
         renderer.update_resources();
-        assert!(renderer.core.page.view.document.render_view().images()[0].width > old_width);
+        assert!(renderer.core.page.view.document().render_view().images()[0].width > old_width);
         let ImageSource::MathMl { svg: old_svg, .. } = old_source else { panic!("equation source") };
-        let ImageSource::MathMl { svg: new_svg, .. } = &renderer.core.page.view.document.render_view().images()[0].source else { panic!("equation source") };
+        let ImageSource::MathMl { svg: new_svg, .. } = &renderer.core.page.view.document().render_view().images()[0].source else { panic!("equation source") };
         assert_ne!(&old_svg, new_svg);
         let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(0).unwrap() else { panic!("decoded math SVG") };
         assert_eq!(bytes, new_svg, "font-size changes must replace the decoded SVG source");
@@ -1327,7 +1327,7 @@ mod tests {
         let (cfi, text) = renderer.selected_passage().unwrap();
         assert_eq!(text, "alpha beta gamma delta epsilon");
         let (_, first, last) =
-            crate::cfi::parse_cfi_range(&renderer.core.page.view.document, &cfi).unwrap();
+            crate::cfi::parse_cfi_range(&renderer.core.page.view.document(), &cfi).unwrap();
         assert_eq!(
             renderer
                 .core
@@ -1361,7 +1361,7 @@ mod tests {
             assert_eq!(renderer.selected_passage().unwrap().1, word);
             let (cfi, _) = renderer.selected_passage().unwrap();
             let (_, first, last) =
-                crate::cfi::parse_cfi_range(&renderer.core.page.view.document, &cfi).unwrap();
+                crate::cfi::parse_cfi_range(&renderer.core.page.view.document(), &cfi).unwrap();
             assert_eq!(
                 renderer
                     .core
@@ -1421,7 +1421,7 @@ mod tests {
         renderer
             .prepare_frame(Size::new(600.0, 800.0))
             .paint(&mut RecordingPainter::default());
-        let root = renderer.core.page.view.document.render_view();
+        let root = renderer.core.page.view.document().render_view();
         let text = root.text();
         let addressing = root.addressing();
         let linked_glyph = (0..text.glyph_count() as u32)
@@ -1445,7 +1445,7 @@ mod tests {
             .core
             .page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(line_idx)
@@ -1949,7 +1949,7 @@ mod tests {
         );
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
-        let view = renderer.core.page.view.document.render_view().text();
+        let view = renderer.core.page.view.document().render_view().text();
         let (line_idx, before_range, after_range) = (0..view.line_count())
             .find_map(|line_idx| {
                 let fragments = view.line_text_fragments(line_idx)?.collect::<Vec<_>>();
@@ -2010,7 +2010,7 @@ mod tests {
         );
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
-        let view = renderer.core.page.view.document.render_view().text();
+        let view = renderer.core.page.view.document().render_view().text();
         let glyph_for = |target| {
             (0..view.glyph_count() as u32)
                 .find(|index| {

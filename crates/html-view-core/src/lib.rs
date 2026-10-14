@@ -227,7 +227,7 @@ pub(crate) struct RendererCore {
 
 impl RendererCore {
     pub(crate) fn doc(&self) -> DocQuery<'_> {
-        DocQuery::new(&self.page.view.document)
+        DocQuery::new(self.page.view.document())
     }
 
     pub fn display_cache_keys(&self) -> FrameDisplayCacheKeys {
@@ -326,7 +326,7 @@ impl RendererCore {
     }
 
     fn new_with_image_loader(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig, image_loader: Option<Arc<dyn ImageLoader>>) -> Self {
-        let document = loaded.document;
+        let document = loaded.document();
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
         let jobs = host.blocking_job_spawner();
@@ -346,7 +346,7 @@ impl RendererCore {
         }
         Self {
             host,
-            page: SpineItem { session: loaded.session, inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(document, layout) },
+            page: SpineItem { inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(loaded.session, layout) },
             note: None,
             note_document: None,
             provider,
@@ -413,7 +413,7 @@ impl RendererCore {
         // precedes it. Relayout at the true document start must preserve the
         // zero offset instead of manufacturing a glyph anchor that scrolls
         // past that leading content.
-        let first_glyph = self.page.view.document.render_view().text().line(0).map(|line| line.start());
+        let first_glyph = self.page.view.document().render_view().text().line(0).map(|line| line.start());
         let anchor_is_document_start = match (self.nav.anchor_glyph_here(), first_glyph) {
             (None, _) => true,
             (Some(anchor), Some(first)) => anchor == first,
@@ -425,20 +425,24 @@ impl RendererCore {
         let anchor_cfi = if preserve_document_start { None } else { self.nav.current_cfi(self.nav_view()) };
 
         self.host.set_glyph_document(self.nav.location().document());
-        let update = self.page.session.update(requested_inputs.clone(), glyph_shaper)?;
-
-        let document = self.page.session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
-        // Typography preparation can regenerate MathML SVGs. Replace only
-        // the image pipeline when their source bytes actually changed.
-        let math_changed = self.page.view.document.render_view().images().iter()
-            .zip(document.render_view().images()).any(|(old, new)| {
-                matches!((&old.source, &new.source),
-                    (ImageSource::MathMl { svg: old, .. }, ImageSource::MathMl { svg: new, .. }) if old != new)
-            });
+        // Keep only the immutable MathML byte handles needed to compare an
+        // update. Geometry and all other chapter buffers stay engine-owned.
+        let previous_math: Vec<_> = self.page.view.document().render_view().images().iter()
+            .enumerate().filter_map(|(index, image)| match &image.source {
+                ImageSource::MathMl { svg, .. } => Some((index, svg.clone())),
+                _ => None,
+            }).collect();
+        let update = self.page.session().update(requested_inputs.clone(), glyph_shaper)?;
+        let document = self.page.view.document();
+        let math_changed = previous_math.iter().any(|(index, old)| {
+            document.render_view().images().get(*index).is_some_and(|image| {
+                matches!(&image.source, ImageSource::MathMl { svg, .. } if old != svg)
+            })
+        });
         if math_changed {
-            self.page.images = crate::spine_item::SpineItem::image_pipeline_for(&document, self.image_service.clone());
+            self.page.images = crate::spine_item::SpineItem::image_pipeline_for(document, self.image_service.clone());
         }
-        self.root_font_size = self.page.install_pipeline_result(document, requested_inputs);
+        self.root_font_size = self.page.install_pipeline_result(requested_inputs);
         if update.stage == EarliestStage::Paint {
             // Paint changes preserve pagination, selection and reading position.
             // Revisions invalidate the displayed colors without discarding geometry.
@@ -475,8 +479,8 @@ impl RendererCore {
     }
 
     pub fn emit_state_snapshot(&mut self) {
-        self.host.emit(RendererEvent::TitleChanged(self.page.view.document.render_view().title().map(str::to_owned)));
-        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(&self.page.view.document)));
+        self.host.emit(RendererEvent::TitleChanged(self.page.view.document().render_view().title().map(str::to_owned)));
+        self.host.emit(RendererEvent::TocChanged(Self::build_document_toc_entries_for(self.page.view.document())));
         self.nav.history.emit_availability(self.host.as_ref());
         self.host.emit(RendererEvent::SearchActiveChanged(self.highlight.is_active()));
         self.highlight.emit_match_signal(self.host.as_ref());
@@ -666,7 +670,7 @@ impl RendererCore {
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
         let document_count = self.nav.documents().uris().len();
         self.nav.toc_anchors.set_strings_by_doc(anchors_by_doc, document_count);
-        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
+        let view = html_view_navigate::NavView { doc: DocQuery::new(self.page.view.document()), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
     }
 
@@ -748,7 +752,7 @@ impl RendererCore {
         };
         let occurrence = match hit.target {
             BookSearchTarget::LocalOccurrence(occurrence) => Some(occurrence),
-            BookSearchTarget::SourceCfi(cfi) => crate::cfi::parse_cfi(&self.page.view.document, &cfi)
+            BookSearchTarget::SourceCfi(cfi) => crate::cfi::parse_cfi(self.page.view.document(), &cfi)
                 .and_then(|(doc, glyph)| (doc == self.nav.location().document()).then_some(glyph))
                 .and_then(|glyph| self.highlight.matches().iter().position(|&(start, end)| start <= glyph && glyph < end)),
         };

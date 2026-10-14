@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 
 use crate::document_view::DocumentView;
+use html::engine::Engine;
 use crate::{FrameGeometryCacheKey, ViewportContinuation, ViewportState, VisibleFrame};
 #[cfg(test)]
 use crate::{PagePositions, VisibleLinePositions};
@@ -20,7 +21,7 @@ pub(crate) struct PreparedPage {
 }
 
 impl PreparedPage {
-    pub(crate) fn install(self, view: &mut DocumentView, viewport: &mut ViewportState) {
+    pub(crate) fn install(self, view: &mut DocumentView<Engine>, viewport: &mut ViewportState) {
         viewport.install_forward_page(self.frame.page().paint_start_offset_y(), self.continuation);
         view.frame = self.frame;
     }

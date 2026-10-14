@@ -294,14 +294,14 @@ fn default_reader_column_count_is_derived_only_from_available_width() {
 }
 
 fn line_index_for_character(core: &RendererCore, wanted: char) -> usize {
-    let text = core.page.view.document.render_view().text();
+    let text = core.page.view.document().render_view().text();
     let glyph = glyph_index_for_character(core, wanted);
     text.line_index_for_glyph(glyph)
         .expect("fixture character must own a line")
 }
 
 fn glyph_index_for_character(core: &RendererCore, wanted: char) -> u32 {
-    let text = core.page.view.document.render_view().text();
+    let text = core.page.view.document().render_view().text();
     (0..text.glyph_count() as u32)
         .find(|index| {
             text.glyph_at(*index as usize)
@@ -388,7 +388,7 @@ fn optional_vertical_rhythm_only_stretches_existing_block_gaps() {
         natural
             .page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -708,7 +708,7 @@ fn paginator_counts_document_vertical_gaps_when_fitting_a_column() {
     assert!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -718,7 +718,7 @@ fn paginator_counts_document_vertical_gaps_when_fitting_a_column() {
             > core
                 .page
                 .view
-                .document
+                .document()
                 .render_view()
                 .text()
                 .line(a)
@@ -740,7 +740,7 @@ fn paginator_uses_tall_inline_image_height_for_column_fitting() {
     let images = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .fragments()
         .images_for_line(a);
@@ -892,7 +892,7 @@ fn paginator_honors_forced_modern_and_legacy_css_breaks() {
 
         assert!(core.page.view.frame.page().line_positions().get(a).is_some());
         assert!(core.page.view.frame.page().line_positions().get(b).is_none(), "{property} must start B in the next fragmentainer");
-        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+        assert_eq!(core.page.view.document().render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
         // Page placement changes without introducing gaps into the document.
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
@@ -1053,7 +1053,7 @@ fn forced_column_break_does_not_leave_a_margin_only_empty_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -1096,7 +1096,7 @@ fn book_paginator_applies_break_after_without_fragmenting_continuous_layout() {
         assert_eq!(
             core.page
                 .view
-                .document
+                .document()
                 .render_view()
                 .text()
                 .line(b)
@@ -1153,8 +1153,8 @@ fn paginator_forced_break_wins_over_an_adjoining_avoid() {
 
     assert!(core.page.view.frame.page().line_positions().get(a).is_some());
     assert!(core.page.view.frame.page().line_positions().get(b).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(a).expect("A line").point().y, 0.0);
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(a).expect("A line").point().y, 0.0);
+    assert_eq!(core.page.view.document().render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
@@ -1171,8 +1171,8 @@ fn paginator_keeps_a_break_inside_avoid_block_together() {
 
     assert!(core.page.view.frame.page().line_positions().get(a).is_some());
     assert!(core.page.view.frame.page().line_positions().get(b).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
@@ -1195,7 +1195,7 @@ fn book_paginator_applies_break_inside_avoid_without_changing_continuous_geometr
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -1207,7 +1207,7 @@ fn book_paginator_applies_break_inside_avoid_without_changing_continuous_geometr
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(c)
@@ -1259,8 +1259,8 @@ fn paginator_honors_break_after_avoid_as_keep_with_next() {
 
     assert!(core.page.view.frame.page().line_positions().get(a).is_some());
     assert!(core.page.view.frame.page().line_positions().get(heading).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("following line").point().y, 40.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(heading).expect("heading line").point().y, 20.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(b).expect("following line").point().y, 40.0, "document geometry stays continuous");
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
@@ -1304,7 +1304,7 @@ fn book_paginator_automatically_keeps_a_heading_with_two_following_lines() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(heading)
@@ -1316,7 +1316,7 @@ fn book_paginator_automatically_keeps_a_heading_with_two_following_lines() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -1328,7 +1328,7 @@ fn book_paginator_automatically_keeps_a_heading_with_two_following_lines() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(c)
@@ -1358,7 +1358,7 @@ fn web_paginator_leaves_automatic_heading_keep_disabled() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(heading)
@@ -1393,7 +1393,7 @@ fn book_paginator_moves_a_large_multiline_heading_to_a_fresh_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(heading)
@@ -1405,7 +1405,7 @@ fn book_paginator_moves_a_large_multiline_heading_to_a_fresh_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(second_heading_line)
@@ -1440,7 +1440,7 @@ fn book_paginator_does_not_move_an_oversized_heading_group() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(heading)
@@ -1486,7 +1486,7 @@ fn authored_forced_break_after_heading_overrides_automatic_keep() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(heading)
@@ -1498,7 +1498,7 @@ fn authored_forced_break_after_heading_overrides_automatic_keep() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -2058,7 +2058,7 @@ fn book_paginator_moves_a_compact_figure_and_caption_to_a_fresh_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(image_label)
@@ -2070,7 +2070,7 @@ fn book_paginator_moves_a_compact_figure_and_caption_to_a_fresh_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2115,7 +2115,7 @@ fn book_paginator_keeps_an_image_only_figure_whole() {
     let image_line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .fragments()
         .images()
@@ -2160,7 +2160,7 @@ fn book_paginator_keeps_a_replaced_image_with_its_multiline_caption() {
     let image_line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .fragments()
         .images()
@@ -2253,7 +2253,7 @@ fn web_paginator_leaves_automatic_figure_placement_disabled() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(image_label)
@@ -2279,7 +2279,7 @@ fn book_paginator_keeps_a_bottom_caption_with_oversized_figure_content() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(image_label)
@@ -2291,7 +2291,7 @@ fn book_paginator_keeps_a_bottom_caption_with_oversized_figure_content() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2357,7 +2357,7 @@ fn book_paginator_keeps_a_top_caption_with_oversized_figure_content() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2369,7 +2369,7 @@ fn book_paginator_keeps_a_top_caption_with_oversized_figure_content() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(image_label)
@@ -2435,7 +2435,7 @@ fn authored_forced_break_between_figure_content_and_caption_wins() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(image_label)
@@ -2447,7 +2447,7 @@ fn authored_forced_break_between_figure_content_and_caption_wins() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2526,7 +2526,7 @@ fn book_paginator_prefers_a_compact_table_in_one_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2588,7 +2588,7 @@ fn web_paginator_leaves_automatic_table_placement_disabled() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2646,7 +2646,7 @@ fn book_paginator_uses_remaining_space_for_a_table_taller_than_a_column() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(caption)
@@ -2682,7 +2682,7 @@ fn book_paginator_breaks_an_oversized_table_between_rows() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(first_row)
@@ -2926,7 +2926,7 @@ fn book_paginator_keeps_a_bottom_table_caption_with_the_last_row() {
     let row_y = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(last_row)
@@ -2936,7 +2936,7 @@ fn book_paginator_keeps_a_bottom_table_caption_with_the_last_row() {
     let caption_line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(caption)
@@ -2968,7 +2968,7 @@ fn authored_forced_break_between_table_rows_wins() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(first_row)
@@ -2980,7 +2980,7 @@ fn authored_forced_break_between_table_rows_wins() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(second_row)
@@ -3063,8 +3063,8 @@ fn paginator_applies_default_widow_and_orphan_limits() {
 
     assert!(core.page.view.frame.page().line_positions().get(a).is_some());
     assert!(core.page.view.frame.page().line_positions().get(b).is_none(), "a 1/1 paragraph split violates the default 2-line limits");
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+    assert_eq!(core.page.view.document().render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
@@ -3087,7 +3087,7 @@ fn book_paginator_applies_line_limits_without_changing_continuous_geometry() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -3099,7 +3099,7 @@ fn book_paginator_applies_line_limits_without_changing_continuous_geometry() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(c)
@@ -3170,7 +3170,7 @@ fn paginator_honors_authored_widow_and_orphan_limits() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(b)
@@ -3182,7 +3182,7 @@ fn paginator_honors_authored_widow_and_orphan_limits() {
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(c)
@@ -3228,7 +3228,7 @@ fn paginator_keeps_table_cell_lines_with_equal_document_y_together() {
     let source_a = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(a)
@@ -3238,7 +3238,7 @@ fn paginator_keeps_table_cell_lines_with_equal_document_y_together() {
     let source_b = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(b)
@@ -3279,7 +3279,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     let left_line_idx = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line_index_for_glyph(left_glyph)
@@ -3287,7 +3287,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     let right_line_idx = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line_index_for_glyph(right_glyph)
@@ -3295,7 +3295,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     let left_line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(left_line_idx)
@@ -3303,7 +3303,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     let right_line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(right_line_idx)
@@ -3355,7 +3355,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
 fn semantic_selection_promotes_table_cells_and_embeds_a_markdown_table() {
     let html = "<html><body style='margin:0'><p>Before</p><table><tr><th>Head A</th><th>Head B</th></tr><tr><td>One</td><td>Two</td></tr></table><p>After</p></body></html>";
     let (mut core, _) = pagination_core(html, Size::new(500.0, 300.0), 1);
-    let glyph_count = core.page.view.document.render_view().text().glyph_count() as u32;
+    let glyph_count = core.page.view.document().render_view().text().glyph_count() as u32;
 
     core.page
         .view
@@ -3571,7 +3571,7 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
 
     core.configure_layout_for_viewport(&mut shaper, Size::new(600.0, 800.0));
     core.paint_forward(&mut RecordingPainter::default());
-    let view = core.page.view.document.render_view();
+    let view = core.page.view.document().render_view();
     let text = view.text();
     let addressing = view.addressing();
     let linked_glyph = (0..text.glyph_count() as u32)
@@ -3592,7 +3592,7 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
     let line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(line_idx)
@@ -3824,10 +3824,10 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         core.page.view.selection.content().markdown(),
         Some("**Needle**")
     );
-    let range_cfi = crate::cfi::generate_cfi_range(&core.page.view.document, 0, start, end)
+    let range_cfi = crate::cfi::generate_cfi_range(core.page.view.document(), 0, start, end)
         .expect("selection has a range CFI");
     assert_eq!(
-        crate::cfi::parse_cfi_range(&core.page.view.document, &range_cfi),
+        crate::cfi::parse_cfi_range(core.page.view.document(), &range_cfi),
         Some((0, start, end))
     );
     core.apply(
@@ -3935,6 +3935,7 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
         0,
         RendererInitialConfig::default(),
     );
+    let original_text = laid_out_text(core.page.view.document());
     let committed_size = core.root_font_size;
     let committed_input_size = core.page.inputs.style_environment.root_font_size;
     host.events.borrow_mut().clear();
@@ -3947,6 +3948,10 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
         core.page.inputs.style_environment.root_font_size,
         committed_input_size
     );
+    assert_eq!(laid_out_text(core.page.view.document()), original_text,
+        "failed shaping must keep the only published layout readable");
+    assert!(std::ptr::eq(core.page.view.document(), core.page.view.owner.document().unwrap()),
+        "display queries must borrow the pipeline's authoritative layout");
     let events = host.events.borrow();
     assert!(
         !events
@@ -3987,7 +3992,7 @@ fn pre_frame_relayout_preserves_the_document_start_before_the_first_glyph() {
     let document_y = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(0)
@@ -4059,7 +4064,7 @@ fn omitted_nav_state_stays_at_document_start_when_semantic_relayout_moves_a_late
     assert_eq!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .text()
             .line(moved)
@@ -4151,16 +4156,22 @@ fn navigation_cache_uses_eviction_when_capacity_is_exceeded() {
     assert_eq!(core.nav.location().document(), 4);
     assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 4);
 
-    while core.nav.location().document() > 0 {
+    // Claim the destination before inserting the outgoing chapter. Inserting
+    // first used to evict a chapter that was still needed on this return trip.
+    for expected in (1..4).rev() {
         core.prev_document(&mut shaper);
+        assert_eq!(core.nav.location().document(), expected);
+        assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 4);
+        assert!(std::ptr::eq(core.page.view.document(), core.page.view.owner.document().unwrap()));
     }
+    core.prev_document(&mut shaper);
     assert_eq!(core.nav.location().document(), 0);
 
     assert!(
         core.nav.history.is_at_newest(),
         "walking back to the first document should leave the history cursor at its newest entry"
     );
-    assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 6);
+    assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 5);
 }
 
 #[test]
@@ -4285,7 +4296,7 @@ fn footnote_preview_requires_note_semantics_and_resolves_cross_spine_targets() {
         core.footnote_preview(&mut shaper, "notes.html#n1")
             .is_some()
     );
-    let rendered_note = laid_out_text(&core.note.as_ref().expect("open note").document);
+    let rendered_note = laid_out_text(&core.note.as_ref().expect("open note").document());
     assert!(rendered_note.contains("Structured note text"));
     assert!(rendered_note.contains("First source"));
     let indexed_reads = read_count.load(Ordering::Relaxed);
@@ -4322,7 +4333,7 @@ fn note_reference_classification_is_per_link_even_when_hrefs_match() {
     );
     let regular = glyph_index_for_character(&core, 'R');
     let noteref = glyph_index_for_character(&core, 'N');
-    let addressing = core.page.view.document.render_view().addressing();
+    let addressing = core.page.view.document().render_view().addressing();
 
     assert!(!addressing.is_note_reference(regular));
     assert!(addressing.is_note_reference(noteref));
@@ -4357,23 +4368,23 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
     let host = Rc::new(TestHost::default());
     let mut shaper = TestShaper::default();
     let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), RendererInitialConfig::default());
-    let fragments = core.page.view.document.render_view().addressing().reading_fragments(0);
+    let fragments = core.page.view.document().render_view().addressing().reading_fragments(0);
     assert_eq!(fragments.iter().map(|fragment| fragment.text.as_str()).collect::<Vec<_>>(), ["Chapter", "Hello bright world.", "Read this link."]);
     let target = fragments[1].target.clone();
     let old_ranges = target.glyph_ranges.clone();
     assert!(!old_ranges.is_empty());
     core.apply(&mut shaper, crate::RendererCommand::SetReadingTarget(Some(target.clone())));
     core.apply(&mut shaper, crate::RendererCommand::SetColumnWidth(300.0));
-    let fragments_after = core.page.view.document.render_view().addressing().reading_fragments(0);
+    let fragments_after = core.page.view.document().render_view().addressing().reading_fragments(0);
     assert_eq!(fragments_after[1].target, target, "array indices survive relayout");
     assert_eq!(fragments_after[1].text, "Hello bright world.");
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
     let clipped_start = old_ranges[1].start;
-    let clipped = core.page.view.document.render_view().addressing().reading_fragments(clipped_start);
+    let clipped = core.page.view.document().render_view().addressing().reading_fragments(clipped_start);
     assert!(!clipped.iter().any(|fragment| fragment.text == "Chapter"));
     assert!(clipped[0].text.starts_with("bright"));
     core.apply(&mut shaper, crate::RendererCommand::SetFontSize(24.0));
-    let reshaped = core.page.view.document.render_view().addressing().reading_fragments(0);
+    let reshaped = core.page.view.document().render_view().addressing().reading_fragments(0);
     assert_eq!(reshaped[1].target, target, "element and glyph indices survive font changes");
     assert_eq!(reshaped[1].text, "Hello bright world.");
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
@@ -4439,12 +4450,12 @@ fn reading_fragments_continue_a_single_element_across_pages() {
 fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
     let html = "<html><body style='margin:0'><p>Reading<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote'><p>Popup-only zebra</p></aside><p>Continues</p></body></html>";
     let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
-    let text = core.page.view.document.render_view().text();
+    let text = core.page.view.document().render_view().text();
     let noteref = glyph_index_for_character(&core, '1');
     assert!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .addressing()
             .is_note_reference(noteref)
@@ -4465,7 +4476,7 @@ fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
     );
     assert!(core.footnote_preview(&mut shaper, "#note").is_some());
     assert!(
-        laid_out_text(&core.note.as_ref().expect("open note").document)
+        laid_out_text(&core.note.as_ref().expect("open note").document())
             .contains("Popup-only zebra")
     );
 }
@@ -4503,7 +4514,7 @@ fn clicked_footnote_emits_a_viewport_overlay_anchor() {
     let line = core
         .page
         .view
-        .document
+        .document()
         .render_view()
         .text()
         .line(line_idx)
@@ -4563,7 +4574,7 @@ fn as_authored_notes_read_inline_instead_of_being_held_for_a_popup() {
     core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
     core.paint_forward(&mut RecordingPainter::default());
 
-    let text = core.page.view.document.render_view().text();
+    let text = core.page.view.document().render_view().text();
     let visible_source = (0..text.glyph_count())
         .filter_map(|index| {
             text.glyph_at(index)
@@ -4581,7 +4592,7 @@ fn as_authored_notes_read_inline_instead_of_being_held_for_a_popup() {
     assert!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .addressing()
             .is_note_target("note")
@@ -4594,7 +4605,7 @@ fn switching_note_display_relays_out_the_document() {
     let (mut core, mut shaper) = pagination_core(html, Size::new(200.0, 200.0), 1);
 
     let flow_text = |core: &RendererCore| {
-        let text = core.page.view.document.render_view().text();
+        let text = core.page.view.document().render_view().text();
         (0..text.glyph_count())
             .filter_map(|index| {
                 text.glyph_at(index)
@@ -4877,7 +4888,7 @@ fn a_note_is_laid_out_to_the_width_its_host_will_show_it_at() {
         core.note
             .as_ref()
             .expect("open note")
-            .document
+            .document()
             .render_view()
             .text()
             .line_count()
@@ -4925,7 +4936,7 @@ fn an_as_authored_note_reference_navigates_rather_than_opening_a_popup() {
     assert!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .addressing()
             .is_note_reference(noteref),
@@ -4966,12 +4977,12 @@ fn namespaced_xhtml_footnotes_are_popup_only_and_absent_from_paginated_text() {
     core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
     core.paint_forward(&mut RecordingPainter::default());
 
-    let text = core.page.view.document.render_view().text();
+    let text = core.page.view.document().render_view().text();
     let noteref = glyph_index_for_character(&core, '1');
     assert!(
         core.page
             .view
-            .document
+            .document()
             .render_view()
             .addressing()
             .is_note_reference(noteref),
@@ -4992,7 +5003,7 @@ fn namespaced_xhtml_footnotes_are_popup_only_and_absent_from_paginated_text() {
     );
     assert!(core.footnote_preview(&mut shaper, "#note").is_some());
     assert!(
-        laid_out_text(&core.note.as_ref().expect("open note").document)
+        laid_out_text(&core.note.as_ref().expect("open note").document())
             .contains("Popup-only magenta")
     );
 }
@@ -5047,7 +5058,7 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
         core.host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
         let glyph = glyph_index_for_character(&core, 'J');
         let line_index = core.doc().find_line_for_glyph(glyph).unwrap();
-        let line = core.page.view.document.render_view().text().line(line_index).unwrap();
+        let line = core.page.view.document().render_view().text().line(line_index).unwrap();
         let screen = core.page.view.frame.page().line_positions().get(line_index).unwrap();
         let click = Point::new(screen.point.x + core.text_geometry().glyph_x_in_line(&line, glyph) + 0.1, screen.point.y + line.height() / 2.0);
         let mut session = crate::RendererSession::from_core(core, shaper);

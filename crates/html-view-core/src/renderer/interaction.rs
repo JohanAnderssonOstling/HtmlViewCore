@@ -3,16 +3,17 @@ use kurbo::{Point, Size};
 use crate::prepared_page::PreparedPage;
 use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
 use html::pipeline::PipelineInputs;
+use html::engine::Engine;
 
 impl RendererCore {
-    fn visible_view_for_doc(&self, doc: usize) -> Option<&crate::document_view::DocumentView> {
+    fn visible_view_for_doc(&self, doc: usize) -> Option<&crate::document_view::DocumentView<Engine>> {
         (doc == self.nav.location().document()).then_some(&self.page.view)
     }
 
     fn visible_view_mut_for_doc(
         &mut self,
         doc: usize,
-    ) -> Option<&mut crate::document_view::DocumentView> {
+    ) -> Option<&mut crate::document_view::DocumentView<Engine>> {
         (doc == self.nav.location().document()).then_some(&mut self.page.view)
     }
 
@@ -79,7 +80,7 @@ impl RendererCore {
         let Some(view) = self.visible_view_for_doc(hit.doc) else {
             return false;
         };
-        let Some(uri) = view.document.render_view().image_uri(hit.image) else {
+        let Some(uri) = view.document().render_view().image_uri(hit.image) else {
             return false;
         };
         if let Some(wake) = self.host.resource_waker() {
@@ -119,8 +120,8 @@ impl RendererCore {
         Self::visible_text_for_view(&self.page.view)
     }
 
-    fn visible_text_for_view(view: &crate::document_view::DocumentView) -> String {
-        let text_view = view.document.render_view().text();
+    fn visible_text_for_view(view: &crate::document_view::DocumentView<Engine>) -> String {
+        let text_view = view.document().render_view().text();
         let mut visible_glyphs = Vec::new();
         for (line_index, _) in view.frame.page().line_positions().iter() {
             let Some(fragments) = text_view.line_text_fragments(line_index) else {
@@ -180,7 +181,7 @@ impl RendererCore {
             return;
         }
 
-        let images = self.page.view.document.render_view().images();
+        let images = self.page.view.document().render_view().images();
         let (next_inputs, layout_needed) = apply_image_poll_updates(
             &self.page.inputs,
             &image_poll.dimensions_changed,
@@ -276,7 +277,7 @@ impl RendererCore {
         self.prefetch_images_for_current_page();
         if self.nav.location().anchor_update_pending() {
             let view = html_view_navigate::NavView {
-                doc: html_view_doc::DocQuery::new(&self.page.view.document),
+                doc: html_view_doc::DocQuery::new(self.page.view.document()),
                 viewport: &self.viewport,
                 frame: &self.page.view.frame,
             };
@@ -325,7 +326,7 @@ impl RendererCore {
             return false;
         };
         if view
-            .document
+            .document()
             .render_view()
             .addressing()
             .link_for_glyph(hit.glyph)
@@ -340,7 +341,7 @@ impl RendererCore {
         let Some(screen) = view.frame.page().line_positions().get(line_idx) else {
             return false;
         };
-        let Some(line) = view.document.render_view().text().line(line_idx) else {
+        let Some(line) = view.document().render_view().text().line(line_idx) else {
             return false;
         };
         let (x0, x1) = geometry.glyph_x_span_in_line(
@@ -419,10 +420,10 @@ impl RendererCore {
             view.selection_view().range(),
             view.selection.content().plain().map(str::to_owned),
         ) && let Some(cfi_range) =
-            crate::cfi::generate_cfi_range(&view.document, doc, start, end)
+            crate::cfi::generate_cfi_range(view.document(), doc, start, end)
         {
             let prefix_start = start.saturating_sub(48);
-            let glyph_count = view.document.render_view().text().glyph_count() as u32;
+            let glyph_count = view.document().render_view().text().glyph_count() as u32;
             let suffix_end = end.saturating_add(48).min(glyph_count);
             let prefix = view
                 .doc()

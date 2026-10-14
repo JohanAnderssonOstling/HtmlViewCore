@@ -25,16 +25,13 @@ use crate::document_view::DocumentView;
 use crate::{ColumnLayout, LaidOutDocument, load};
 
 pub(crate) struct SpineItem {
-    /// The pipeline that produced the document, kept so it can be asked for
-    /// the document again under different inputs.
-    pub(crate) session: Engine,
     pub(crate) inputs: PipelineInputs,
     /// Decoded images, addressed by an index into this document's resources.
     /// A pipeline belonging to another document answers the same index with a
     /// different picture.
     pub(crate) images: ImagePipeline,
     /// What is on screen of it.
-    pub(crate) view: DocumentView,
+    pub(crate) view: DocumentView<Engine>,
 }
 
 impl SpineItem {
@@ -43,12 +40,11 @@ impl SpineItem {
         layout: ColumnLayout,
         image_service: ImageService,
     ) -> Self {
-        let images = Self::image_pipeline_for(&loaded.document, image_service);
+        let images = Self::image_pipeline_for(loaded.document(), image_service);
         Self {
-            session: loaded.session,
             inputs: loaded.inputs,
             images,
-            view: DocumentView::new(loaded.document, layout),
+            view: DocumentView::new(loaded.session, layout),
         }
     }
 
@@ -62,19 +58,10 @@ impl SpineItem {
         )
     }
 
-    /// Replaces the document while keeping the item's identity, for a relayout
-    /// that produced a new one from the same source.
-    pub(crate) fn replace_document(&mut self, document: LaidOutDocument) {
-        self.view.document = document;
-    }
+    pub(crate) fn session(&mut self) -> &mut Engine { &mut self.view.owner }
 
-    /// Installs the inseparable products of one successful pipeline update.
-    pub(crate) fn install_pipeline_result(
-        &mut self,
-        document: LaidOutDocument,
-        inputs: PipelineInputs,
-    ) -> f32 {
-        self.view.document = document;
+    /// Commit reader inputs only after the engine has published an update.
+    pub(crate) fn install_pipeline_result(&mut self, inputs: PipelineInputs) -> f32 {
         self.inputs = inputs;
         self.root_font_size()
     }

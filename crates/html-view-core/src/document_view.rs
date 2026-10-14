@@ -11,24 +11,43 @@
 //! (`scoped_to_element_id`), and how the reader presents one (`NoteDisplay`).
 //! Displaying it is not particular, and is not reimplemented here.
 
+use html::engine::Engine;
 use html_view_doc::{DocQuery, TextGeometry};
 use html_view_select::{SelectionMode, SelectionState, SelectionView, TableSelectionState};
 use kurbo::Point;
 
 use crate::{ColumnLayout, LaidOutDocument, VisibleFrame};
 
-pub(crate) struct DocumentView {
-    pub(crate) document: LaidOutDocument,
+/// Immutable access shared by engine-owned chapters and independent notes.
+pub(crate) trait DocumentOwner {
+    fn document(&self) -> &LaidOutDocument;
+}
+
+impl DocumentOwner for LaidOutDocument {
+    fn document(&self) -> &LaidOutDocument { self }
+}
+
+impl DocumentOwner for Engine {
+    fn document(&self) -> &LaidOutDocument {
+        Engine::document(self).expect("displayed chapter has a published layout")
+    }
+}
+
+pub(crate) struct DocumentView<D = LaidOutDocument> {
+    pub(crate) owner: D,
     pub(crate) layout: ColumnLayout,
     pub(crate) frame: VisibleFrame,
     pub(crate) selection: SelectionState,
     pub(crate) table_selection: TableSelectionState,
 }
 
-impl DocumentView {
-    pub(crate) fn new(document: LaidOutDocument, layout: ColumnLayout) -> Self {
+impl<D: DocumentOwner> DocumentView<D> {
+    pub(crate) fn new(owner: D, layout: ColumnLayout) -> Self {
+        // A displayed engine has completed initial shaping. Its last published
+        // layout remains readable even when a subsequent update fails.
+        let _ = owner.document();
         Self {
-            document,
+            owner,
             layout,
             frame: VisibleFrame::default(),
             selection: SelectionState::default(),
@@ -36,8 +55,10 @@ impl DocumentView {
         }
     }
 
+    pub(crate) fn document(&self) -> &LaidOutDocument { self.owner.document() }
+
     pub(crate) fn doc(&self) -> DocQuery<'_> {
-        DocQuery::new(&self.document)
+        DocQuery::new(self.document())
     }
 
     pub(crate) fn geometry(&self) -> TextGeometry<'_> {

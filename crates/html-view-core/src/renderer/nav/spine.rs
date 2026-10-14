@@ -14,11 +14,14 @@ impl RendererCore {
     /// Makes `item` the page. Everything addressed by a document -- its
     /// pipeline, its images, its glyph registry -- arrives with it, which is
     /// the whole point of their being one thing.
-    pub(super) fn activate_spine_item(&mut self, mut item: SpineItem) {
+    pub(super) fn activate_spine_item(&mut self, mut item: SpineItem, cache_previous: Option<usize>) {
         // The column layout belongs to the reader rather than to the document
         // arriving, so it stays behind.
-        item.view.layout = std::mem::take(&mut self.page.view.layout);
-        self.page = item;
+        item.view.layout = self.page.view.layout.clone();
+        let previous = mem::replace(&mut self.page, item);
+        if let Some(index) = cache_previous {
+            self.document_cache.insert_document(index, previous);
+        }
         self.root_font_size = self.page.root_font_size();
         self.revisions
             .invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
@@ -27,50 +30,22 @@ impl RendererCore {
         self.host.emit(RendererEvent::TitleChanged(
             self.page
                 .view
-                .document
+                .document()
                 .render_view()
                 .title()
                 .map(str::to_owned),
         ));
         self.host.emit(RendererEvent::TocChanged(
-            Self::build_document_toc_entries_for(&self.page.view.document),
+            Self::build_document_toc_entries_for(self.page.view.document()),
         ));
         let view = NavView {
-            doc: DocQuery::new(&self.page.view.document),
+            doc: DocQuery::new(self.page.view.document()),
             viewport: &self.viewport,
             frame: &self.page.view.frame,
         };
         self.nav.update_toc_anchor_filter(view);
         self.resolve_visible_annotations();
         self.resolve_media_overlay_highlight();
-    }
-
-    pub(super) fn cache_current_document(&mut self) {
-        if self.document_cache.is_disabled() {
-            return;
-        }
-
-        // The page keeps reading until something replaces it, so what goes to
-        // the cache is a copy of the document with the session that produced
-        // it. The session cannot be copied, and the page has no use for it
-        // once it is being put away.
-        let current_index = self.nav.location().document();
-        let document = self.page.view.document.clone();
-        let session = mem::replace(
-            &mut self.page.session,
-            html::engine::Engine::new(self.provider.clone()),
-        );
-        let images = SpineItem::image_pipeline_for(&document, self.image_service.clone());
-        let layout = self.page.view.layout.clone();
-        self.document_cache.insert_document(
-            current_index,
-            SpineItem {
-                session,
-                inputs: self.page.inputs.clone(),
-                images,
-                view: DocumentView::new(document, layout),
-            },
-        );
     }
 
     pub(crate) fn rebased_inputs_for_doc_index(
@@ -146,12 +121,12 @@ impl RendererCore {
             return;
         }
 
-        self.cache_current_document();
+        let previous_doc_index = self.nav.location().document();
         if self.prepared_navigation.as_ref().is_some_and(|(index, _)| *index == doc_index) {
             let loaded = self.prepared_navigation.take().unwrap().1;
             let item = self.spine_item(loaded);
             self.nav.activate_document(doc_index);
-            self.activate_spine_item(item);
+            self.activate_spine_item(item, Some(previous_doc_index));
             let (nav, mut cx) = self.nav_cx();
             nav.finish_document_navigation(&mut cx, anchor);
             return;
@@ -160,20 +135,19 @@ impl RendererCore {
 
         if let Some(mut cached) = self.document_cache.take_document(doc_index) {
             self.host.set_glyph_document(doc_index);
-            let Ok(document) = cached.session.rehydrate_glyphs(glyph_shaper) else {
+            let Ok(()) = cached.session().rehydrate_glyphs(glyph_shaper) else {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
                 let fallback = self.spine_item(fallback);
                 self.nav.activate_document(doc_index);
-                self.activate_spine_item(fallback);
+                self.activate_spine_item(fallback, Some(previous_doc_index));
                 let (nav, mut cx) = self.nav_cx();
                 nav.finish_document_navigation(&mut cx, anchor);
                 return;
             };
-            cached.replace_document(document);
             let requested_inputs = self.rebased_inputs_for_doc_index(doc_index, &cached.inputs);
             let inputs_match = cached.inputs == requested_inputs;
             self.nav.activate_document(doc_index);
-            self.activate_spine_item(cached);
+            self.activate_spine_item(cached, Some(previous_doc_index));
             if !inputs_match
                 && self
                     .apply_pipeline_inputs(requested_inputs, glyph_shaper)
@@ -182,13 +156,13 @@ impl RendererCore {
                 let fallback = self.load_document_for_index(glyph_shaper, doc_index);
                 let fallback = self.spine_item(fallback);
                 self.nav.activate_document(doc_index);
-                self.activate_spine_item(fallback);
+                self.activate_spine_item(fallback, None);
             }
         } else {
             let loaded = self.load_document_for_index(glyph_shaper, doc_index);
             let item = self.spine_item(loaded);
             self.nav.activate_document(doc_index);
-            self.activate_spine_item(item);
+            self.activate_spine_item(item, Some(previous_doc_index));
         }
 
         let (nav, mut cx) = self.nav_cx();

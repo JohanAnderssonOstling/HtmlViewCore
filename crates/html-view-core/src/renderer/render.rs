@@ -1,3 +1,4 @@
+use crate::document_view::DocumentOwner;
 use crate::{PagePositions, Painter, RenderState, RendererCore};
 
 use html_view_doc::DocQuery;
@@ -38,7 +39,7 @@ impl RendererCore {
     /// overflow clipping. A note is an ordinary laid-out document, so it is
     /// drawn by the same machinery rather than by a second painter here.
     pub(crate) fn note_scene(&self) -> Option<html::render::RenderScene> {
-        let note = &self.note.as_ref()?.document;
+        let note = &self.note.as_ref()?.document();
         let width = self.note_layout_width();
         let options = html::render::FragmentRenderOptions::new(width, None)
             .ok()?
@@ -140,7 +141,7 @@ impl RendererCore {
             html_view_paginate::PaginationMode::Web
         };
         Paginator::new(
-            DocQuery::new(&self.page.view.document),
+            DocQuery::new(self.page.view.document()),
             &self.page.view.layout,
             mode,
         )
@@ -204,7 +205,7 @@ impl RendererCore {
     }
 
     pub(crate) fn prefetch_images_for_current_page(&mut self) {
-        let root = self.page.view.document.render_view();
+        let root = self.page.view.document().render_view();
         let text = root.text();
         let fragments = root.fragments();
         if fragments.images().is_empty() || text.line_count() == 0 {
@@ -244,7 +245,7 @@ impl RendererCore {
         // render backward from end offset
         self.viewport.begin_backward_preparation();
 
-        let lines = self.page.view.document.render_view().text().lines();
+        let lines = DocumentOwner::document(&self.page.view.owner).render_view().text().lines();
         let composition = self.viewport.composition();
         let backward = self.viewport.backward_composition();
         let end_line = if let Some(idx) = backward.anchor_end_line() {

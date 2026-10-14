@@ -2,7 +2,6 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
 use crate::{DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, RendererPreparation, ResourceProvider, TocEntry, ViewportState, load};
 use html::resources::ImageLoader;
@@ -99,7 +98,7 @@ impl RendererPreparation {
 impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
         NavView {
-            doc: DocQuery::new(&self.page.view.document),
+            doc: DocQuery::new(self.page.view.document()),
             viewport: &self.viewport,
             frame: &self.page.view.frame,
         }
@@ -111,7 +110,7 @@ impl RendererCore {
         (
             &mut self.nav,
             NavContext {
-                doc: DocQuery::new(&self.page.view.document),
+                doc: DocQuery::new(self.page.view.document()),
                 viewport: &mut self.viewport,
                 frame: &self.page.view.frame,
                 host: self.host.as_ref(),
@@ -166,7 +165,7 @@ impl RendererCore {
     ) {
         let (doc, in_doc_fraction) = self.nav.document_at_fraction(fraction);
         self.set_position(glyph_shaper, doc, None);
-        let glyph_count = self.page.view.document.render_view().text().glyph_count();
+        let glyph_count = self.page.view.document().render_view().text().glyph_count();
         let glyph = (in_doc_fraction * glyph_count as f64) as u32;
         self.restore_glyph_position(glyph.min(glyph_count.saturating_sub(1) as u32));
         self.update_nav_signal();
@@ -270,7 +269,7 @@ impl RendererCore {
         let mut next_start_offset_y = composition.start_offset_y();
         if let Some(end_idx) = self.page.view.frame.page().end_line() {
             let next_idx = end_idx + 1;
-            if let Some(line) = self.page.view.document.render_view().text().line(next_idx) {
+            if let Some(line) = self.page.view.document().render_view().text().line(next_idx) {
                 next_start_offset_y = line.point().y;
             }
         } else if continuation.next_start_offset_y() > composition.start_offset_y() {
@@ -317,7 +316,7 @@ impl RendererCore {
             .and_then(|anchor_idx| {
                 self.page
                     .view
-                    .document
+                    .document()
                     .render_view()
                     .text()
                     .line(anchor_idx)
