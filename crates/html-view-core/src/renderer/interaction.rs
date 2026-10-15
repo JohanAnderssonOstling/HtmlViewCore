@@ -88,8 +88,13 @@ impl RendererCore {
             let (send, receive) = std::sync::mpsc::channel();
             self.pending_file_events.borrow_mut().push(receive);
             self.host.blocking_job_spawner().spawn(Box::new(move || {
-                let result = provider.read_bytes(&uri).map(|bytes| crate::RendererEvent::ImageOpened { uri, bytes }).map_err(|e| e.to_string());
-                if send.send(result).is_ok() { wake(); }
+                let result = provider
+                    .read_bytes(&uri)
+                    .map(|bytes| crate::RendererEvent::ImageOpened { uri, bytes })
+                    .map_err(|e| e.to_string());
+                if send.send(result).is_ok() {
+                    wake();
+                }
             }));
             return true;
         }
@@ -215,9 +220,14 @@ impl RendererCore {
         self.pending_file_events.borrow_mut().retain(|receiver| {
             match receiver.try_recv() {
                 Ok(Ok(event)) => self.host.emit(event),
-                Ok(Err(message)) => self.emit_operation_failed(crate::RendererOperation::UpdateDocument, message),
+                Ok(Err(message)) => {
+                    self.emit_operation_failed(crate::RendererOperation::UpdateDocument, message)
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return true,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.emit_operation_failed(crate::RendererOperation::UpdateDocument, "file worker stopped".into()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.emit_operation_failed(
+                    crate::RendererOperation::UpdateDocument,
+                    "file worker stopped".into(),
+                ),
             }
             false
         });
@@ -267,6 +277,7 @@ impl RendererCore {
         if self.nav.location().anchor_update_pending() {
             let view = html_view_navigate::NavView {
                 doc: html_view_doc::DocQuery::new(&self.page.view.document),
+                source: &self.page.source_index,
                 viewport: &self.viewport,
                 frame: &self.page.view.frame,
             };
@@ -275,6 +286,8 @@ impl RendererCore {
             self.nav.mark_anchor_clean();
         }
         self.update_nav_signal();
+        let (nav, mut cx) = self.nav_cx();
+        nav.emit_reading_position(&mut cx);
     }
 
     /// Incorporates resources and then prepares viewport composition.
@@ -397,7 +410,14 @@ impl RendererCore {
             click
         };
 
-        let view = self.visible_view_for_doc(doc)?;
+        self.publish_document_selection(doc);
+        click.map(|glyph| crate::DocumentGlyph { doc, glyph })
+    }
+
+    pub(crate) fn publish_document_selection(&self, doc: usize) {
+        let Some(view) = self.visible_view_for_doc(doc) else {
+            return;
+        };
         if let (Some((start, end)), Some(exact_text)) = (
             view.selection_view().range(),
             view.selection.content().plain().map(str::to_owned),
@@ -425,7 +445,6 @@ impl RendererCore {
                 suffix,
             });
         }
-        click.map(|glyph| crate::DocumentGlyph { doc, glyph })
     }
 
     pub fn copy_selection_to_clipboard(&self) -> Result<bool, String> {
@@ -540,7 +559,7 @@ mod tests {
 
     fn base_inputs() -> html::pipeline::PipelineInputs {
         html::pipeline::PipelineInputs {
-            source: "<html />".to_string(),
+            source: "<html />".into(),
             markup_syntax: html::pipeline::MarkupSyntax::Html,
             user_styles: Vec::new(),
             reader_overrides: Default::default(),

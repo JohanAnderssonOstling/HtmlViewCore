@@ -18,6 +18,12 @@ pub(crate) struct PendingNavigation {
     receive: Receiver<Result<load::PreparedRenderDocument, String>>,
 }
 
+impl PendingNavigation {
+    pub(crate) fn is_click(&self) -> bool {
+        matches!(self.action, NavigationRequest::Click(..))
+    }
+}
+
 impl RendererCore {
     fn document_settings(&self) -> load::DocumentLoadSettings {
         load::DocumentLoadSettings {

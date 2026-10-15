@@ -73,6 +73,8 @@ pub struct InteractionPalette {
     pub active_search_match: Color,
     pub annotation: Color,
     pub active_annotation: Color,
+    /// The passage being read aloud.
+    pub reading: Color,
 }
 
 impl Default for InteractionPalette {
@@ -83,6 +85,7 @@ impl Default for InteractionPalette {
             active_search_match: Color::rgba8(190, 116, 55, 164),
             annotation: Color::rgba8(236, 204, 91, 104),
             active_annotation: Color::rgba8(196, 126, 57, 148),
+            reading: Color::rgba8(151, 188, 159, 56),
         }
     }
 }
@@ -242,10 +245,13 @@ pub enum RendererCommand {
         results: Vec<BookSearchMatch>,
     },
     NavigateSearch(i8),
+    /// Selects a zero-based match directly, preserving next/previous navigation.
+    NavigateSearchTo(usize),
     SetAnnotations(Vec<RendererAnnotation>),
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),
+    SetReadingTarget(Option<html::layout::ReadingTarget>),
     RequestVisibleText,
     CopySelection,
     CopySelectionCitation {
@@ -254,8 +260,31 @@ pub enum RendererCommand {
     },
 }
 
+/// A publication source address, independent of glyph indices and layout.
+/// Even path steps address elements; a final odd step addresses a text chunk.
+/// Element addresses also represent pages containing only images.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub document: usize,
+    pub path: Vec<usize>,
+    pub utf16_offset: Option<usize>,
+}
+
+/// A single snapshot from which a host derives its chapter, UI and persistence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingPosition {
+    pub source: SourcePosition,
+    pub fraction: f32,
+    pub document_fraction: f32,
+    pub location: u64,
+    pub total_locations: u64,
+    pub document_count: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum RendererEvent {
+    /// One settled page location and its progress, emitted after pagination.
+    ReadingPositionChanged(ReadingPosition),
     PositionChanged {
         doc: usize,
         glyph: Option<u32>,
@@ -313,6 +342,7 @@ pub enum RendererEvent {
 pub enum RendererOperation {
     CopySelection,
     CopyImage,
+    CopyEquationLatex,
     UpdateDocument,
 }
 
@@ -321,6 +351,7 @@ impl fmt::Display for RendererOperation {
         formatter.write_str(match self {
             Self::CopySelection => "copy selection",
             Self::CopyImage => "copy image",
+            Self::CopyEquationLatex => "copy equation as LaTeX",
             Self::UpdateDocument => "update document rendering",
         })
     }

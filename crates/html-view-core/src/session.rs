@@ -1,13 +1,15 @@
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use web_time::Instant;
 
+use html_view_paginate::PaginationScratch;
 use kurbo::{Point, Size};
 
 use crate::{
     FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter,
-    RendererCommand, RendererCore, RendererHost, RendererOperation, RendererRevisions,
-    ResourceProvider, TocEntry,
+    ReadingFragment, ReadingTarget, RendererCommand, RendererCore, RendererHost, RendererOperation,
+    RendererRevisions, ResourceProvider, TocEntry,
 };
 
 /// The high-level renderer API used by UI backends.
@@ -18,6 +20,8 @@ pub struct RendererSession<S> {
     core: RendererCore,
     glyph_shaper: S,
     pointer_down_position: Option<Point>,
+    touch_selection_anchor: Option<Range<u32>>,
+    navigation_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +45,8 @@ impl<S: GlyphShaper> RendererSession<S> {
             core,
             glyph_shaper,
             pointer_down_position: None,
+            touch_selection_anchor: None,
+            navigation_revision: 0,
         }
     }
 
@@ -163,6 +169,12 @@ impl<S: GlyphShaper> RendererSession<S> {
         &self.core.page.view.document
     }
 
+    /// The reader palette for hosts adapting image paint. This is separate
+    /// from text foreground overrides and never changes image resources.
+    pub fn image_theme(&self) -> Option<html::pipeline::ThemeAdaptation> {
+        self.core.page.inputs.reader_overrides.theme
+    }
+
     pub fn glyph_shaper(&self) -> &S {
         &self.glyph_shaper
     }
@@ -181,7 +193,28 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn apply(&mut self, command: RendererCommand) {
+        if matches!(
+            &command,
+            RendererCommand::NavigateToHref(_)
+                | RendererCommand::NavigateHistory(_)
+                | RendererCommand::NavigateDocument(_)
+                | RendererCommand::SetPosition { .. }
+                | RendererCommand::SetCfiPosition(_)
+                | RendererCommand::SetProgressFraction(_)
+                | RendererCommand::NavigateSearch(_)
+                | RendererCommand::NavigateSearchTo(_)
+        ) {
+            self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        }
         self.core.apply(&mut self.glyph_shaper, command);
+    }
+
+    pub fn navigation_revision(&self) -> u64 {
+        self.navigation_revision
+    }
+
+    pub fn advance_reading_document(&mut self) {
+        self.core.next_document(&mut self.glyph_shaper);
     }
 
     /// Builds the navigation list from headings in the current document.
@@ -201,28 +234,220 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.nav.current_cfi(self.core.nav_view())
     }
 
+    /// Cheap readiness check: narration must not extract the old chapter during navigation.
+    pub fn reading_document(&self) -> Option<usize> {
+        self.core
+            .pending_navigation
+            .is_none()
+            .then(|| self.core.nav.location().document())
+    }
+
+    /// Readable block addresses and the source glyph at the visible position.
+    /// Text is materialized by the caller as each item is requested.
+    pub fn reading_items(&self) -> Option<(usize, usize, u32, Vec<ReadingTarget>)> {
+        let doc = self.reading_document()?;
+        let view = &self.core.page.view;
+        let start = view
+            .frame
+            .page()
+            .line_positions()
+            .iter()
+            .filter_map(|(index, _)| {
+                view.document
+                    .render_view()
+                    .text()
+                    .line(index)
+                    .map(|line| line.start())
+            })
+            .min()
+            .unwrap_or(0);
+        let addressing = view.document.render_view().addressing();
+        let items = addressing.reading_targets_in(0..u32::MAX);
+        let index = items
+            .iter()
+            .position(|item| {
+                item.glyph_ranges
+                    .last()
+                    .is_some_and(|range| range.end > start)
+            })
+            .unwrap_or(items.len());
+        Some((doc, index, start, items))
+    }
+
+    /// Blocks addressed by array indices, split at pages from the visible page onward.
+    /// Returns `None` while a requested document is still loading.
+    pub fn document_reading_fragments(&self) -> Option<(usize, usize, Vec<ReadingFragment>)> {
+        let (doc, full) = self.reading_fragments_from(true)?;
+        let (_, onward) = self.reading_fragments_from(false)?;
+        let view = &self.core.page.view;
+        let start = view
+            .frame
+            .page()
+            .line_positions()
+            .iter()
+            .filter_map(|(index, _)| {
+                view.document
+                    .render_view()
+                    .text()
+                    .line(index)
+                    .map(|line| line.start())
+            })
+            .min()
+            .unwrap_or(0);
+        let addressing = view.document.render_view().addressing();
+        let mut fragments = Vec::new();
+        for fragment in full {
+            let Some(first) = fragment.target.glyph_ranges.first() else {
+                continue;
+            };
+            if first.start >= start {
+                break;
+            }
+            if fragment
+                .target
+                .glyph_ranges
+                .last()
+                .is_some_and(|range| range.end <= start)
+            {
+                fragments.push(fragment);
+            } else {
+                fragments.extend(addressing.reading_fragments_in(first.start..start));
+            }
+        }
+        let index = fragments.len();
+        fragments.extend(onward);
+        Some((doc, index, fragments))
+    }
+
+    pub fn reading_target_cfi(&self, target: &ReadingTarget) -> Option<String> {
+        crate::cfi::generate_cfi(
+            &self.core.page.view.document,
+            self.core.nav.location().document(),
+            target.glyph_ranges.first()?.start,
+        )
+    }
+
+    pub fn reading_fragments(&self) -> Option<(usize, Vec<ReadingFragment>)> {
+        self.reading_fragments_from(false)
+    }
+
+    fn reading_fragments_from(
+        &self,
+        whole_document: bool,
+    ) -> Option<(usize, Vec<ReadingFragment>)> {
+        if self.core.pending_navigation.is_some() {
+            return None;
+        }
+        let view = &self.core.page.view;
+        let start = view
+            .frame
+            .page()
+            .line_positions()
+            .iter()
+            .filter_map(|(index, _)| {
+                view.document
+                    .render_view()
+                    .text()
+                    .line(index)
+                    .map(|line| line.start())
+            })
+            .min()
+            .unwrap_or(0);
+        let text = view.document.render_view().text();
+        let addressing = view.document.render_view().addressing();
+        let paginator = self.core.paginator();
+        let mut scratch = PaginationScratch::default();
+        let mut offset = if whole_document {
+            text.line(0).map(|line| line.point().y).unwrap_or(0.0)
+        } else {
+            view.frame.page().paint_start_offset_y()
+        };
+        let mut consumed = if whole_document { 0 } else { start };
+        let mut fragments = Vec::new();
+        for _ in 0..text.lines().len().max(1) {
+            let page = paginator.page_at_with_scratch(offset, Vec::new(), &mut scratch);
+            let end = page
+                .positions
+                .iter()
+                .filter_map(|(index, _)| text.line(index).map(|line| line.end()))
+                .max()
+                .unwrap_or(consumed);
+            let boundary = addressing.reading_boundary_after_word(end);
+            if boundary > consumed {
+                fragments.extend(addressing.reading_fragments_in(consumed..boundary));
+                consumed = boundary;
+            }
+            if page.reached_end {
+                break;
+            }
+            let next_offset = page
+                .last_line
+                .and_then(|line| text.line(line + 1))
+                .map(|line| line.point().y)
+                .unwrap_or(page.next_start_offset_y);
+            if next_offset <= offset {
+                break;
+            }
+            offset = next_offset;
+        }
+        Some((self.core.nav.location().document(), fragments))
+    }
+
+    /// Highlights a block and follows it only if its beginning is off screen.
+    pub fn follow_reading_target(&mut self, target: ReadingTarget) {
+        let start = target.glyph_ranges.first().map(|range| range.start);
+        if let Some(start) = start {
+            let visible = self
+                .core
+                .doc()
+                .find_line_for_glyph(start)
+                .is_some_and(|line| {
+                    self.core
+                        .page
+                        .view
+                        .frame
+                        .page()
+                        .line_positions()
+                        .contains(line)
+                });
+            if !visible {
+                self.core.set_position(
+                    &mut self.glyph_shaper,
+                    self.core.nav.location().document(),
+                    Some(start),
+                );
+            }
+        }
+        self.apply(RendererCommand::SetReadingTarget(Some(target)));
+    }
+
     pub fn resolve_href(&self, href: &str) -> Option<(usize, Option<String>)> {
         self.core.resolve_href(href)
     }
 
     pub fn navigate_to_href(&mut self, href: &str) -> bool {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.navigate_to_href(&mut self.glyph_shaper, href)
     }
 
     pub fn navigate_history_back(&mut self) -> bool {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.navigate_history_back(&mut self.glyph_shaper)
     }
 
     pub fn navigate_history_forward(&mut self) -> bool {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.navigate_history_forward(&mut self.glyph_shaper)
     }
 
     pub fn set_position(&mut self, document: usize, glyph: Option<u32>) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core
             .set_position(&mut self.glyph_shaper, document, glyph);
     }
 
     pub fn set_cfi_position(&mut self, cfi: &str) -> bool {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.set_cfi_position(cfi)
     }
 
@@ -231,18 +456,22 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn next_page(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.next_page(&mut self.glyph_shaper);
     }
 
     pub fn previous_page(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.prev_page(&mut self.glyph_shaper);
     }
 
     pub fn next_line(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.next_line(&mut self.glyph_shaper);
     }
 
     pub fn previous_line(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.prev_line(&mut self.glyph_shaper);
     }
 
@@ -259,10 +488,12 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn next_document(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.next_document(&mut self.glyph_shaper);
     }
 
     pub fn previous_document(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.prev_document(&mut self.glyph_shaper);
     }
 
@@ -333,10 +564,12 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn next_match(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.next_match(&mut self.glyph_shaper);
     }
 
     pub fn previous_match(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.prev_match(&mut self.glyph_shaper);
     }
 
@@ -356,6 +589,25 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.hit_test_document_image(position).is_some()
     }
 
+    pub fn equation_at(&self, position: Point) -> bool {
+        self.core.hit_test_document_image(position).is_some_and(|image| {
+            self.core.page.view.document.render_view().image_mathml(image.image).is_some()
+        })
+    }
+
+    /// Convert the retained equation only on request; no LaTeX cache is kept.
+    pub fn copy_equation_latex_at(&self, position: Point) -> bool {
+        let Some(image) = self.core.hit_test_document_image(position) else { return false };
+        let view = self.core.page.view.document.render_view();
+        let Some(markup) = view.image_mathml(image.image) else { return false };
+        let result = crate::mathml::to_latex(markup)
+            .and_then(|latex| self.core.host.set_clipboard(&latex));
+        if let Err(message) = result {
+            self.core.emit_operation_failed(RendererOperation::CopyEquationLatex, message);
+        }
+        true
+    }
+
     pub fn copy_image_at(&self, position: Point) -> bool {
         let Some(image) = self.core.hit_test_document_image(position) else {
             return false;
@@ -365,6 +617,121 @@ impl<S: GlyphShaper> RendererSession<S> {
                 .emit_operation_failed(RendererOperation::CopyImage, message);
         }
         true
+    }
+
+    /// Select a word without triggering a link or image action.
+    pub fn select_word_at(&mut self, position: Point) -> bool {
+        let Some(word) = self.touch_word_at(position, true) else {
+            return false;
+        };
+        self.touch_selection_anchor = Some(word.clone());
+        self.install_touch_selection(word);
+        true
+    }
+
+    /// Fix the opposite boundary while a selection handle moves. The range
+    /// can reverse direction when the dragged handle crosses the fixed end.
+    pub fn begin_selection_handle(&mut self, start: bool) -> bool {
+        let Some((first, last)) = self.core.page.view.selection_view().range() else {
+            return false;
+        };
+        let fixed = if start { last } else { first };
+        self.touch_selection_anchor = Some(fixed..fixed);
+        true
+    }
+
+    pub fn update_touch_selection(&mut self, position: Point) -> bool {
+        let Some(anchor) = self.touch_selection_anchor.clone() else {
+            return false;
+        };
+        let Some(word) = self.touch_word_at(position, false) else {
+            return false;
+        };
+        self.install_touch_selection(word.start.min(anchor.start)..word.end.max(anchor.end));
+        true
+    }
+
+    fn touch_word_at(&self, position: Point, require_ink: bool) -> Option<Range<u32>> {
+        let hit = self.core.hit_test_document_glyph(position)?;
+        if hit.doc != self.core.nav.location().document() {
+            return None;
+        }
+        let view = &self.core.page.view;
+        // Hit testing returns a caret boundary. The right half of a character
+        // can therefore report the next glyph, including a trailing space.
+        for glyph in [Some(hit.glyph), hit.glyph.checked_sub(1)]
+            .into_iter()
+            .flatten()
+        {
+            if view
+                .geometry()
+                .glyph_range_bounds(glyph, glyph + 1)
+                .is_some_and(|bounds| bounds.contains(position))
+            {
+                return view.doc().word_range_at(glyph);
+            }
+        }
+        if require_ink {
+            return None;
+        }
+        [Some(hit.glyph), hit.glyph.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .find_map(|glyph| {
+                // A caret at the edge of the last visible line can address the
+                // first character on the next page. Clamp to visible text instead.
+                view.geometry().glyph_range_bounds(glyph, glyph + 1)?;
+                view.doc().word_range_at(glyph)
+            })
+    }
+
+    fn install_touch_selection(&mut self, range: Range<u32>) {
+        self.pointer_down_position = None;
+        self.core.page.view.table_selection.clear();
+        self.core.page.view.selection.select_range(
+            range.start,
+            range.end,
+            crate::SelectionMode::Plain,
+        );
+        self.core.page.view.update_selection_text();
+        self.core
+            .publish_document_selection(self.core.nav.location().document());
+        self.core.request_overlay_repaint();
+    }
+
+    pub fn end_touch_selection(&mut self) {
+        self.touch_selection_anchor = None;
+    }
+
+    pub fn clear_text_selection(&mut self) {
+        self.touch_selection_anchor = None;
+        self.core.page.view.selection = crate::SelectionState::default();
+        self.core.request_overlay_repaint();
+    }
+
+    /// Read the current range synchronously for actions taken immediately
+    /// after a handle release; queued UI events may describe an older range.
+    pub fn selected_passage(&self) -> Option<(String, String)> {
+        let view = &self.core.page.view;
+        let (start, end) = view.selection_view().range()?;
+        let cfi = crate::cfi::generate_cfi_range(
+            &view.document,
+            self.core.nav.location().document(),
+            start,
+            end,
+        )?;
+        Some((cfi, view.selection.content().plain()?.to_owned()))
+    }
+
+    pub fn selection_endpoints(&self) -> (Option<Point>, Option<Point>) {
+        let Some((start, end)) = self.core.page.view.selection_view().range() else {
+            return (None, None);
+        };
+        let (start, end) = self.core.text_geometry().selection_endpoints(start, end);
+        (
+            start.map(|point| self.core.from_layout_point(point)),
+            end.map(|point| self.core.from_layout_point(point)),
+        )
     }
 
     /// Starts the complete primary-pointer interaction. Image copying takes
@@ -424,8 +791,22 @@ impl<S: GlyphShaper> RendererSession<S> {
         let Some(hit) = self.core.finish_document_selection() else {
             return false;
         };
-        self.core
-            .handle_document_click(&mut self.glyph_shaper, hit, click_position)
+        let before = (
+            self.core.nav.location().document(),
+            self.core.nav.anchor_glyph_here(),
+        );
+        let handled = self
+            .core
+            .handle_document_click(&mut self.glyph_shaper, hit, click_position);
+        if before
+            != (
+                self.core.nav.location().document(),
+                self.core.nav.anchor_glyph_here(),
+            )
+        {
+            self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        }
+        handled
     }
 
     pub fn pointer_leave(&mut self) {
@@ -527,7 +908,25 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// Incorporates completed resources. This operation may update document
     /// layout and must run from application state update code.
     pub fn update_resources(&mut self) {
+        let deferred_click = self
+            .core
+            .pending_navigation
+            .as_ref()
+            .is_some_and(|pending| pending.is_click());
+        let before = (
+            self.core.nav.location().document(),
+            self.core.nav.anchor_glyph_here(),
+        );
         self.core.finish_pending_navigation(&mut self.glyph_shaper);
+        if deferred_click
+            && before
+                != (
+                    self.core.nav.location().document(),
+                    self.core.nav.anchor_glyph_here(),
+                )
+        {
+            self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        }
         self.core.update_resources(&mut self.glyph_shaper);
     }
 
@@ -625,6 +1024,10 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use html::document::ImageSource;
+    use html::resources::DecodedImage;
+    use html::pipeline::{ReaderStyleOverrides, ThemeAdaptation};
 
     use crate::text_backend::{
         FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, ShapedLine, TextShapeRequest,
@@ -772,6 +1175,38 @@ mod tests {
         events: RefCell<Vec<RendererEvent>>,
         repaints: Cell<usize>,
         fail_clipboard: Cell<bool>,
+        clipboard: RefCell<String>,
+    }
+
+    #[derive(Default)]
+    struct EquationPainter {
+        colors: Vec<u32>,
+    }
+
+    #[derive(Default)]
+    struct SvgThemePainter {
+        ordinary_svgs: usize,
+        raster_images: usize,
+    }
+
+    impl Painter for SvgThemePainter {
+        fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
+        fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {}
+        fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {
+            self.raster_images += 1;
+        }
+        fn draw_svg(&mut self, _bytes: &[u8], _hash: &[u8], _size: (u32, u32), _rect: Rect) {
+            self.ordinary_svgs += 1;
+        }
+    }
+
+    impl Painter for EquationPainter {
+        fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
+        fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {}
+        fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
+        fn draw_math_svg(&mut self, _bytes: &[u8], _hash: &[u8], _size: (u32, u32), _rect: Rect, color: u32) {
+            self.colors.push(color);
+        }
     }
 
     impl RendererHost for TestHost {
@@ -791,10 +1226,11 @@ mod tests {
             None
         }
 
-        fn set_clipboard(&self, _text: &str) -> Result<(), String> {
+        fn set_clipboard(&self, text: &str) -> Result<(), String> {
             if self.fail_clipboard.get() {
                 Err("test clipboard failure".to_owned())
             } else {
+                *self.clipboard.borrow_mut() = text.to_owned();
                 Ok(())
             }
         }
@@ -811,6 +1247,208 @@ mod tests {
         fn emit(&self, event: RendererEvent) {
             self.events.borrow_mut().push(event);
         }
+    }
+
+    #[test]
+    fn equation_context_copy_uses_retained_mathml_and_reports_clipboard_failure() {
+        let file = std::env::temp_dir().join(format!("html-view-mathml-{}.html", std::process::id()));
+        std::fs::write(&file, "<!doctype html><p>Equation <math><mfrac><mn>1</mn><mi>x</mi></mfrac></math></p><svg width='20' height='20'><rect width='20' height='20'/></svg>").unwrap();
+        let host = Rc::new(TestHost::default());
+        let uri = file.to_string_lossy().into_owned();
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host.clone(), TestShaper::default(), Arc::new(FileSystemProvider::new()),
+            vec![uri], 0, None, crate::RendererInitialConfig::default(),
+        );
+        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut RecordingPainter::default());
+        let mut equation = None;
+        let mut ordinary_svg = None;
+        for y in (0..250).step_by(2) {
+            for x in (0..600).step_by(2) {
+                let point = Point::new(x as f64, y as f64);
+                if renderer.equation_at(point) {
+                    equation.get_or_insert(point);
+                } else if renderer.image_at(point) {
+                    ordinary_svg.get_or_insert(point);
+                }
+            }
+        }
+        let equation = equation.expect("rendered equation hit target");
+        let ordinary_svg = ordinary_svg.expect("ordinary SVG hit target");
+        assert!(!renderer.copy_equation_latex_at(ordinary_svg));
+        assert!(renderer.copy_equation_latex_at(equation));
+        assert_eq!(*host.clipboard.borrow(), r"\frac{1}{x}");
+        host.fail_clipboard.set(true);
+        assert!(renderer.copy_equation_latex_at(equation));
+        assert!(host.events.borrow().iter().any(|event| matches!(event,
+            RendererEvent::OperationFailed { operation: RendererOperation::CopyEquationLatex, .. })));
+        let old_source = renderer.core.page.view.document.render_view().images()[0].source.clone();
+        let old_width = renderer.core.page.view.document.render_view().images()[0].width;
+        renderer.apply(RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
+            foreground: Some(0xeeeeeeff), ..Default::default()
+        }));
+        renderer.update_resources();
+        let mut painter = EquationPainter::default();
+        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut painter);
+        assert_eq!(painter.colors, [0xeeeeeeff], "equation painting must use the current reader theme");
+        renderer.apply(RendererCommand::SetFontSize(32.0));
+        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut RecordingPainter::default());
+        renderer.update_resources();
+        assert!(renderer.core.page.view.document.render_view().images()[0].width > old_width);
+        let ImageSource::MathMl { svg: old_svg, .. } = old_source else { panic!("equation source") };
+        let ImageSource::MathMl { svg: new_svg, .. } = &renderer.core.page.view.document.render_view().images()[0].source else { panic!("equation source") };
+        assert_ne!(&old_svg, new_svg);
+        let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(0).unwrap() else { panic!("decoded math SVG") };
+        assert_eq!(bytes, new_svg, "font-size changes must replace the decoded SVG source");
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn inline_and_external_svgs_receive_current_theme_without_replacing_decoded_sources() {
+        let directory = std::env::temp_dir().join(format!("html-view-svg-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("chapter.html");
+        let source = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><rect width='20' height='20' fill='black'/></svg>";
+        std::fs::write(directory.join("diagram.svg"), source).unwrap();
+        std::fs::write(&file, format!("<!doctype html><p>Diagram {source}<img src='diagram.svg'></p>")).unwrap();
+        let mut renderer = RendererSession::from_provider_with_nav(
+            Rc::new(TestHost::default()), TestShaper::default(), Arc::new(FileSystemProvider::new()),
+            vec![file.to_string_lossy().into_owned()], 0, None, crate::RendererInitialConfig::default(),
+        );
+        let size = Size::new(600.0, 400.0);
+        renderer.prepare_frame(size).paint(&mut RecordingPainter::default());
+        renderer.update_resources();
+        let mut painter = SvgThemePainter::default();
+        renderer.prepare_frame(size).paint(&mut painter);
+        assert_eq!(painter.ordinary_svgs, 2);
+        assert_eq!(renderer.image_theme(), None);
+        let sources: Vec<_> = (0..2).map(|index| {
+            let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(index).unwrap() else { panic!("decoded SVG") };
+            bytes.clone()
+        }).collect();
+        for theme in [
+            ThemeAdaptation { ink: 0xe8e7e4ff, surface: 0x2d2b28ff },
+            ThemeAdaptation { ink: 0x272624ff, surface: 0xfef8edff },
+        ] {
+            renderer.apply(RendererCommand::SetReaderStyleOverrides(ReaderStyleOverrides { theme: Some(theme), ..Default::default() }));
+            let mut painter = SvgThemePainter::default();
+            renderer.prepare_frame(size).paint(&mut painter);
+            assert_eq!(renderer.image_theme(), Some(theme));
+            assert_eq!(painter.ordinary_svgs, 2);
+            for (index, original) in sources.iter().enumerate() {
+                let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(index as u32).unwrap() else { panic!("decoded SVG") };
+                assert_eq!(bytes, original, "theme changes only affect rasterized paint");
+            }
+        }
+        renderer.apply(RendererCommand::SetReaderStyleOverrides(Default::default()));
+        assert_eq!(renderer.image_theme(), None);
+        let mut painter = SvgThemePainter::default();
+        renderer.prepare_frame(size).paint(&mut painter);
+        assert_eq!(painter.ordinary_svgs, 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn touch_selection_tracks_words_handles_wrapped_lines_and_final_cfi_without_links() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file = std::env::temp_dir().join(format!("html-view-touch-{nonce}.html"));
+        std::fs::write(&file, "<html><head><meta charset='utf-8'></head><body><p><a href='#target'>alpha</a> beta gamma delta epsilon zeta eta theta</p><p>cafe\u{301} 👩‍👧</p><p id='target'>target</p></body></html>").unwrap();
+        let host = Rc::new(TestHost::default());
+        let mut renderer = RendererSession::from_provider_with_nav(
+            host.clone(),
+            TestShaper::default(),
+            Arc::new(FileSystemProvider::new()),
+            vec![file.to_string_lossy().into_owned()],
+            0,
+            Some("0:0"),
+            crate::RendererInitialConfig::default(),
+        );
+        renderer.apply(RendererCommand::SetColumnWidth(120.0));
+        renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
+        renderer
+            .prepare_frame(Size::new(120.0, 500.0))
+            .paint(&mut RecordingPainter::default());
+        let point_at = |renderer: &RendererSession<TestShaper>, word: &str| {
+            let doc = renderer.core.doc();
+            let all = doc.glyph_text(&[0..doc.text().glyph_count() as u32]);
+            let byte = all.find(word).unwrap();
+            let glyph = all[..byte].chars().count() as u32;
+            let bounds = renderer
+                .core
+                .text_geometry()
+                .glyph_range_bounds(glyph, glyph + 1)
+                .unwrap();
+            Point::new(
+                bounds.x0 + bounds.width() * 0.8,
+                bounds.y0 + bounds.height() * 0.5,
+            )
+        };
+        let location = renderer.current_cfi();
+        assert!(!renderer.select_word_at(Point::new(-50.0, -50.0)));
+        assert!(renderer.select_word_at(point_at(&renderer, "alpha")));
+        assert_eq!(renderer.selected_passage().unwrap().1, "alpha");
+        renderer.end_touch_selection();
+        assert_eq!(renderer.current_cfi(), location);
+        assert!(renderer.begin_selection_handle(false));
+        assert!(renderer.update_touch_selection(point_at(&renderer, "epsilon")));
+        renderer.end_touch_selection();
+        let (cfi, text) = renderer.selected_passage().unwrap();
+        assert_eq!(text, "alpha beta gamma delta epsilon");
+        let (_, first, last) =
+            crate::cfi::parse_cfi_range(&renderer.core.page.view.document, &cfi).unwrap();
+        assert_eq!(
+            renderer
+                .core
+                .doc()
+                .build_selection_text(first, last)
+                .0
+                .unwrap(),
+            text
+        );
+        let (start, end) = renderer.selection_endpoints();
+        assert!(
+            end.unwrap().y > start.unwrap().y,
+            "wrapped selection handles must use their own lines"
+        );
+        assert!(renderer.begin_selection_handle(true));
+        assert!(renderer.update_touch_selection(point_at(&renderer, "zeta")));
+        renderer.end_touch_selection();
+        assert!(renderer.selected_passage().unwrap().1.contains("zeta"));
+        assert_eq!(renderer.current_cfi(), location);
+        assert!(renderer.copy_selection());
+        assert!(renderer.begin_selection_handle(false));
+        assert!(renderer.update_touch_selection(Point::new(3000.0, 5000.0)));
+        assert!(renderer.selected_passage().unwrap().1.ends_with("target"));
+        assert!(
+            renderer.selection_endpoints().1.is_some(),
+            "the edge drag must end on visible text"
+        );
+        renderer.end_touch_selection();
+        for word in ["cafe\u{301}", "👩‍👧"] {
+            assert!(renderer.select_word_at(point_at(&renderer, word)));
+            assert_eq!(renderer.selected_passage().unwrap().1, word);
+            let (cfi, _) = renderer.selected_passage().unwrap();
+            let (_, first, last) =
+                crate::cfi::parse_cfi_range(&renderer.core.page.view.document, &cfi).unwrap();
+            assert_eq!(
+                renderer
+                    .core
+                    .doc()
+                    .build_selection_text(first, last)
+                    .0
+                    .as_deref(),
+                Some(word)
+            );
+            renderer.end_touch_selection();
+        }
+        renderer.clear_text_selection();
+        assert!(renderer.selected_passage().is_none());
+        assert_eq!(renderer.selection_endpoints(), (None, None));
+        assert!(!renderer.update_touch_selection(point_at(&renderer, "gamma")));
+        assert!(host.events.borrow().iter().any(|event| matches!(event, RendererEvent::SelectionFinished { exact_text, .. } if exact_text == "alpha beta gamma delta epsilon")));
+        std::fs::remove_file(file).unwrap();
     }
 
     #[test]
@@ -951,19 +1589,45 @@ mod tests {
 
     #[test]
     fn initial_cross_spine_target_is_selected_during_worker_preparation() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let fixture = std::env::temp_dir().join(format!("html-view-target-preparation-{nonce}"));
         std::fs::create_dir_all(&fixture).unwrap();
         let first = fixture.join("one.html");
         let second = fixture.join("two.html");
         std::fs::write(&first, "<html><body>First</body></html>").unwrap();
-        std::fs::write(&second, "<html><body><h1 id=\"target\">Prepared target</h1></body></html>").unwrap();
+        std::fs::write(
+            &second,
+            "<html><body><h1 id=\"target\">Prepared target</h1></body></html>",
+        )
+        .unwrap();
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-        let uris = vec![first.to_string_lossy().into_owned(), second.to_string_lossy().into_owned()];
-        let preparation = crate::RendererPreparation::from_provider_with_nav_and_target(provider, uris, 0, Some("0:12"), Some("two.html#target"), crate::RendererInitialConfig::default()).unwrap();
-        assert_eq!(preparation.doc_index, 1, "the target document must be chosen before UI-thread shaping");
+        let uris = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+        let preparation = crate::RendererPreparation::from_provider_with_nav_and_target(
+            provider,
+            uris,
+            0,
+            Some("0:12"),
+            Some("two.html#target"),
+            crate::RendererInitialConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            preparation.doc_index, 1,
+            "the target document must be chosen before UI-thread shaping"
+        );
         assert_eq!(preparation.initial_anchor.as_deref(), Some("target"));
-        let renderer = RendererSession::from_preparation(Rc::new(TestHost::default()), TestShaper::default(), preparation).unwrap();
+        let renderer = RendererSession::from_preparation(
+            Rc::new(TestHost::default()),
+            TestShaper::default(),
+            preparation,
+        )
+        .unwrap();
         assert_eq!(renderer.core.nav.location().document(), 1);
         std::fs::remove_dir_all(fixture).unwrap();
     }

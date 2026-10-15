@@ -4,6 +4,51 @@
 //! spine addressing, range syntax, and recovery policy.
 
 use html::layout::LaidOutDocument;
+use html_view_types::SourcePosition;
+
+/// Serializes either a text address or an element address using EPUB CFI.
+pub fn source_position_cfi(position: &SourcePosition) -> String {
+    let path = position.path.iter().map(|step| format!("/{step}")).collect::<String>();
+    let offset = position.utf16_offset.map(|offset| format!(":{offset}")).unwrap_or_default();
+    format!("epubcfi(/6/{}!{path}{offset})", (position.document + 1) * 2)
+}
+
+/// The start of a point or range CFI, without optional ID assertions.
+pub fn parse_source_position(cfi: &str) -> Option<SourcePosition> {
+    let document = parse_cfi_spine_only(cfi)?;
+    let (_, content) = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?.split_once('!')?;
+    let parts = split_range_components(content);
+    let start = match parts.as_slice() {
+        [point] => point.clone(),
+        [common, start, _] => format!("{}/{}", common.trim_end_matches('/'), start.trim_start_matches('/')),
+        _ => return None,
+    };
+    let mut plain = String::new();
+    let mut escaped = false;
+    let mut assertion = false;
+    for character in start.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '^' => escaped = true,
+            '[' => assertion = true,
+            ']' => assertion = false,
+            _ if !assertion => plain.push(character),
+            _ => {}
+        }
+    }
+    if escaped || assertion {
+        return None;
+    }
+    let (path, utf16_offset) = match plain.split_once(':') {
+        Some((path, offset)) => (path, Some(leading_usize(offset)?)),
+        None => (plain.as_str(), None),
+    };
+    let path = path.split('/').filter(|step| !step.is_empty()).map(str::parse).collect::<Result<Vec<usize>, _>>().ok()?;
+    Some(SourcePosition { document, path, utf16_offset })
+}
 
 #[derive(Clone, Copy)]
 enum GlyphBoundary {
@@ -170,6 +215,24 @@ mod tests {
     use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, LayoutConstraints, ShapeError};
     use html::pipeline::DocumentFactory;
     use std::collections::HashMap;
+
+    #[test]
+    fn source_positions_roundtrip_text_elements_and_document_start() {
+        for position in [
+            SourcePosition { document: 2, path: vec![4, 12, 1], utf16_offset: Some(17) },
+            SourcePosition { document: 1, path: vec![4, 8, 2], utf16_offset: None },
+            SourcePosition { document: 0, path: Vec::new(), utf16_offset: None },
+        ] {
+            assert_eq!(parse_source_position(&source_position_cfi(&position)), Some(position));
+        }
+    }
+
+    #[test]
+    fn source_position_uses_range_start_and_ignores_escaped_assertions() {
+        assert_eq!(parse_source_position("epubcfi(/6/2!/4[body^,name],/12[section]/1:0,/12[section]/1:8)"), Some(SourcePosition { document: 0, path: vec![4, 12, 1], utf16_offset: Some(0) }));
+        assert_eq!(parse_source_position("epubcfi(/6/2!/4/8[sec^]tion]/1:12)"), Some(SourcePosition { document: 0, path: vec![4, 8, 1], utf16_offset: Some(12) }));
+        assert!(parse_source_position("epubcfi(/6/2!/4[unclosed/1:0)").is_none());
+    }
 
     #[derive(Default)]
     struct TestShaper {

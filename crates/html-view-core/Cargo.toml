@@ -19,4 +19,6 @@ kurbo.workspace = true
 peniko.workspace = true
 unicode-normalization.workspace = true
 smallvec = "1"
+mathema = { git = "https://github.com/DevExzh/mathema", rev = "d9cce9ffeb7346181d4c3201dc0a13727269863b", default-features = false }
+roxmltree = "0.21"
 web-time = "1"

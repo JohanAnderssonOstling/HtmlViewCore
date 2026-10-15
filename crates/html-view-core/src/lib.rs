@@ -13,12 +13,14 @@ use crate::document_cache::DocumentCache;
 use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPageCache;
 use crate::spine_item::SpineItem;
+use html::document::ImageSource;
 use html::layout::GlyphShaper;
 pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
 use html::pipeline::{EarliestStage, PipelineInputs};
 pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy};
 pub use html::resources::{BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata, ResourceProvider};
-use html::resources::{ImagePipeline, ImageService};
+use html::resources::{ImageLoader, ImagePipeline, ImageService};
+use html_view_doc::SourceIndex;
 
 pub use html_view_cfi as cfi;
 
@@ -26,6 +28,7 @@ mod document_cache;
 mod document_view;
 mod prepared_page;
 mod spine_item;
+mod mathml;
 
 pub mod layout {
     pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
@@ -49,6 +52,7 @@ pub mod text_backend {
 }
 
 pub use html::layout::LaidOutDocument;
+pub use html::layout::{ReadingFragment, ReadingTarget};
 pub use html::render::{Painter, RecordingPainter, TextRunFragment};
 
 mod session;
@@ -177,6 +181,7 @@ mod frame_cache_tests {
 pub struct RendererPreparation {
     loaded: load::PreparedRenderDocument,
     provider: Arc<dyn ResourceProvider>,
+    image_loader: Option<Arc<dyn ImageLoader>>,
     document_uris: Vec<String>,
     doc_index: usize,
     glyph_index: u32,
@@ -200,6 +205,7 @@ pub(crate) struct RendererCore {
     image_service: ImageService,
     root_font_size: f32,
     viewport: ViewportState,
+    column_viewport_request: Option<nav::ColumnViewportRequest>,
     document_cache: DocumentCache,
     pending_navigation: Option<nav::PendingNavigation>,
     pending_file_events: std::cell::RefCell<Vec<std::sync::mpsc::Receiver<Result<RendererEvent, String>>>>,
@@ -316,11 +322,20 @@ impl RendererCore {
         self.host.emit(RendererEvent::OperationFailed { operation, message });
     }
 
+    #[cfg(test)]
     pub fn new(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig) -> Self {
+        Self::new_with_image_loader(host, loaded, provider, document_uris, current_doc_index, config, None)
+    }
+
+    fn new_with_image_loader(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig, image_loader: Option<Arc<dyn ImageLoader>>) -> Self {
         let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
         let image_resources = document.render_view().images().to_vec();
-        let image_service = ImageService::with_job_spawner(provider.clone(), host.blocking_job_spawner(), ImageService::DEFAULT_BYTE_BUDGET);
+        let jobs = host.blocking_job_spawner();
+        let image_service = match image_loader {
+            Some(loader) => ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET),
+            None => ImageService::with_job_spawner(provider.clone(), jobs, ImageService::DEFAULT_BYTE_BUDGET),
+        };
         image_service.set_completion_waker(host.resource_waker());
         let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
@@ -333,13 +348,14 @@ impl RendererCore {
         }
         Self {
             host,
-            page: SpineItem { session: loaded.session, inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(document, layout) },
+            page: SpineItem { source_index: loaded.source_index, session: loaded.session, inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(document, layout) },
             note: None,
             note_document: None,
             provider,
             image_service,
             root_font_size,
             viewport: ViewportState::default(),
+            column_viewport_request: None,
             document_cache,
             pending_navigation: None,
             pending_file_events: Default::default(),
@@ -410,12 +426,36 @@ impl RendererCore {
         let preserve_document_start = anchor_is_document_start && matches!(composition.direction(), PaintDirection::Forward) && composition.start_offset_y() <= 0.1 && self.page.view.frame.page().start_line().is_none_or(|line| line == 0);
         let anchor_glyph = if preserve_document_start { None } else { self.nav.anchor_glyph_here().or_else(|| self.nav.current_glyph_position(self.nav_view())) };
         let anchor_cfi = if preserve_document_start { None } else { self.nav.current_cfi(self.nav_view()) };
+        let anchor_is_element = !preserve_document_start && self.nav.current_source_position(self.nav_view()).utf16_offset.is_none();
 
+        let source_changed = self.page.inputs.source != requested_inputs.source || self.page.inputs.markup_syntax != requested_inputs.markup_syntax;
         self.host.set_glyph_document(self.nav.location().document());
         let update = self.page.session.update(requested_inputs.clone(), glyph_shaper)?;
 
         let document = self.page.session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
+        // Typography preparation can regenerate MathML SVGs. Replace only
+        // the image pipeline when their source bytes actually changed.
+        let math_changed = self.page.view.document.render_view().images().iter()
+            .zip(document.render_view().images()).any(|(old, new)| {
+                matches!((&old.source, &new.source),
+                    (ImageSource::MathMl { svg: old, .. }, ImageSource::MathMl { svg: new, .. }) if old != new)
+            });
+        if math_changed {
+            self.page.images = crate::spine_item::SpineItem::image_pipeline_for(&document, self.image_service.clone());
+        }
+        if source_changed {
+            self.page.source_index = Arc::new(SourceIndex::new(&requested_inputs.source, requested_inputs.markup_syntax));
+        }
         self.root_font_size = self.page.install_pipeline_result(document, requested_inputs);
+        if update.stage == EarliestStage::Paint {
+            // Paint changes preserve pagination, selection and reading position.
+            // Revisions invalidate the displayed colors without discarding geometry.
+            self.revisions.invalidate_pipeline_from(EarliestStage::Paint);
+            if request_repaint {
+                self.host.request_repaint();
+            }
+            return Ok(());
+        }
         if update.stage == EarliestStage::None {
             // reset_view_state also clears selection even when all pipeline
             // products were reusable.
@@ -424,7 +464,10 @@ impl RendererCore {
             self.revisions.invalidate_pipeline_from(update.stage);
         }
         self.reset_view_state();
-        if update.anchors_preserved {
+        self.resolve_media_overlay_highlight();
+        if anchor_is_element && let Some(cfi) = anchor_cfi.as_deref() {
+            self.restore_position_from_cfi(cfi);
+        } else if update.anchors_preserved {
             if let Some(glyph_idx) = anchor_glyph {
                 self.restore_glyph_position(glyph_idx);
             }
@@ -479,6 +522,7 @@ impl RendererCore {
             RendererCommand::SetDocumentTextLengths(lengths) => {
                 if self.nav.install_document_text_lengths(lengths) {
                     self.update_nav_signal();
+                    self.host.request_repaint();
                 }
             }
             RendererCommand::SetColumnWidth(width) => self.set_col_width(glyph_shaper, width),
@@ -551,6 +595,7 @@ impl RendererCore {
             RendererCommand::AppendSearchResults { query, options, results } => self.append_search_results(glyph_shaper, query, options, results),
             RendererCommand::NavigateSearch(step) if step > 0 => self.next_match(glyph_shaper),
             RendererCommand::NavigateSearch(_) => self.prev_match(glyph_shaper),
+            RendererCommand::NavigateSearchTo(index) => self.select_match(glyph_shaper, index),
             RendererCommand::SetAnnotations(annotations) => {
                 self.annotations.replace(annotations);
                 self.resolve_visible_annotations();
@@ -568,6 +613,11 @@ impl RendererCore {
             }
             RendererCommand::SetMediaOverlayTarget(target_href) => {
                 self.media_overlay.set_target(target_href);
+                self.resolve_media_overlay_highlight();
+                self.request_overlay_repaint();
+            }
+            RendererCommand::SetReadingTarget(target) => {
+                self.media_overlay.set_reading_target(target);
                 self.resolve_media_overlay_highlight();
                 self.request_overlay_repaint();
             }
@@ -628,7 +678,7 @@ impl RendererCore {
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
         let document_count = self.nav.documents().uris().len();
         self.nav.toc_anchors.set_strings_by_doc(anchors_by_doc, document_count);
-        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
+        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), source: &self.page.source_index, viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
     }
 
@@ -728,6 +778,12 @@ impl RendererCore {
 
     pub fn next_match(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         if self.highlight.next_match() {
+            self.navigate_after_match_step(glyph_shaper);
+        }
+    }
+
+    pub fn select_match(&mut self, glyph_shaper: &mut impl GlyphShaper, index: usize) {
+        if self.highlight.select_match(index) {
             self.navigate_after_match_step(glyph_shaper);
         }
     }

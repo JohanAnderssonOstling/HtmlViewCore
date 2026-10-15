@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
 use crate::{DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, RendererPreparation, ResourceProvider, TocEntry, ViewportState, load};
+use html::resources::ImageLoader;
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
 
@@ -18,7 +19,21 @@ mod spine;
 mod pending;
 pub(crate) use pending::{PendingNavigation, NavigationRequest};
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct ColumnViewportRequest {
+    available_width: f64,
+    column_width: f64,
+    column_count: u8,
+    column_gap: f64,
+}
+
 impl RendererPreparation {
+    /// Supply image I/O separately from the synchronous text provider.
+    pub fn with_image_loader(mut self, loader: Arc<dyn ImageLoader>) -> Self {
+        self.image_loader = Some(loader);
+        self
+    }
+
     pub fn from_provider_with_nav(
         provider: Arc<dyn ResourceProvider>,
         document_uris: Vec<String>,
@@ -62,7 +77,7 @@ impl RendererPreparation {
                 note_display: config.note_display,
             },
         )?;
-        Ok(Self { loaded, provider, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config })
+        Ok(Self { loaded, provider, image_loader: None, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config })
     }
 
     fn resolve_initial_target(
@@ -93,18 +108,20 @@ impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
         NavView {
             doc: DocQuery::new(&self.page.view.document),
+            source: &self.page.source_index,
             viewport: &self.viewport,
             frame: &self.page.view.frame,
         }
     }
 
-    fn nav_cx(&mut self) -> (&mut NavigationState, NavContext<'_>) {
+    pub(super) fn nav_cx(&mut self) -> (&mut NavigationState, NavContext<'_>) {
         // Disjoint field borrows: navigation state is mutated through the
         // first, everything it reads or writes through the second.
         (
             &mut self.nav,
             NavContext {
                 doc: DocQuery::new(&self.page.view.document),
+                source: &self.page.source_index,
                 viewport: &mut self.viewport,
                 frame: &self.page.view.frame,
                 host: self.host.as_ref(),
@@ -184,10 +201,10 @@ impl RendererCore {
         glyph_shaper: &mut impl GlyphShaper,
         prepared: RendererPreparation,
     ) -> Result<Self, String> {
-        let RendererPreparation { loaded, provider, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config } = prepared;
+        let RendererPreparation { loaded, provider, image_loader, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config } = prepared;
         let restoring_position = nav_state.is_some();
         let loaded = load::finish_prepared_document(loaded, glyph_shaper)?;
-        let mut renderer = Self::new(host, loaded, provider, document_uris, doc_index, config);
+        let mut renderer = Self::new_with_image_loader(host, loaded, provider, document_uris, doc_index, config, image_loader);
 
         if let Some(anchor) = initial_anchor {
             renderer.navigate_to_href(glyph_shaper, &format!("#{anchor}"));
@@ -411,7 +428,24 @@ impl RendererCore {
     pub fn set_column_viewport_plan(&mut self, glyph_shaper: &mut impl GlyphShaper, available_width: f64, column_width: f64, column_count: u8, column_gap: f64) {
         if !available_width.is_finite() || available_width <= 0.0 { return; }
         let width = column_width.clamp(200.0, 1200.0).round();
-        self.page.view.layout.size.width = available_width / self.page.view.layout.scale.max(0.1);
+        let layout = &self.page.view.layout;
+        let request = ColumnViewportRequest {
+            available_width: available_width / layout.scale.max(0.1),
+            column_width: width,
+            column_count: column_count.max(1),
+            column_gap: column_gap.max(0.0),
+        };
+        // Viewport preparation derives the actual count and gap. Compare the
+        // host's request separately so an unchanged render cannot repaint
+        // itself forever. Still reapply it if another command changed layout.
+        if self.column_viewport_request == Some(request)
+            && layout.base_col_width == width
+            && layout.col_width == width
+            && layout.max_col_count == Some(request.column_count)
+        {
+            return;
+        }
+        self.page.view.layout.size.width = request.available_width;
         if (width - self.page.view.layout.col_width).abs() >= 0.1
             && let Err(error) = self.relayout_for_column_width(glyph_shaper, width) {
                 self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
@@ -419,9 +453,10 @@ impl RendererCore {
             }
         self.page.view.layout.base_col_width = width;
         self.page.view.layout.col_width = width;
-        self.page.view.layout.col_count = f64::from(column_count.max(1));
-        self.page.view.layout.col_gap = column_gap.max(0.0);
-        self.page.view.layout.max_col_count = Some(column_count.max(1));
+        self.page.view.layout.col_count = f64::from(request.column_count);
+        self.page.view.layout.col_gap = request.column_gap;
+        self.page.view.layout.max_col_count = Some(request.column_count);
+        self.column_viewport_request = Some(request);
         self.host.request_repaint();
     }
 

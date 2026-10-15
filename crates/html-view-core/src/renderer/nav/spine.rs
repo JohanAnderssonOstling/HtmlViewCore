@@ -37,6 +37,7 @@ impl RendererCore {
         ));
         let view = NavView {
             doc: DocQuery::new(&self.page.view.document),
+            source: &self.page.source_index,
             viewport: &self.viewport,
             frame: &self.page.view.frame,
         };
@@ -65,6 +66,7 @@ impl RendererCore {
         self.document_cache.insert_document(
             current_index,
             SpineItem {
+                source_index: self.page.source_index.clone(),
                 session,
                 inputs: self.page.inputs.clone(),
                 images,

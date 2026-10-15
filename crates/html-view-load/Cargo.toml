@@ -8,4 +8,5 @@ repository.workspace = true
 [dependencies]
 html.workspace = true
 html-view-types.workspace = true
+html-view-doc.workspace = true
 web-time = "1"

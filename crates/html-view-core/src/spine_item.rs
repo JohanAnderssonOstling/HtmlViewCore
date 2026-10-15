@@ -20,11 +20,14 @@ use std::sync::Arc;
 use html::engine::Engine;
 use html::pipeline::PipelineInputs;
 use html::resources::{ImagePipeline, ImageService};
+use html_view_doc::SourceIndex;
 
 use crate::document_view::DocumentView;
 use crate::{ColumnLayout, LaidOutDocument, load};
 
 pub(crate) struct SpineItem {
+    /// Source addresses stay with their document through caching and reflow.
+    pub(crate) source_index: Arc<SourceIndex>,
     /// The pipeline that produced the document, kept so it can be asked for
     /// the document again under different inputs.
     pub(crate) session: Engine,
@@ -45,6 +48,7 @@ impl SpineItem {
     ) -> Self {
         let images = Self::image_pipeline_for(&loaded.document, image_service);
         Self {
+            source_index: loaded.source_index,
             session: loaded.session,
             inputs: loaded.inputs,
             images,

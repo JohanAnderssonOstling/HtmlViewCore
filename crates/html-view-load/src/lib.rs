@@ -11,13 +11,14 @@ use html::pipeline::{
     StyleEnvironment, StylesheetRevision,
 };
 use html_view_types::NoteDisplay;
+use html_view_doc::SourceIndex;
 
 
 pub struct LoadedRenderDocument {
+    pub source_index: Arc<SourceIndex>,
     pub session: Engine,
     pub inputs: PipelineInputs,
     pub document: LaidOutDocument,
-    pub source: String,
 }
 
 /// Initial document state prepared without a platform glyph shaper.
@@ -26,9 +27,9 @@ pub struct LoadedRenderDocument {
 /// adapters can construct it on their worker executor and finish shaping on
 /// the thread that owns their text system.
 pub struct PreparedRenderDocument {
+    pub source_index: Arc<SourceIndex>,
     pub session: Engine,
     pub inputs: PipelineInputs,
-    pub source: String,
 }
 
 #[derive(Clone)]
@@ -125,23 +126,42 @@ pub fn prepare_document_with_settings(
     uri: &str,
     settings: DocumentLoadSettings,
 ) -> Result<PreparedRenderDocument, String> {
-    let DocumentLoadSettings {
-        root_font_size,
-        column_width,
-        reader_overrides,
-        image_sizing_policy,
-        text_composition_policy,
-        note_display,
-    } = settings;
-    let source_bytes = provider
-        .read_bytes(uri)
-        .map_err(|error| format!("failed to load HTML resource {uri}: {error}"))?;
+    let inputs = document_inputs(provider.as_ref(), uri, settings, None)?;
+    let mut session = Engine::new(provider);
+    session.prepare_through_style(inputs.clone()).map_err(|error| error.to_string())?;
+    let source_index = Arc::new(SourceIndex::new(&inputs.source, inputs.markup_syntax));
+    Ok(PreparedRenderDocument { session, inputs, source_index })
+}
+
+pub fn finish_prepared_document(
+    mut prepared: PreparedRenderDocument,
+    glyph_shaper: &mut impl GlyphShaper,
+) -> Result<LoadedRenderDocument, String> {
+    let document = prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
+    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs, document, source_index: prepared.source_index })
+}
+
+/// Decode the source and build the same inputs for worker preparation and
+/// synchronous loading. The inputs own the HTML; no separate copy is retained.
+fn document_inputs(
+    provider: &dyn ResourceProvider,
+    uri: &str,
+    settings: DocumentLoadSettings,
+    mut timings: Option<&mut PipelineTimings>,
+) -> Result<PipelineInputs, String> {
+    let load_started = Instant::now();
+    let source_bytes = provider.read_bytes(uri).map_err(|error| format!("failed to load HTML resource {uri}: {error}"))?;
     let transport_encoding = provider.metadata(uri).ok().and_then(|metadata| metadata.charset);
     let source = html::pipeline::decode_html_bytes(&source_bytes, transport_encoding.as_deref());
-    let layout_constraints = PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.load_html += load_started.elapsed();
+    }
+
+    let start = Instant::now();
+    let DocumentLoadSettings { root_font_size, column_width, reader_overrides, image_sizing_policy, text_composition_policy, note_display } = settings;
     let inputs = PipelineInputs {
-        source: source.clone(),
-        markup_syntax: markup_syntax_for_resource(provider.as_ref(), uri),
+        source: source.into(),
+        markup_syntax: markup_syntax_for_resource(provider, uri),
         user_styles: Vec::new(),
         reader_overrides,
         note_flow: note_flow_for(note_display),
@@ -152,21 +172,14 @@ pub fn prepare_document_with_settings(
         style_environment: StyleEnvironment { root_font_size: root_font_size.max(1.0).round() as u32, media: html::pipeline::MediaEnvironment::screen(column_width, None).ok_or_else(|| "column width must be finite and positive".to_owned())?, direction: 0 },
         font_environment: FontEnvironmentRevision::INITIAL,
         image_metrics_revision: ImageMetricsRevision::INITIAL,
-        layout: layout_constraints,
+        layout: PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy },
         image_metrics: Default::default(),
         paint: PaintSettingsRevision::INITIAL,
     };
-    let mut session = Engine::new(provider);
-    session.prepare_through_style(inputs.clone()).map_err(|error| error.to_string())?;
-    Ok(PreparedRenderDocument { session, inputs, source })
-}
-
-pub fn finish_prepared_document(
-    mut prepared: PreparedRenderDocument,
-    glyph_shaper: &mut impl GlyphShaper,
-) -> Result<LoadedRenderDocument, String> {
-    let document = prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
-    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs, document, source: prepared.source })
+    if let Some(timings) = timings {
+        timings.layout_total += start.elapsed();
+    }
+    Ok(inputs)
 }
 
 fn load_document_with_dom_pipeline_impl(
@@ -176,50 +189,16 @@ fn load_document_with_dom_pipeline_impl(
     glyph_shaper: &mut impl GlyphShaper,
     mut timings: Option<&mut PipelineTimings>,
 ) -> LoadedRenderDocument {
-    let DocumentLoadSettings {
-        root_font_size,
-        column_width,
-        reader_overrides,
-        image_sizing_policy,
-        text_composition_policy,
-        note_display,
-    } = settings;
-    let load_started = Instant::now();
-    let source_bytes = provider.read_bytes(uri).expect("Failed to load HTML");
-    let transport_encoding = provider.metadata(uri).ok().and_then(|metadata| metadata.charset);
-    let html = html::pipeline::decode_html_bytes(&source_bytes, transport_encoding.as_deref());
-    if let Some(timings) = timings.as_deref_mut() {
-        timings.load_html += load_started.elapsed();
-    }
-
+    let inputs = document_inputs(provider.as_ref(), uri, settings, timings.as_deref_mut()).expect("Failed to prepare HTML inputs");
     let start = Instant::now();
-    let mut session = Engine::new(provider.clone());
-    let layout_constraints = PipelineLayoutConstraints { viewport_width: column_width, viewport_height: None, line_height: root_font_size as f64, image_sizing_policy, text_composition_policy };
-    let inputs = PipelineInputs {
-        source: html.clone(),
-        markup_syntax: markup_syntax_for_resource(provider.as_ref(), uri),
-        user_styles: Vec::new(),
-        reader_overrides,
-        note_flow: note_flow_for(note_display),
-        source_revision: SourceRevision::INITIAL,
-        base_uri: uri.to_string(),
-        resource_revision: ResourceRevision::INITIAL,
-        stylesheet_revision: StylesheetRevision::INITIAL,
-        style_environment: StyleEnvironment { root_font_size: root_font_size.max(1.0).round() as u32, media: html::pipeline::MediaEnvironment::screen(column_width, None).expect("column width must be finite and positive"), direction: 0 },
-        font_environment: FontEnvironmentRevision::INITIAL,
-        image_metrics_revision: ImageMetricsRevision::INITIAL,
-        layout: layout_constraints,
-        image_metrics: Default::default(),
-        paint: PaintSettingsRevision::INITIAL,
-    };
-
+    let mut session = Engine::new(provider);
     session.update(inputs.clone(), glyph_shaper).expect("initial pipeline update should succeed");
     let document = session.document().expect("pipeline session should own a laid-out document").clone();
     if let Some(timings) = timings {
         timings.layout_total += start.elapsed();
     }
-
-    LoadedRenderDocument { session, inputs, document, source: html }
+    let source_index = Arc::new(SourceIndex::new(&inputs.source, inputs.markup_syntax));
+    LoadedRenderDocument { session, inputs, document, source_index }
 }
 
 pub fn load_document(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> LoadedRenderDocument {

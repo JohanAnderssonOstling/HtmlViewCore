@@ -8,12 +8,12 @@
 
 use std::collections::HashSet;
 
-use html_view_doc::DocQuery;
+use html_view_doc::{DocQuery, SourceIndex};
 
 mod navigate;
 #[cfg(test)]
 mod test_support;
-use html_view_types::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
+use html_view_types::{ReadingPosition, RendererEvent, RendererHost, ViewportState, VisibleFrame};
 
 /// Everything within-document navigation reads.
 ///
@@ -22,6 +22,7 @@ use html_view_types::{RendererEvent, RendererHost, ViewportState, VisibleFrame};
 #[derive(Clone, Copy)]
 pub struct NavView<'a> {
     pub doc: DocQuery<'a>,
+    pub source: &'a SourceIndex,
     pub viewport: &'a ViewportState,
     pub frame: &'a VisibleFrame,
 }
@@ -29,6 +30,7 @@ pub struct NavView<'a> {
 /// [`NavView`] plus the ability to move the viewport and notify the host.
 pub struct NavContext<'a> {
     pub doc: DocQuery<'a>,
+    pub source: &'a SourceIndex,
     pub viewport: &'a mut ViewportState,
     pub frame: &'a VisibleFrame,
     pub host: &'a dyn RendererHost,
@@ -36,7 +38,7 @@ pub struct NavContext<'a> {
 
 impl<'a> NavContext<'a> {
     pub fn view(&self) -> NavView<'_> {
-        NavView { doc: self.doc, viewport: self.viewport, frame: self.frame }
+        NavView { doc: self.doc, source: self.source, viewport: self.viewport, frame: self.frame }
     }
 }
 
@@ -75,9 +77,10 @@ impl<T: Clone + PartialEq> Debounced<T> {
     }
 }
 
-/// The four signals emitted together whenever the reading position moves.
+/// The settled reading snapshot and compatibility navigation signals.
 #[derive(Default)]
 pub struct NavSignals {
+    pub reading_position: Debounced<ReadingPosition>,
     pub position: Debounced<(usize, Option<u32>)>,
     pub cfi: Debounced<Option<String>>,
     pub progress: Debounced<(f32, u64, u64, usize)>,

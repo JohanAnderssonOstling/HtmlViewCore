@@ -10,7 +10,8 @@
 
 use crate::{SpineAnchor, Location, NavContext, NavView};
 use crate::NavigationState;
-use html_view_types::{DocAnchor, RendererEvent};
+use html_view_cfi::{parse_cfi, parse_source_position, source_position_cfi};
+use html_view_types::{DocAnchor, ReadingPosition, RendererEvent, SourcePosition};
 
 /// Characters per reported reading location. Fixed-size spans keep location
 /// numbers stable as font size and column width change.
@@ -63,8 +64,33 @@ impl NavigationState {
     }
 
     pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
-        let glyph_idx = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx))?;
-        html_view_cfi::generate_cfi(cx.doc.document(), self.current_doc_index, glyph_idx)
+        Some(source_position_cfi(&self.current_source_position(cx)))
+    }
+
+    pub fn current_source_position(&self, cx: NavView<'_>) -> SourcePosition {
+        let line = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx));
+        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx));
+        // An image-only line can share a glyph boundary with following text.
+        // Do not borrow that text's source address for the image's page.
+        let glyph = glyph.filter(|_| cx.doc.text().line(line).is_some_and(|line| line.start() < line.end()));
+        cx.doc.source_position_on_line(self.current_doc_index, line, glyph, cx.source)
+    }
+
+    /// Publish only after the viewport's page has settled. All host projections
+    /// consume this value together, independently of legacy navigation signals.
+    pub fn emit_reading_position(&mut self, cx: &mut NavContext<'_>) {
+        let view = cx.view();
+        let source = self.current_source_position(view);
+        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(view));
+        let document_fraction = if let Some(glyph) = glyph.filter(|_| view.doc.text().glyph_count() > 0) {
+            glyph as f64 / view.doc.text().glyph_count().max(1) as f64
+        } else {
+            view.viewport.composition().start_offset_y() / view.doc.text().lines().last().map(|line| line.point().y + line.height()).unwrap_or(1.0).max(1.0)
+        }
+        .clamp(0.0, 1.0);
+        let (fraction, location, total_locations) = self.progress_at(document_fraction);
+        let position = ReadingPosition { source, fraction, document_fraction: document_fraction as f32, location, total_locations, document_count: self.document_uris.len() };
+        self.signals.reading_position.emit_if_changed(position, cx.host, RendererEvent::ReadingPositionChanged);
     }
 
     pub fn current_location(&self, cx: NavView<'_>) -> Location {
@@ -119,7 +145,15 @@ impl NavigationState {
     }
 
     pub fn restore_position_from_cfi(&mut self, cx: &mut NavContext<'_>, cfi: &str) -> bool {
-        let Some((doc_idx, glyph_idx)) = html_view_cfi::parse_cfi(cx.doc.document(), cfi) else {
+        if let Some(position) = parse_source_position(cfi)
+            && position.document == self.current_doc_index
+            && let Some(y) = cx.doc.source_element_y(&position, cx.source)
+        {
+            self.restore_forward_offset(cx, y);
+            self.anchor_at(None);
+            return true;
+        }
+        let Some((doc_idx, glyph_idx)) = parse_cfi(cx.doc.document(), cfi) else {
             return false;
         };
         if doc_idx != self.current_doc_index {
