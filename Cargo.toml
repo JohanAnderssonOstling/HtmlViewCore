@@ -15,7 +15,7 @@ html-view-paginate = { path = "crates/html-view-paginate" }
 html-view-paint = { path = "crates/html-view-paint" }
 html-view-select = { path = "crates/html-view-select" }
 html-view-types = { path = "crates/html-view-types" }
-html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine", rev = "afbf82d3b2e2a6ec598876c5428ff6aec5b6a55c" }
+html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine", rev = "912a84ce98bb38df163c0508a57a4f06cb40ee5a" }
 kurbo = "0.11.3"
 peniko = "0.2.0"
 unicode-normalization = "0.1"
