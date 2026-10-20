@@ -282,6 +282,12 @@ impl RendererCore {
             let next_idx = end_idx + 1;
             if let Some(line) = self.page.view.document.render_view().text().line(next_idx) {
                 next_start_offset_y = line.point().y;
+            } else {
+                // Backward composition leaves a continuation even on the
+                // chapter's last page. With no next line, leave the chapter
+                // rather than composing the same page again.
+                self.continue_past_page(glyph_shaper);
+                return;
             }
         } else if continuation.next_start_offset_y() > composition.start_offset_y() {
             next_start_offset_y = continuation.next_start_offset_y();

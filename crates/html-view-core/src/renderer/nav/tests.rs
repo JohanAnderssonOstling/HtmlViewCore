@@ -4763,6 +4763,41 @@ fn spine_core(
 }
 
 #[test]
+fn page_turn_leaves_a_chapter_after_returning_to_its_last_page() {
+    let viewport = Size::new(200.0, 40.0);
+    let first =
+        "<html><body style='margin:0;line-height:20px'>A<br>B<br>C<br>D<br>E<br>F</body></html>";
+    let second = "<html><body style='margin:0'>Next chapter</body></html>";
+    let (mut core, mut shaper) = spine_core(
+        vec![("one.html", first), ("two.html", second)],
+        viewport,
+        200.0,
+        1,
+    );
+    core.next_document(&mut shaper);
+    core.prepare_frame(&mut shaper, viewport);
+    core.prev_page(&mut shaper);
+    core.prepare_frame(&mut shaper, viewport);
+    assert_eq!(core.nav.location().document(), 0);
+    assert!(core.viewport.composition().start_offset_y() > 0.0);
+    assert_eq!(
+        core.page.view.frame.page().end_line(),
+        Some(core.page.view.document.render_view().text().line_count() - 1),
+        "backward navigation must land on the chapter's last line"
+    );
+
+    core.next_page(&mut shaper);
+    core.prepare_frame(&mut shaper, viewport);
+
+    assert_eq!(
+        core.nav.location().document(),
+        1,
+        "Right must reopen the next chapter without an extra blank page"
+    );
+    assert_eq!(core.viewport.composition().start_offset_y(), 0.0);
+}
+
+#[test]
 fn a_page_turn_opens_the_next_document() {
     let one = "<html><body style='margin:0'><p>First document</p></body></html>";
     let (provider, _) = CountingProvider::new(vec![("one.html", one), ("two.html", one)]);
