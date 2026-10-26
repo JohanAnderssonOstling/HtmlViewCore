@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/html-view-cfi", "crates/html-view-core", "crates/html-view-doc", "crates/html-view-harness", "crates/html-view-load", "crates/html-view-navigate", "crates/html-view-paginate", "crates/html-view-paint", "crates/html-view-select", "crates/html-view-types"]
 
 [workspace.package]
+license = "GPL-3.0-or-later"
 repository = "https://github.com/JohanAnderssonOstling/HtmlViewCore"
 
 [workspace.dependencies]
