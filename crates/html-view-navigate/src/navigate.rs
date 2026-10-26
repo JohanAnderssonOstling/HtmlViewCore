@@ -25,7 +25,7 @@ impl NavigationState {
     // -- position queries ---------------------------------------------------
 
     pub fn find_start_line(&self, cx: NavView<'_>) -> usize {
-        cx.doc.start_line_at(cx.viewport.composition().start_offset_y(), 0.1)
+        cx.doc.view().geometry().start_line_at(cx.viewport.composition().start_offset_y(), 0.1)
     }
 
     /// The glyph at the top of the page on screen, or at the scroll offset when
@@ -64,23 +64,28 @@ impl NavigationState {
     }
 
     pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
-        Some(source_position_cfi(&self.current_source_position(cx)))
+        Some(source_position_cfi(&self.current_source_position(cx)?))
     }
 
-    pub fn current_source_position(&self, cx: NavView<'_>) -> SourcePosition {
+    pub fn current_source_position(&self, cx: NavView<'_>) -> Option<SourcePosition> {
+        // A document with no layout lines still has an intentional start
+        // address. Missing addresses on actual lines remain unavailable.
+        if cx.doc.text().line_count() == 0 && cx.viewport.composition().start_offset_y() <= 0.1 {
+            return Some(SourcePosition { document: self.current_doc_index, path: Vec::new(), utf16_offset: None });
+        }
         let line = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx));
         let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx));
         // An image-only line can share a glyph boundary with following text.
         // Do not borrow that text's source address for the image's page.
         let glyph = glyph.filter(|_| cx.doc.text().line(line).is_some_and(|line| line.start() < line.end()));
-        cx.doc.source_position_on_line(self.current_doc_index, line, glyph, cx.source)
+        cx.doc.source_position_on_line(self.current_doc_index, line, glyph)
     }
 
     /// Publish only after the viewport's page has settled. All host projections
     /// consume this value together, independently of legacy navigation signals.
     pub fn emit_reading_position(&mut self, cx: &mut NavContext<'_>) {
         let view = cx.view();
-        let source = self.current_source_position(view);
+        let Some(source) = self.current_source_position(view) else { return };
         let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(view));
         let document_fraction = if let Some(glyph) = glyph.filter(|_| view.doc.text().glyph_count() > 0) {
             glyph as f64 / view.doc.text().glyph_count().max(1) as f64
@@ -115,7 +120,7 @@ impl NavigationState {
     }
 
     pub fn restore_glyph_position(&mut self, cx: &mut NavContext<'_>, glyph_idx: u32) {
-        let Some(line_idx) = cx.doc.find_line_for_glyph(glyph_idx) else {
+        let Some(line_idx) = cx.doc.text().line_index_for_glyph(glyph_idx) else {
             return;
         };
         let Some(line) = cx.doc.text().line(line_idx) else {
@@ -132,7 +137,7 @@ impl NavigationState {
         if cx.doc.text().lines().is_empty() {
             return false;
         }
-        let line_idx = cx.doc.start_line_at(target_y, 0.1);
+        let line_idx = cx.doc.view().geometry().start_line_at(target_y, 0.1);
         let Some(line) = cx.doc.text().line(line_idx) else {
             return false;
         };
@@ -147,7 +152,7 @@ impl NavigationState {
     pub fn restore_position_from_cfi(&mut self, cx: &mut NavContext<'_>, cfi: &str) -> bool {
         if let Some(position) = parse_source_position(cfi)
             && position.document == self.current_doc_index
-            && let Some(y) = cx.doc.source_element_y(&position, cx.source)
+            && let Some(y) = cx.doc.source_element_y(&position)
         {
             self.restore_forward_offset(cx, y);
             self.anchor_at(None);
@@ -193,7 +198,7 @@ impl NavigationState {
             return false;
         };
         let search_y = current_line.point().y + current_line.height() + 0.1;
-        let target_idx = cx.doc.start_line_at(search_y, 0.0);
+        let target_idx = cx.doc.view().geometry().start_line_at(search_y, 0.0);
         if target_idx >= lines.len() {
             return false;
         }
@@ -220,7 +225,7 @@ impl NavigationState {
             return false;
         }
         let search_y = current_line.point().y.max(0.0);
-        let Some(target_idx) = cx.doc.end_line_at(search_y, 0.1) else {
+        let Some(target_idx) = cx.doc.view().geometry().end_line_at(search_y, 0.1) else {
             return false;
         };
         if let Some(target_line) = lines.get(target_idx) {

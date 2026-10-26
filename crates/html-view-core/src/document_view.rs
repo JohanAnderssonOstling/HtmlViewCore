@@ -14,19 +14,22 @@
 use html_view_doc::{DocQuery, TextGeometry};
 use html_view_select::{SelectionMode, SelectionState, SelectionView, TableSelectionState};
 use kurbo::Point;
+use std::ops::Deref;
 
 use crate::{ColumnLayout, LaidOutDocument, VisibleFrame};
 
-pub(crate) struct DocumentView {
-    pub(crate) document: LaidOutDocument,
+/// Display state is independent of whether a session owns the document or a
+/// standalone note owns it directly. Queries borrow through that owner.
+pub(crate) struct DocumentView<D = Box<LaidOutDocument>> {
+    pub(crate) document: D,
     pub(crate) layout: ColumnLayout,
     pub(crate) frame: VisibleFrame,
     pub(crate) selection: SelectionState,
     pub(crate) table_selection: TableSelectionState,
 }
 
-impl DocumentView {
-    pub(crate) fn new(document: LaidOutDocument, layout: ColumnLayout) -> Self {
+impl<D: Deref<Target = LaidOutDocument>> DocumentView<D> {
+    pub(crate) fn new(document: D, layout: ColumnLayout) -> Self {
         Self {
             document,
             layout,
@@ -119,7 +122,7 @@ impl DocumentView {
             self.selection.clear_text();
             return;
         };
-        let (plain, ordinary) = self.doc().build_selection_text(start, end);
+        let (plain, ordinary) = self.doc().view().export().selection_text(start..end);
         let markdown = if self.selection.interaction().is_semantic() {
             self.selection_view()
                 .build_semantic_selection_text(start, end)

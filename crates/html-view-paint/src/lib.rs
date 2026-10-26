@@ -12,7 +12,7 @@ use html::layout::ReadingTarget;
 use html::render::Painter;
 use std::ops::Range;
 use html::resources::ImagePipeline;
-use html_view_doc::{DocQuery, TextGeometry, scaled_image_size};
+use html_view_doc::{DocQuery, TextGeometry};
 use html_view_select::SelectionView;
 use html_view_types::{
     AnnotationStyle, BookSearchMatch, BookSearchTarget, InteractionPalette, ReaderPaintPalette,
@@ -25,13 +25,13 @@ use peniko::Color;
 #[derive(Default)]
 pub struct AnnotationOverlayState {
     source: Vec<RendererAnnotation>,
-    visible: Vec<(String, u32, u32, AnnotationStyle, [u8; 4])>,
+    visible: Vec<(String, Range<u32>, AnnotationStyle, [u8; 4])>,
 }
 
 #[derive(Default)]
 pub struct MediaOverlayHighlightState {
     target_href: Option<String>,
-    visible: Option<(u32, u32)>,
+    visible: Option<Range<u32>>,
     reading_target: Option<ReadingTarget>,
     reading_ranges: Vec<Range<u32>>,
 }
@@ -39,7 +39,7 @@ pub struct MediaOverlayHighlightState {
 #[derive(Default)]
 pub struct HighlightState {
     query: String,
-    matches: Vec<(u32, u32)>,
+    matches: Vec<Range<u32>>,
     book_matches: Vec<BookSearchMatch>,
     current_match: usize,
     current_local_match: usize,
@@ -66,7 +66,7 @@ impl HighlightState {
         self.search_active
     }
 
-    pub fn matches(&self) -> &[(u32, u32)] {
+    pub fn matches(&self) -> &[Range<u32>] {
         &self.matches
     }
 
@@ -74,7 +74,7 @@ impl HighlightState {
         self.current_match
     }
 
-    pub fn install_visible_matches(&mut self, matches: Vec<(u32, u32)>) {
+    pub fn install_visible_matches(&mut self, matches: Vec<Range<u32>>) {
         self.matches = matches;
     }
 
@@ -82,7 +82,7 @@ impl HighlightState {
         query: String,
         state: SearchProjectionState,
         options: SearchOptions,
-        matches: Vec<(u32, u32)>,
+        matches: Vec<Range<u32>>,
         current_local_match: usize,
     ) -> Self {
         Self {
@@ -98,7 +98,7 @@ impl HighlightState {
     pub fn projected_active(
         query: String,
         options: SearchOptions,
-        matches: Vec<(u32, u32)>,
+        matches: Vec<Range<u32>>,
         current_local_match: usize,
     ) -> Self {
         Self::projected_with_state(
@@ -113,7 +113,7 @@ impl HighlightState {
     pub fn projected_inactive(
         query: String,
         options: SearchOptions,
-        matches: Vec<(u32, u32)>,
+        matches: Vec<Range<u32>>,
         current_local_match: usize,
     ) -> Self {
         Self::projected_with_state(
@@ -157,7 +157,7 @@ impl HighlightState {
 
     /// Records whole-document matches and mirrors them as book matches, which
     /// is how a current-document search reports results.
-    pub fn set_local_matches(&mut self, doc: usize, matches: Vec<(u32, u32)>) {
+    pub fn set_local_matches(&mut self, doc: usize, matches: Vec<Range<u32>>) {
         self.book_matches = matches
             .iter()
             .enumerate()
@@ -239,7 +239,7 @@ impl HighlightState {
     pub fn current_local_match_start(&self) -> Option<u32> {
         self.matches
             .get(self.current_local_match)
-            .map(|&(start, _)| start)
+            .map(|range| range.start)
     }
 
     pub fn emit_match_signal(&self, host: &dyn RendererHost) {
@@ -287,14 +287,13 @@ impl AnnotationOverlayState {
         for annotation in &self.source {
             let by_cfi = html_view_cfi::parse_cfi_range(doc.document(), &annotation.cfi_range)
                 .filter(|(document, _, _)| *document == current_doc)
-                .map(|(_, start, end)| (start, end));
-            if let Some((start, end)) =
+                .map(|(_, start, end)| start..end);
+            if let Some(range) =
                 by_cfi.or_else(|| doc.recover_annotation_range(annotation, current_doc))
             {
                 self.visible.push((
                     annotation.id.clone(),
-                    start,
-                    end,
+                    range,
                     annotation.style,
                     annotation.color,
                 ));
@@ -304,11 +303,11 @@ impl AnnotationOverlayState {
 
     /// The glyph range an annotation occupies in the document on screen, if it
     /// is one of the annotations resolved onto this page.
-    pub fn glyph_range(&self, id: &str) -> Option<(u32, u32)> {
+    pub fn glyph_range(&self, id: &str) -> Option<Range<u32>> {
         self.visible
             .iter()
             .find(|(annotation_id, ..)| annotation_id == id)
-            .map(|(_, start, end, _, _)| (*start, *end))
+            .map(|(_, range, _, _)| range.clone())
     }
 
     /// Reports the topmost annotation covering `glyph`. Later annotations win,
@@ -318,7 +317,7 @@ impl AnnotationOverlayState {
             .visible
             .iter()
             .rev()
-            .find(|(_, start, end, _, _)| glyph >= *start && glyph < *end)
+            .find(|(_, range, _, _)| range.contains(&glyph))
         else {
             return false;
         };
@@ -332,7 +331,7 @@ impl MediaOverlayHighlightState {
         self.target_href.as_deref()
     }
 
-    pub fn set_visible(&mut self, range: Option<(u32, u32)>) {
+    pub fn set_visible(&mut self, range: Option<Range<u32>>) {
         self.visible = range;
     }
 
@@ -352,11 +351,11 @@ impl MediaOverlayHighlightState {
 
     pub fn set_reading_ranges(&mut self, ranges: Vec<Range<u32>>) { self.reading_ranges = ranges; }
 
-    pub fn visible(&self) -> Option<(u32, u32)> {
-        self.visible
+    pub fn visible(&self) -> Option<Range<u32>> {
+        self.visible.clone()
     }
 
-    pub fn resolved(target_href: Option<String>, visible: Option<(u32, u32)>) -> Self {
+    pub fn resolved(target_href: Option<String>, visible: Option<Range<u32>>) -> Self {
         Self {
             target_href,
             visible,
@@ -725,7 +724,7 @@ impl<'a> PagePainter<'a> {
         &self,
         cx: &mut impl Painter,
         line_idx: usize,
-        line: &html::layout::RenderLine,
+        _line: &html::layout::RenderLine,
         screen_point: Point,
     ) {
         // draw selection highlight for a line
@@ -735,23 +734,8 @@ impl<'a> PagePainter<'a> {
         let semantic_cells = self
             .selection
             .semantic_cell_glyph_ranges(sel_start, sel_end);
-        let mut selected_ranges = self
-            .geo
-            .doc
-            .line_text_intersections(line_idx, sel_start, sel_end)
-            .map(|(start, end)| start..end)
-            .collect::<Vec<_>>();
-        for promoted in self
-            .selection
-            .semantic_promoted_glyph_ranges(sel_start, sel_end)
-        {
-            selected_ranges.extend(
-                self.geo
-                    .doc
-                    .line_text_intersections(line_idx, promoted.start, promoted.end)
-                    .map(|(start, end)| start..end),
-            );
-        }
+        let mut selected_ranges = vec![sel_start..sel_end];
+        selected_ranges.extend(self.selection.semantic_promoted_glyph_ranges(sel_start, sel_end));
         selected_ranges.sort_by_key(|range| range.start);
         let mut merged: Vec<Range<u32>> = Vec::new();
         for range in selected_ranges {
@@ -782,13 +766,9 @@ impl<'a> PagePainter<'a> {
                 fragments = next;
             }
             for fragment in fragments {
-                let (range_x0, range_x1) =
-                    self.geo
-                        .glyph_x_span_in_line(line, fragment.start, fragment.end);
-                let x0 = screen_point.x + range_x0;
-                let x1 = screen_point.x + range_x1;
-                let (x0, x1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
-                self.fill_selection_rect(cx, x0, x1, screen_point.y, line.height());
+                for rect in self.geo.line_selection_rects(line_idx, fragment, screen_point) {
+                    self.fill_selection_rect(cx, rect.x0, rect.x1, rect.y0, rect.height());
+                }
             }
         }
     }
@@ -876,7 +856,7 @@ impl<'a> PagePainter<'a> {
                 if let Some(line_idx) = decoration.line_idx().or_else(|| {
                     self.geo
                         .doc
-                        .find_line_index_for_decoration(rect.y0, rect.y1)
+                        .view().geometry().line_intersecting_vertical_range(rect.y0, rect.y1)
                 }) {
                     if let Some(screen) =
                         line_positions.and_then(|positions| positions.get(line_idx))
@@ -1290,13 +1270,13 @@ impl<'a> PagePainter<'a> {
         point: Point,
         placeholder: Color,
     ) {
-        let (width, height) = scaled_image_size(frag);
+        let size = frag.size();
         let offset = frag.offset();
         let rect = Rect::new(
             point.x + offset.x,
             point.y + offset.y,
-            point.x + offset.x + width,
-            point.y + offset.y + height,
+            point.x + offset.x + size.width,
+            point.y + offset.y + size.height,
         );
         if let Some(decoded) = self.images.get_decoded(frag.image_idx()) {
             match decoded {
@@ -1309,7 +1289,7 @@ impl<'a> PagePainter<'a> {
                     width,
                     height,
                 } => {
-                    if self.geo.doc.view().image_mathml(frag.image_idx()).is_some() {
+                    if self.geo.doc.view().export().is_equation(frag.image_idx()) {
                         cx.draw_math_svg(bytes, hash, (*width, *height), rect, frag.text_color());
                     } else {
                         cx.draw_svg(bytes, hash, (*width, *height), rect);
@@ -1337,9 +1317,10 @@ impl<'a> PagePainter<'a> {
         let first = self
             .highlight
             .matches
-            .partition_point(|&(_, end)| end <= line.start());
+            .partition_point(|range| range.end <= line.start());
 
-        for (i, &(match_start, match_end)) in self.highlight.matches[first..].iter().enumerate() {
+        for (i, range) in self.highlight.matches[first..].iter().enumerate() {
+            let (match_start, match_end) = (range.start, range.end);
             if match_start >= line.end() {
                 break;
             }
@@ -1350,20 +1331,8 @@ impl<'a> PagePainter<'a> {
                 self.interaction_palette.search_match
             };
 
-            for (start, end) in
-                self.geo
-                    .doc
-                    .line_text_intersections(line.index(), match_start, match_end)
-            {
-                let (range_x0, range_x1) = self.geo.glyph_x_span_in_line(line, start, end);
-                let x0 = screen_point.x + range_x0;
-                let x1 = screen_point.x + range_x1;
-                let (x0, x1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
-
-                if x1 > x0 {
-                    let rect = Rect::new(x0, screen_point.y, x1, screen_point.y + line.height());
-                    cx.fill_rect(rect, color);
-                }
+            for rect in self.geo.line_selection_rects(line.index(), match_start..match_end, screen_point) {
+                if rect.width() > 0.0 { cx.fill_rect(rect, color); }
             }
         }
     }
@@ -1372,43 +1341,36 @@ impl<'a> PagePainter<'a> {
         &self,
         painter: &mut impl Painter,
         line_idx: usize,
-        line: &html::layout::RenderLine,
+        _line: &html::layout::RenderLine,
         screen: Point,
     ) {
-        for (_, range_start, range_end, style, rgba) in &self.annotations.visible {
-            for (start, end) in
-                self.geo
-                    .doc
-                    .line_text_intersections(line_idx, *range_start, *range_end)
-            {
-                let (x0, x1) = self.geo.glyph_x_span_in_line(line, start, end);
-                let (x0, x1) = (screen.x + x0, screen.x + x1);
-                if x1 <= x0 {
-                    continue;
-                }
+        for (_, range, style, rgba) in &self.annotations.visible {
+            for bounds in self.geo.line_selection_rects(line_idx, range.clone(), screen) {
+                let (x0, x1) = (bounds.x0, bounds.x1);
+                if x1 <= x0 { continue; }
                 let color = Color::rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
                 let thickness = 2.0;
                 let rect = match style {
                     AnnotationStyle::Highlight => {
-                        Rect::new(x0, screen.y, x1, screen.y + line.height())
+                        bounds
                     }
                     AnnotationStyle::Squiggly => {
-                        for rect in squiggly_rects(x0, x1, screen.y + line.height()) {
+                        for rect in squiggly_rects(x0, x1, bounds.y1) {
                             painter.fill_rect(rect, color);
                         }
                         continue;
                     }
                     AnnotationStyle::Underline => Rect::new(
                         x0,
-                        screen.y + line.height() - thickness,
+                        bounds.y1 - thickness,
                         x1,
-                        screen.y + line.height(),
+                        bounds.y1,
                     ),
                     AnnotationStyle::Strikethrough => Rect::new(
                         x0,
-                        screen.y + line.height() / 2.0,
+                        (bounds.y0 + bounds.y1) / 2.0,
                         x1,
-                        screen.y + line.height() / 2.0 + thickness,
+                        (bounds.y0 + bounds.y1) / 2.0 + thickness,
                     ),
                 };
                 painter.fill_rect(rect, color);
@@ -1417,16 +1379,11 @@ impl<'a> PagePainter<'a> {
     }
 
     pub fn paint_media_overlay_for_line(&self, painter: &mut impl Painter, line: &html::layout::RenderLine, screen: Point) {
-        let visible_range = self.media_overlay.visible.map(|(start, end)| start..end);
+        let visible_range = self.media_overlay.visible.clone();
         let ranges = if self.media_overlay.reading_target.is_some() { self.media_overlay.reading_ranges.as_slice() } else { visible_range.as_slice() };
         for range in ranges {
-            let (range_start, range_end) = (range.start, range.end);
-            for (start, end) in self.geo.doc.line_text_intersections(line.index(), range_start, range_end) {
-                let (x0, x1) = self.geo.glyph_x_span_in_line(line, start, end);
-                let (x0, x1) = (screen.x + x0, screen.x + x1);
-                if x1 > x0 {
-                    painter.fill_rect(Rect::new(x0, screen.y, x1, screen.y + line.height()), self.interaction_palette.reading);
-                }
+            for rect in self.geo.line_selection_rects(line.index(), range.clone(), screen) {
+                if rect.width() > 0.0 { painter.fill_rect(rect, self.interaction_palette.reading); }
             }
         }
     }

@@ -1,92 +1,9 @@
 use crate::BoundaryAnchors;
 use html_view_doc::DocQuery;
 
-const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
+use html::layout::ContentRole;
+
 const EPSILON: f64 = 0.01;
-
-fn has_token(value: Option<&str>, expected: &str) -> bool {
-    value.is_some_and(|value| {
-        value.split_ascii_whitespace().any(|token| {
-            token.eq_ignore_ascii_case(expected)
-                || token
-                    .rsplit_once(':')
-                    .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(expected))
-        })
-    })
-}
-
-fn has_epub_type(boxes: html::layout::RenderBoxView<'_>, box_idx: usize, expected: &str) -> bool {
-    has_token(
-        boxes
-            .attribute(box_idx, "epub:type")
-            .or_else(|| boxes.attribute_expanded(box_idx, Some(EPUB_NAMESPACE), "type")),
-        expected,
-    )
-}
-
-fn has_any_epub_type(
-    boxes: html::layout::RenderBoxView<'_>,
-    box_idx: usize,
-    expected: &[&str],
-) -> bool {
-    expected
-        .iter()
-        .any(|kind| has_epub_type(boxes, box_idx, kind))
-}
-
-fn has_any_role(boxes: html::layout::RenderBoxView<'_>, box_idx: usize, expected: &[&str]) -> bool {
-    expected
-        .iter()
-        .any(|role| has_token(boxes.attribute(box_idx, "role"), role))
-}
-
-fn is_compact_semantic_structure(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    has_any_epub_type(
-        boxes,
-        box_idx,
-        &[
-            "epigraph",
-            "poem",
-            "verse",
-            "stanza",
-            "biblioentry",
-            "dedication",
-            "abstract",
-            "notice",
-            "pullquote",
-            "theorem",
-            "proof",
-            "example",
-            "exercise",
-        ],
-    ) || has_any_role(
-        boxes,
-        box_idx,
-        &[
-            "doc-epigraph",
-            "doc-biblioentry",
-            "doc-dedication",
-            "doc-abstract",
-            "doc-notice",
-            "doc-pullquote",
-            "doc-example",
-        ],
-    )
-}
-
-fn is_semantic_statement(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    has_any_epub_type(boxes, box_idx, &["theorem", "proof", "example", "exercise"])
-        || has_any_role(boxes, box_idx, &["doc-example"])
-}
-
-fn is_semantic_label(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    has_epub_type(boxes, box_idx, "label")
-        || boxes.tag(box_idx).is_some_and(|tag| {
-            ["h1", "h2", "h3", "h4", "h5", "h6"]
-                .iter()
-                .any(|heading| tag.eq_ignore_ascii_case(heading))
-        })
-}
 
 /// Returns soft keep ranges for compact book structures. These are
 /// pagination preferences, not layout constraints: the normal keep event
@@ -139,27 +56,22 @@ pub(crate) fn semantic_keep_ranges(
         if range_lines.is_empty() {
             continue;
         }
-        let tag = boxes.tag(box_idx);
-        let compact_line_limit = if tag.is_some_and(|tag| tag.eq_ignore_ascii_case("li")) {
+        let semantics = root.semantics().content(box_idx);
+        let compact_line_limit = if semantics.has_role(ContentRole::ListItem) {
             Some(4)
-        } else if tag.is_some_and(|tag| {
-            tag.eq_ignore_ascii_case("pre")
-                || (tag.eq_ignore_ascii_case("code") && boxes.is_block_container(box_idx))
-        }) {
+        } else if semantics.has_role(ContentRole::CodeBlock) {
             Some(12)
-        } else if tag.is_some_and(|tag| tag.eq_ignore_ascii_case("blockquote")) {
+        } else if semantics.has_role(ContentRole::Quote) {
             Some(6)
-        } else if is_compact_semantic_structure(boxes, box_idx) {
+        } else if semantics.has_role(ContentRole::CompactStructure) {
             Some(8)
-        } else {
-            None
-        };
+        } else { None };
         let Some(limit) = compact_line_limit else {
             continue;
         };
         let has_forced_inside = anchors.boxes().any(|descendant| {
             descendant != box_idx
-                && doc.box_descends_from(descendant, box_idx)
+                && doc.view().semantics().contains(box_idx, descendant)
                 && (boxes.forces_break_before(descendant) || boxes.forces_break_after(descendant))
         });
         if range_lines.len() <= limit
@@ -179,15 +91,11 @@ pub(crate) fn semantic_keep_ranges(
         for pair in child_pairs[group_start..group_end].windows(2) {
             let label = pair[0].1;
             let content = pair[1].1;
-            let is_definition_pair = boxes
-                .tag(label)
-                .is_some_and(|tag| tag.eq_ignore_ascii_case("dt"))
-                && boxes
-                    .tag(content)
-                    .is_some_and(|tag| tag.eq_ignore_ascii_case("dd"));
+            let is_definition_pair = root.semantics().content(label).has_role(ContentRole::DefinitionTerm)
+                && root.semantics().content(content).has_role(ContentRole::DefinitionDescription);
             let is_statement_label_pair = boxes.parent(label).is_some_and(|parent| {
-                boxes.parent(content) == Some(parent) && is_semantic_statement(boxes, parent)
-            }) && is_semantic_label(boxes, label);
+                boxes.parent(content) == Some(parent) && root.semantics().content(parent).has_role(ContentRole::Statement)
+            }) && root.semantics().content(label).has_role(ContentRole::Label);
             if !is_definition_pair && !is_statement_label_pair {
                 continue;
             }

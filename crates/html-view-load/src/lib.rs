@@ -7,18 +7,21 @@ use html::layout::{LaidOutDocument, LayoutTimings};
 use html::resources::ResourceProvider;
 use html::engine::Engine;
 use html::pipeline::{
-    FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints as PipelineLayoutConstraints, MarkupSyntax, PaintSettingsRevision, PipelineInputs, ReaderStyleOverrides, ResourceRevision, SourceRevision,
+    FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints as PipelineLayoutConstraints, PaintSettingsRevision, PipelineInputs, ReaderStyleOverrides, ResourceRevision, SourceRevision,
     StyleEnvironment, StylesheetRevision,
 };
 use html_view_types::NoteDisplay;
-use html_view_doc::SourceIndex;
 
 
 pub struct LoadedRenderDocument {
-    pub source_index: Arc<SourceIndex>,
     pub session: Engine,
     pub inputs: PipelineInputs,
-    pub document: LaidOutDocument,
+}
+
+impl LoadedRenderDocument {
+    pub fn document(&self) -> &LaidOutDocument {
+        self.session.document().expect("loaded session must own a laid-out document")
+    }
 }
 
 /// Initial document state prepared without a platform glyph shaper.
@@ -27,7 +30,6 @@ pub struct LoadedRenderDocument {
 /// adapters can construct it on their worker executor and finish shaping on
 /// the thread that owns their text system.
 pub struct PreparedRenderDocument {
-    pub source_index: Arc<SourceIndex>,
     pub session: Engine,
     pub inputs: PipelineInputs,
 }
@@ -68,14 +70,7 @@ pub fn note_flow_for(note_display: NoteDisplay) -> html::pipeline::NoteFlow {
 /// EPUB manifest media types take precedence over filenames: XHTML chapters
 /// are often named `.html`, where HTML parsing would swallow `<a id="..."/>`
 /// page markers and color subsequent text as links.
-pub fn markup_syntax_for_resource(provider: &dyn ResourceProvider, uri: &str) -> MarkupSyntax {
-    let media_type = provider.metadata(uri).ok().and_then(|metadata| metadata.media_type);
-    match media_type.as_deref().map(|value| value.split(';').next().unwrap_or(value).trim()) {
-        Some(value) if value.eq_ignore_ascii_case("application/xhtml+xml") || value.eq_ignore_ascii_case("application/xml") || value.eq_ignore_ascii_case("text/xml") => MarkupSyntax::Xml,
-        Some(value) if value.eq_ignore_ascii_case("text/html") => MarkupSyntax::Html,
-        _ => MarkupSyntax::from_uri(uri),
-    }
-}
+pub use html::document::markup_syntax_for_resource;
 
 pub fn load_css_with_provider(provider: &dyn ResourceProvider, base_uri: &str) -> Vec<String> {
     let mut chunks = Vec::new();
@@ -129,16 +124,16 @@ pub fn prepare_document_with_settings(
     let inputs = document_inputs(provider.as_ref(), uri, settings, None)?;
     let mut session = Engine::new(provider);
     session.prepare_through_style(inputs.clone()).map_err(|error| error.to_string())?;
-    let source_index = Arc::new(SourceIndex::new(&inputs.source, inputs.markup_syntax));
-    Ok(PreparedRenderDocument { session, inputs, source_index })
+    Ok(PreparedRenderDocument { session, inputs })
 }
 
 pub fn finish_prepared_document(
     mut prepared: PreparedRenderDocument,
     glyph_shaper: &mut impl GlyphShaper,
 ) -> Result<LoadedRenderDocument, String> {
-    let document = prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
-    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs, document, source_index: prepared.source_index })
+    prepared.session.rehydrate_glyphs(glyph_shaper).map_err(|error| error.to_string())?;
+    prepared.session.document().ok_or_else(|| "prepared pipeline session has no laid-out document".to_owned())?;
+    Ok(LoadedRenderDocument { session: prepared.session, inputs: prepared.inputs })
 }
 
 /// Decode the source and build the same inputs for worker preparation and
@@ -193,12 +188,11 @@ fn load_document_with_dom_pipeline_impl(
     let start = Instant::now();
     let mut session = Engine::new(provider);
     session.update(inputs.clone(), glyph_shaper).expect("initial pipeline update should succeed");
-    let document = session.document().expect("pipeline session should own a laid-out document").clone();
+    session.document().expect("pipeline session should own a laid-out document");
     if let Some(timings) = timings {
         timings.layout_total += start.elapsed();
     }
-    let source_index = Arc::new(SourceIndex::new(&inputs.source, inputs.markup_syntax));
-    LoadedRenderDocument { session, inputs, document, source_index }
+    LoadedRenderDocument { session, inputs }
 }
 
 pub fn load_document(provider: Arc<dyn ResourceProvider>, uri: &str, root_font_size: f32, col_width: f64, glyph_shaper: &mut impl GlyphShaper) -> LoadedRenderDocument {
@@ -400,7 +394,7 @@ mod tests {
             .expect("document should prepare");
         let mut shaper = TestGlyphShaper::default();
         let loaded = super::finish_prepared_document(prepared, &mut shaper).expect("platform shaping should finish");
-        assert!(loaded.document.render_view().text().glyph_count() > 0);
+        assert!(loaded.document().render_view().text().glyph_count() > 0);
         let _ = fs::remove_file(path);
     }
 
@@ -632,7 +626,7 @@ mod tests {
                 }
             };
 
-            let mut report = document.document.memory_usage_report();
+            let mut report = document.document().memory_usage_report();
             report.sort_by_bytes_desc();
             let total = report.total_bytes();
             processed += 1;

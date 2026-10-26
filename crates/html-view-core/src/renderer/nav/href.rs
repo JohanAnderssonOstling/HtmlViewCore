@@ -139,14 +139,14 @@ impl RendererCore {
             return Self::document_has_anchor(&self.page.view.document, anchor);
         }
         if let Some((index, loaded)) = &self.prepared_navigation {
-            if *index == doc_index { return Self::document_has_anchor(&loaded.document, anchor); }
+            if *index == doc_index { return Self::document_has_anchor(loaded.document(), anchor); }
         }
         if let Some(item) = self.document_cache.document(doc_index) {
             return Self::document_has_anchor(&item.view.document, anchor);
         }
 
         let loaded = self.load_document_for_index(glyph_shaper, doc_index);
-        let valid = Self::document_has_anchor(&loaded.document, anchor);
+        let valid = Self::document_has_anchor(loaded.document(), anchor);
         let item = self.spine_item(loaded);
         self.document_cache.insert_document(doc_index, item);
         self.host.set_glyph_document(self.nav.location().document());

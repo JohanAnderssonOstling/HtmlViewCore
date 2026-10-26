@@ -249,7 +249,7 @@ impl RendererCore {
         let backward = self.viewport.backward_composition();
         let end_line = if let Some(idx) = backward.anchor_end_line() {
             idx.min(lines.len().saturating_sub(1))
-        } else if let Some(idx) = self.doc().end_line_at(composition.end_offset_y(), 1e-6) {
+        } else if let Some(idx) = self.doc().view().geometry().end_line_at(composition.end_offset_y(), 1e-6) {
             idx
         } else {
             self.restart_forward_at(0.0);

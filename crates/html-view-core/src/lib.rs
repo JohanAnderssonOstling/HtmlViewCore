@@ -13,14 +13,13 @@ use crate::document_cache::DocumentCache;
 use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPageCache;
 use crate::spine_item::SpineItem;
-use html::document::ImageSource;
 use html::layout::GlyphShaper;
 pub use html::layout::{DocumentTocNode, TextDecorationLines, UsedBorderRadii};
 use html::pipeline::{EarliestStage, PipelineInputs};
-pub use html::pipeline::{ImageSizingPolicy, RootFontSize, TextCompositionPolicy};
+pub use html::pipeline::{ImageSizingPolicy, ReaderStyleOverrides, RootFontSize, TextCompositionPolicy};
 pub use html::resources::{BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata, ResourceProvider};
-use html::resources::{ImageLoader, ImagePipeline, ImageService};
-use html_view_doc::SourceIndex;
+use html::resources::{ImageLoader, ImageService};
+pub use html::style::FontFace;
 
 pub use html_view_cfi as cfi;
 
@@ -28,7 +27,6 @@ mod document_cache;
 mod document_view;
 mod prepared_page;
 mod spine_item;
-mod mathml;
 
 pub mod layout {
     pub use html::layout::{LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument, ShapeError, ShapedDocument};
@@ -56,13 +54,12 @@ pub use html::layout::{ReadingFragment, ReadingTarget};
 pub use html::render::{Painter, RecordingPainter, TextRunFragment};
 
 mod session;
-pub use session::{FramePainter, PointerDownOptions, PointerMoveOutcome, PreparedFrame, RendererSession};
+pub use session::{FramePainter, PointerDownOptions, PointerMoveOutcome, PreparedFrame, ReadingLine, RendererSession};
 
 const DEFAULT_DOCUMENT_CACHE_CAPACITY: usize = 3;
 
 fn document_text_index(source: &str, uri: &str, provider: &dyn ResourceProvider) -> Option<html::parse::DocumentTextIndex> {
-    let parsed = html::parse::parse_document(source, load::markup_syntax_for_resource(provider, uri)).ok()?;
-    html::parse::DocumentTextIndex::from_parsed(&parsed).ok()
+    html::document::text_index_for_resource(source, provider, uri)
 }
 
 pub fn search_publication(provider: &dyn ResourceProvider, document_uris: &[String], query: &str, options: SearchOptions) -> Vec<BookSearchMatch> {
@@ -95,7 +92,7 @@ pub fn search_publication_streaming(provider: &dyn ResourceProvider, document_ur
         };
         let text = index.text();
         let chars: Vec<char> = text.chars().collect();
-        for (start, end) in html_view_doc::find_text_matches(text, query, options) {
+        for (start, end) in html::text::find_text_matches(text, query, options.into()) {
             if cancelled() || results.len() >= MAX_RESULTS {
                 break;
             }
@@ -328,16 +325,13 @@ impl RendererCore {
     }
 
     fn new_with_image_loader(host: Rc<dyn RendererHost>, loaded: load::LoadedRenderDocument, provider: Arc<dyn ResourceProvider>, document_uris: Vec<String>, current_doc_index: usize, config: RendererInitialConfig, image_loader: Option<Arc<dyn ImageLoader>>) -> Self {
-        let document = loaded.document;
         let root_font_size = loaded.inputs.style_environment.root_font_size as f32;
-        let image_resources = document.render_view().images().to_vec();
         let jobs = host.blocking_job_spawner();
         let image_service = match image_loader {
             Some(loader) => ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET),
             None => ImageService::with_job_spawner(provider.clone(), jobs, ImageService::DEFAULT_BYTE_BUDGET),
         };
         image_service.set_completion_waker(host.resource_waker());
-        let image_pipeline = ImagePipeline::with_service(Arc::new(image_resources), image_service.clone());
         let document_cache = DocumentCache::new(DEFAULT_DOCUMENT_CACHE_CAPACITY);
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
         let layout = ColumnLayout { col_width: column_width, base_col_width: column_width, scale: config.scale.clamp(0.5, 3.0), max_col_count: config.max_column_count.map(|count| count.max(1)), ..Default::default() };
@@ -348,7 +342,7 @@ impl RendererCore {
         }
         Self {
             host,
-            page: SpineItem { source_index: loaded.source_index, session: loaded.session, inputs: loaded.inputs, images: image_pipeline, view: DocumentView::new(document, layout) },
+            page: SpineItem::new(loaded, layout, image_service.clone()),
             note: None,
             note_document: None,
             provider,
@@ -426,27 +420,16 @@ impl RendererCore {
         let preserve_document_start = anchor_is_document_start && matches!(composition.direction(), PaintDirection::Forward) && composition.start_offset_y() <= 0.1 && self.page.view.frame.page().start_line().is_none_or(|line| line == 0);
         let anchor_glyph = if preserve_document_start { None } else { self.nav.anchor_glyph_here().or_else(|| self.nav.current_glyph_position(self.nav_view())) };
         let anchor_cfi = if preserve_document_start { None } else { self.nav.current_cfi(self.nav_view()) };
-        let anchor_is_element = !preserve_document_start && self.nav.current_source_position(self.nav_view()).utf16_offset.is_none();
+        let anchor_is_element = !preserve_document_start && self.nav.current_source_position(self.nav_view()).is_some_and(|source| source.utf16_offset.is_none());
 
-        let source_changed = self.page.inputs.source != requested_inputs.source || self.page.inputs.markup_syntax != requested_inputs.markup_syntax;
+        self.host.set_font_overrides(&requested_inputs.reader_overrides);
         self.host.set_glyph_document(self.nav.location().document());
-        let update = self.page.session.update(requested_inputs.clone(), glyph_shaper)?;
+        let update = self.page.view.document.session.update(requested_inputs.clone(), glyph_shaper)?;
+        self.host.prepare_font_faces(self.page.view.document.session.font_faces(), self.provider.clone());
 
-        let document = self.page.session.document().cloned().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
-        // Typography preparation can regenerate MathML SVGs. Replace only
-        // the image pipeline when their source bytes actually changed.
-        let math_changed = self.page.view.document.render_view().images().iter()
-            .zip(document.render_view().images()).any(|(old, new)| {
-                matches!((&old.source, &new.source),
-                    (ImageSource::MathMl { svg: old, .. }, ImageSource::MathMl { svg: new, .. }) if old != new)
-            });
-        if math_changed {
-            self.page.images = crate::spine_item::SpineItem::image_pipeline_for(&document, self.image_service.clone());
-        }
-        if source_changed {
-            self.page.source_index = Arc::new(SourceIndex::new(&requested_inputs.source, requested_inputs.markup_syntax));
-        }
-        self.root_font_size = self.page.install_pipeline_result(document, requested_inputs);
+        let document = self.page.view.document.session.document().ok_or_else(|| html::pipeline::PipelineError("pipeline update completed without a laid-out document".to_owned()))?;
+        self.page.images.update_resources(document.render_view().images());
+        self.root_font_size = self.page.install_pipeline_result(requested_inputs);
         if update.stage == EarliestStage::Paint {
             // Paint changes preserve pagination, selection and reading position.
             // Revisions invalidate the displayed colors without discarding geometry.
@@ -535,6 +518,13 @@ impl RendererCore {
                     self.page.view.layout.max_col_count = count;
                     self.page.view.layout.finish_viewport_reconfiguration(None);
                     self.host.request_repaint();
+                }
+            }
+            RendererCommand::RefreshFonts => {
+                let mut inputs = self.page.inputs.clone();
+                inputs.font_environment = inputs.font_environment.next();
+                if let Err(error) = self.apply_pipeline_inputs(inputs, glyph_shaper) {
+                    self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
                 }
             }
             RendererCommand::SetFontSize(size) => self.set_root_font_size(glyph_shaper, size),
@@ -678,14 +668,14 @@ impl RendererCore {
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
         let document_count = self.nav.documents().uris().len();
         self.nav.toc_anchors.set_strings_by_doc(anchors_by_doc, document_count);
-        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), source: &self.page.source_index, viewport: &self.viewport, frame: &self.page.view.frame };
+        let view = html_view_navigate::NavView { doc: DocQuery::new(&self.page.view.document), viewport: &self.viewport, frame: &self.page.view.frame };
         self.nav.update_toc_anchor_filter(view);
     }
 
     pub fn set_search_query(&mut self, query: &str) {
         let options = self.highlight.current_document_options();
         self.highlight.restart(query.to_owned(), options);
-        let matches = self.doc().find_matches_with_options(query, options);
+        let matches = self.doc().text().find_matches(query, options.into());
         let empty = matches.is_empty();
         self.highlight.set_local_matches(self.nav.location().document(), matches);
         self.highlight.emit_results(self.host.as_ref());
@@ -708,7 +698,7 @@ impl RendererCore {
         if query.is_empty() {
             // restart already cleared both result sets.
         } else if local_scope {
-            let matches = self.doc().find_matches_with_options(query, options);
+            let matches = self.doc().text().find_matches(query, options.into());
             self.highlight.set_local_matches(self.nav.location().document(), matches);
         } else {
             let results = search_publication(self.provider.as_ref(), self.nav.documents().uris(), query, options);
@@ -753,7 +743,7 @@ impl RendererCore {
     /// Projects search results onto the loaded document without reading another
     /// file or changing the viewport. Navigation uses the same source mapping.
     fn refresh_visible_search_matches(&mut self) -> bool {
-        let matches = self.doc().find_matches_with_options(self.highlight.query(), self.highlight.options());
+        let matches = self.doc().text().find_matches(self.highlight.query(), self.highlight.options().into());
         self.highlight.install_visible_matches(matches);
         let Some(hit) = self.highlight.current_book_match().filter(|hit| hit.doc == self.nav.location().document()) else {
             return false;
@@ -762,7 +752,7 @@ impl RendererCore {
             BookSearchTarget::LocalOccurrence(occurrence) => Some(occurrence),
             BookSearchTarget::SourceCfi(cfi) => crate::cfi::parse_cfi(&self.page.view.document, &cfi)
                 .and_then(|(doc, glyph)| (doc == self.nav.location().document()).then_some(glyph))
-                .and_then(|glyph| self.highlight.matches().iter().position(|&(start, end)| start <= glyph && glyph < end)),
+                .and_then(|glyph| self.highlight.matches().iter().position(|range| range.contains(&glyph))),
         };
         let Some(occurrence) = occurrence else {
             return false;

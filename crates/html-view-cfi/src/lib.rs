@@ -47,6 +47,7 @@ pub fn parse_source_position(cfi: &str) -> Option<SourcePosition> {
         None => (plain.as_str(), None),
     };
     let path = path.split('/').filter(|step| !step.is_empty()).map(str::parse).collect::<Result<Vec<usize>, _>>().ok()?;
+    if path.contains(&0) { return None; }
     Some(SourcePosition { document, path, utf16_offset })
 }
 

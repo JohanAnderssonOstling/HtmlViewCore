@@ -25,6 +25,14 @@ impl PendingNavigation {
 }
 
 impl RendererCore {
+    /// Local navigation supersedes a chapter read without waiting for its I/O.
+    /// Dropping the receiver discards the stale result when that read finishes.
+    pub(super) fn cancel_pending_navigation(&mut self) {
+        if self.pending_navigation.take().is_some() {
+            self.host.request_repaint();
+        }
+    }
+
     fn document_settings(&self) -> load::DocumentLoadSettings {
         load::DocumentLoadSettings {
             root_font_size: self.root_font_size,
@@ -102,7 +110,11 @@ impl RendererCore {
         }
         self.host.set_glyph_document(pending.doc);
         let loaded =
-            match result.and_then(|prepared| load::finish_prepared_document(prepared, shaper)) {
+            match result.and_then(|prepared| {
+                self.host.set_font_overrides(&prepared.inputs.reader_overrides);
+                self.host.prepare_font_faces(prepared.session.font_faces(), self.provider.clone());
+                load::finish_prepared_document(prepared, shaper)
+            }) {
                 Ok(loaded) => loaded,
                 Err(message) => {
                     self.host.set_glyph_document(self.nav.location().document());

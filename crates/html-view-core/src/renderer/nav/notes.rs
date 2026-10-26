@@ -113,9 +113,9 @@ impl RendererCore {
         // document's renderer resources changes that document.
         let is_note_target = {
             let laid_out = match freshly_loaded.as_ref() {
-                Some(loaded) => &loaded.document,
-                None if doc == self.nav.location().document() => &self.page.view.document,
-                None => &self.document_cache.document(doc)?.view.document,
+                Some(loaded) => loaded.document(),
+                None if doc == self.nav.location().document() => &*self.page.view.document,
+                None => &*self.document_cache.document(doc)?.view.document,
             };
             laid_out.render_view().addressing().is_note_target(fragment)
         };
@@ -140,11 +140,11 @@ impl RendererCore {
                 .session
                 .layout_note(fragment, constraints, glyph_shaper),
             None if doc == self.nav.location().document() => {
-                self.page
+                self.page.view.document
                     .session
                     .layout_note(fragment, constraints, glyph_shaper)
             }
-            None => self.document_cache.document_mut(doc)?.session.layout_note(
+            None => self.document_cache.document_mut(doc)?.view.document.session.layout_note(
                 fragment,
                 constraints,
                 glyph_shaper,
@@ -158,7 +158,7 @@ impl RendererCore {
         // through the same code the page uses.
         self.note = Some(
             crate::document_view::DocumentView::new(
-                note.clone(),
+                Box::new(note),
                 crate::ColumnLayout {
                     col_width: width,
                     base_col_width: width,

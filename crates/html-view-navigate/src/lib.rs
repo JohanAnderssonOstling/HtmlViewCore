@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use html_view_doc::{DocQuery, SourceIndex};
+use html_view_doc::DocQuery;
 
 mod navigate;
 #[cfg(test)]
@@ -22,7 +22,6 @@ use html_view_types::{ReadingPosition, RendererEvent, RendererHost, ViewportStat
 #[derive(Clone, Copy)]
 pub struct NavView<'a> {
     pub doc: DocQuery<'a>,
-    pub source: &'a SourceIndex,
     pub viewport: &'a ViewportState,
     pub frame: &'a VisibleFrame,
 }
@@ -30,7 +29,6 @@ pub struct NavView<'a> {
 /// [`NavView`] plus the ability to move the viewport and notify the host.
 pub struct NavContext<'a> {
     pub doc: DocQuery<'a>,
-    pub source: &'a SourceIndex,
     pub viewport: &'a mut ViewportState,
     pub frame: &'a VisibleFrame,
     pub host: &'a dyn RendererHost,
@@ -38,7 +36,7 @@ pub struct NavContext<'a> {
 
 impl<'a> NavContext<'a> {
     pub fn view(&self) -> NavView<'_> {
-        NavView { doc: self.doc, source: self.source, viewport: self.viewport, frame: self.frame }
+        NavView { doc: self.doc, viewport: self.viewport, frame: self.frame }
     }
 }
 

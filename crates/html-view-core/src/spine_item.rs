@@ -15,70 +15,58 @@
 //! exists and shares that document's resources, so it is a [`DocumentView`] --
 //! the display half alone.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use html::engine::Engine;
 use html::pipeline::PipelineInputs;
 use html::resources::{ImagePipeline, ImageService};
-use html_view_doc::SourceIndex;
 
 use crate::document_view::DocumentView;
 use crate::{ColumnLayout, LaidOutDocument, load};
 
 pub(crate) struct SpineItem {
     /// Source addresses stay with their document through caching and reflow.
-    pub(crate) source_index: Arc<SourceIndex>,
-    /// The pipeline that produced the document, kept so it can be asked for
-    /// the document again under different inputs.
-    pub(crate) session: Engine,
     pub(crate) inputs: PipelineInputs,
     /// Decoded images, addressed by an index into this document's resources.
     /// A pipeline belonging to another document answers the same index with a
     /// different picture.
     pub(crate) images: ImagePipeline,
     /// What is on screen of it.
-    pub(crate) view: DocumentView,
+    pub(crate) view: DocumentView<SessionDocument>,
+}
+
+/// Owns the pipeline, whose document is borrowed by the shared view code.
+/// Keeping the session here prevents the view from retaining an obsolete
+/// document after reflow or glyph rehydration.
+pub(crate) struct SessionDocument {
+    pub(crate) session: Engine,
+}
+
+impl Deref for SessionDocument {
+    type Target = LaidOutDocument;
+
+    fn deref(&self) -> &Self::Target {
+        self.session.document().expect("spine session must own a laid-out document")
+    }
 }
 
 impl SpineItem {
-    pub(crate) fn new(
-        loaded: load::LoadedRenderDocument,
-        layout: ColumnLayout,
-        image_service: ImageService,
-    ) -> Self {
-        let images = Self::image_pipeline_for(&loaded.document, image_service);
+    pub(crate) fn new(loaded: load::LoadedRenderDocument, layout: ColumnLayout, image_service: ImageService) -> Self {
+        let images = Self::image_pipeline_for(loaded.document(), image_service);
         Self {
-            source_index: loaded.source_index,
-            session: loaded.session,
             inputs: loaded.inputs,
             images,
-            view: DocumentView::new(loaded.document, layout),
+            view: DocumentView::new(SessionDocument { session: loaded.session }, layout),
         }
     }
 
-    pub(crate) fn image_pipeline_for(
-        document: &LaidOutDocument,
-        image_service: ImageService,
-    ) -> ImagePipeline {
-        ImagePipeline::with_service(
-            Arc::new(document.render_view().images().to_vec()),
-            image_service,
-        )
+    pub(crate) fn image_pipeline_for(document: &LaidOutDocument, image_service: ImageService) -> ImagePipeline {
+        ImagePipeline::with_service(Arc::new(document.render_view().images().to_vec()), image_service)
     }
 
-    /// Replaces the document while keeping the item's identity, for a relayout
-    /// that produced a new one from the same source.
-    pub(crate) fn replace_document(&mut self, document: LaidOutDocument) {
-        self.view.document = document;
-    }
-
-    /// Installs the inseparable products of one successful pipeline update.
-    pub(crate) fn install_pipeline_result(
-        &mut self,
-        document: LaidOutDocument,
-        inputs: PipelineInputs,
-    ) -> f32 {
-        self.view.document = document;
+    /// Records the inputs for the document now owned by the updated session.
+    pub(crate) fn install_pipeline_result(&mut self, inputs: PipelineInputs) -> f32 {
         self.inputs = inputs;
         self.root_font_size()
     }

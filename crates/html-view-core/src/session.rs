@@ -4,13 +4,27 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use html_view_paginate::PaginationScratch;
-use kurbo::{Point, Size};
+use kurbo::{Point, Rect, Size};
 
 use crate::{
     FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter,
     ReadingFragment, ReadingTarget, RendererCommand, RendererCore, RendererHost, RendererOperation,
     RendererRevisions, ResourceProvider, TocEntry,
 };
+
+/// One rendered line, retaining its reading region even when other lines
+/// occupy the same vertical space. Coordinates match painted selection bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingLine {
+    pub glyphs: Range<u32>,
+    pub bounds: Rect,
+    /// The page-column band at this line's height, spanning adjacent cells.
+    pub column_bounds: Rect,
+    pub column: i32,
+    /// The nearest laid-out table cell, including CSS table cells.
+    /// This identity is local to the current document layout.
+    pub cell: Option<usize>,
+}
 
 /// The high-level renderer API used by UI backends.
 ///
@@ -163,6 +177,73 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// Where an annotation sits on screen, for the same reason.
     pub fn annotation_bounds(&self, id: &str) -> Option<kurbo::Rect> {
         self.core.annotation_bounds(id)
+    }
+
+    /// Visible rendered lines in document order, retaining table-cell and
+    /// page-column boundaries. Each line counts separately even if it overlaps
+    /// another line vertically. Bands follow the cell or text block's width.
+    pub fn visible_reading_lines(&self) -> Vec<ReadingLine> {
+        if self.reading_document().is_none() {
+            return Vec::new();
+        }
+        let view = &self.core.page.view;
+        let rendered = view.document.render_view();
+        let text = rendered.text();
+        let boxes = rendered.boxes();
+        let geometry = self.core.text_geometry();
+        let mut lines: Vec<ReadingLine> = view.frame.page().line_positions().iter().filter_map(|(index, screen)| {
+            let line = text.line(index)?;
+            if line.height() <= 0.0 {
+                return None;
+            }
+            // Project the formatting context's clip exactly as the painter
+            // does, including pagination's translation into another column.
+            let clip = text.line_overflow_clip(index).map(|clip| {
+                let rect = clip.rect() + (screen.point - line.point());
+                Rect::new(
+                    if clip.clips_x() { rect.x0 } else { f64::NEG_INFINITY },
+                    if clip.clips_y() { rect.y0 } else { f64::NEG_INFINITY },
+                    if clip.clips_x() { rect.x1 } else { f64::INFINITY },
+                    if clip.clips_y() { rect.y1 } else { f64::INFINITY },
+                )
+            });
+            let clipped = |rect: Rect| clip.map_or(rect, |clip| rect.intersect(clip));
+            // Hidden text still contributes layout lines. Only painted text
+            // should consume ruler steps, and anchors must start in visible ink.
+            let glyphs = text.line_text_fragments(index)?.filter(|fragment| fragment.visible())
+                .map(|fragment| fragment.glyphs()).filter(|range| !range.is_empty())
+                .filter(|range| {
+                    if clip.is_none() {
+                        return true;
+                    }
+                    let (x0, x1) = geometry.glyph_x_span_in_line(&line, range.start, range.end);
+                    let bounds = clipped(Rect::new(screen.point.x + x0, screen.point.y, screen.point.x + x1, screen.point.y + line.height()));
+                    bounds.width() > 0.0 && bounds.height() > 0.0
+                })
+                .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))?;
+            let owner = line.owner_box_idx();
+            let cell = std::iter::once(owner).chain(boxes.ancestors(owner)).find(|&index| boxes.is_table_cell(index));
+            let region = cell.unwrap_or(owner);
+            let (x, width) = boxes.point(region).zip(boxes.size(region))
+                .filter(|(_, size)| size.width > 0.0)
+                .map(|(point, size)| (screen.point.x + point.x - line.point().x, size.width))
+                .unwrap_or_else(|| (view.layout.col_x(f64::from(screen.col_index), 0.0), view.layout.col_width));
+            let bounds = clipped(Rect::new(x, screen.point.y, x + width, screen.point.y + line.height()));
+            if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                return None;
+            }
+            let start = self.core.from_layout_point(Point::new(bounds.x0, bounds.y0));
+            let end = self.core.from_layout_point(Point::new(bounds.x1, bounds.y1));
+            let column_x = view.layout.col_x(f64::from(screen.col_index), 0.0);
+            let column_start = self.core.from_layout_point(Point::new(column_x, screen.point.y));
+            let column_end = self.core.from_layout_point(Point::new(column_x + view.layout.col_width, screen.point.y + line.height()));
+            let column_bounds = Rect::new(column_start.x, column_start.y, column_end.x, column_end.y);
+            Some(ReadingLine { glyphs, bounds: Rect::new(start.x, start.y, end.x, end.y), column_bounds, column: screen.col_index, cell })
+        }).collect();
+        // Spatial line indexes interleave adjacent table cells. Source glyph
+        // order completes each cell/block while retaining page-column order.
+        lines.sort_by_key(|line| (line.column, line.glyphs.start));
+        lines
     }
 
     pub fn document(&self) -> &LaidOutDocument {
@@ -394,13 +475,16 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     /// Highlights a block and follows it only if its beginning is off screen.
-    pub fn follow_reading_target(&mut self, target: ReadingTarget) {
+    /// Returns whether following it changed the page, without recording manual
+    /// navigation (which would interrupt narration).
+    pub fn follow_reading_target(&mut self, target: ReadingTarget) -> bool {
+        let mut moved = false;
         let start = target.glyph_ranges.first().map(|range| range.start);
         if let Some(start) = start {
             let visible = self
                 .core
                 .doc()
-                .find_line_for_glyph(start)
+                .text().line_index_for_glyph(start)
                 .is_some_and(|line| {
                     self.core
                         .page
@@ -416,9 +500,11 @@ impl<S: GlyphShaper> RendererSession<S> {
                     self.core.nav.location().document(),
                     Some(start),
                 );
+                moved = true;
             }
         }
         self.apply(RendererCommand::SetReadingTarget(Some(target)));
+        moved
     }
 
     pub fn resolve_href(&self, href: &str) -> Option<(usize, Option<String>)> {
@@ -591,7 +677,7 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn equation_at(&self, position: Point) -> bool {
         self.core.hit_test_document_image(position).is_some_and(|image| {
-            self.core.page.view.document.render_view().image_mathml(image.image).is_some()
+            self.core.page.view.document.render_view().export().is_equation(image.image)
         })
     }
 
@@ -599,9 +685,8 @@ impl<S: GlyphShaper> RendererSession<S> {
     pub fn copy_equation_latex_at(&self, position: Point) -> bool {
         let Some(image) = self.core.hit_test_document_image(position) else { return false };
         let view = self.core.page.view.document.render_view();
-        let Some(markup) = view.image_mathml(image.image) else { return false };
-        let result = crate::mathml::to_latex(markup)
-            .and_then(|latex| self.core.host.set_clipboard(&latex));
+        let Some(result) = html::export::equation_latex(view, image.image) else { return false };
+        let result = result.and_then(|latex| self.core.host.set_clipboard(&latex));
         if let Err(message) = result {
             self.core.emit_operation_failed(RendererOperation::CopyEquationLatex, message);
         }
@@ -668,7 +753,7 @@ impl<S: GlyphShaper> RendererSession<S> {
                 .glyph_range_bounds(glyph, glyph + 1)
                 .is_some_and(|bounds| bounds.contains(position))
             {
-                return view.doc().word_range_at(glyph);
+                return view.doc().text().word_range_at(glyph);
             }
         }
         if require_ink {
@@ -681,7 +766,7 @@ impl<S: GlyphShaper> RendererSession<S> {
                 // A caret at the edge of the last visible line can address the
                 // first character on the next page. Clamp to visible text instead.
                 view.geometry().glyph_range_bounds(glyph, glyph + 1)?;
-                view.doc().word_range_at(glyph)
+                view.doc().text().word_range_at(glyph)
             })
     }
 
@@ -1372,7 +1457,9 @@ mod tests {
             .paint(&mut RecordingPainter::default());
         let point_at = |renderer: &RendererSession<TestShaper>, word: &str| {
             let doc = renderer.core.doc();
-            let all = doc.glyph_text(&[0..doc.text().glyph_count() as u32]);
+            let text = doc.text();
+            let all: String = (0..text.glyph_count()).filter_map(|index| text.glyph_at(index)
+                .and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect();
             let byte = all.find(word).unwrap();
             let glyph = all[..byte].chars().count() as u32;
             let bounds = renderer
@@ -1402,7 +1489,7 @@ mod tests {
             renderer
                 .core
                 .doc()
-                .build_selection_text(first, last)
+                .view().export().selection_text(first..last)
                 .0
                 .unwrap(),
             text
@@ -1436,7 +1523,7 @@ mod tests {
                 renderer
                     .core
                     .doc()
-                    .build_selection_text(first, last)
+                    .view().export().selection_text(first..last)
                     .0
                     .as_deref(),
                 Some(word)
@@ -1500,7 +1587,7 @@ mod tests {
         let line_idx = renderer
             .core
             .doc()
-            .find_line_for_glyph(linked_glyph)
+            .text().line_index_for_glyph(linked_glyph)
             .unwrap();
         let screen = renderer
             .core
@@ -2093,10 +2180,10 @@ mod tests {
         let outer_line = renderer
             .core
             .doc()
-            .find_line_for_glyph(glyph_for('A'))
+            .text().line_index_for_glyph(glyph_for('A'))
             .unwrap();
         let nested = glyph_for('I');
-        let nested_line = renderer.core.doc().find_line_for_glyph(nested).unwrap();
+        let nested_line = renderer.core.doc().text().line_index_for_glyph(nested).unwrap();
 
         assert_ne!(outer_line, nested_line);
         assert_eq!(
@@ -2116,7 +2203,7 @@ mod tests {
             Some((nested, nested + 1))
         );
         assert_eq!(
-            renderer.core.doc().find_line_for_glyph(glyph_for('B')),
+            renderer.core.doc().text().line_index_for_glyph(glyph_for('B')),
             Some(outer_line)
         );
         assert_eq!(

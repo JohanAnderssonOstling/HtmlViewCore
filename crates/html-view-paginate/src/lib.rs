@@ -18,94 +18,7 @@ use std::collections::{HashMap, HashSet};
 mod semantic_keeps;
 mod vertical_rhythm;
 
-// These epub/ARIA predicates are pagination's own. `semantic_keeps` carries a
-// similar pair whose `has_token` additionally matches namespace-prefixed tokens
-// (`foo:chapter`). The two have always differed; unifying them would widen what
-// counts as a sidebar or chapter start, so they stay separate until that is a
-// deliberate decision.
-const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
-
-fn has_token(value: Option<&str>, expected: &str) -> bool {
-    value.is_some_and(|value| {
-        value
-            .split_ascii_whitespace()
-            .any(|token| token.eq_ignore_ascii_case(expected))
-    })
-}
-
-fn has_epub_type(boxes: html::layout::RenderBoxView<'_>, box_idx: usize, expected: &str) -> bool {
-    has_token(
-        boxes
-            .attribute(box_idx, "epub:type")
-            .or_else(|| boxes.attribute_expanded(box_idx, Some(EPUB_NAMESPACE), "type")),
-        expected,
-    )
-}
-
-fn is_semantic_sidebar(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    let is_note = ["footnote", "endnote", "rearnote"]
-        .iter()
-        .any(|kind| has_epub_type(boxes, box_idx, kind))
-        || ["doc-footnote", "doc-endnote"]
-            .iter()
-            .any(|role| has_token(boxes.attribute(box_idx, "role"), role));
-    !is_note
-        && (has_epub_type(boxes, box_idx, "sidebar")
-            || has_token(boxes.attribute(box_idx, "role"), "complementary")
-            || boxes
-                .tag(box_idx)
-                .is_some_and(|tag| tag.eq_ignore_ascii_case("aside")))
-}
-
-fn is_semantic_page_start(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    const EPUB_TYPES: &[&str] = &[
-        "chapter",
-        "part",
-        "appendix",
-        "prologue",
-        "epilogue",
-        "foreword",
-        "preface",
-        "introduction",
-        "conclusion",
-        "acknowledgments",
-        "afterword",
-        "bibliography",
-        "glossary",
-        "index",
-        "colophon",
-        "titlepage",
-        "halftitlepage",
-        "copyright-page",
-        "frontmatter",
-        "bodymatter",
-        "backmatter",
-    ];
-    const DPUB_ROLES: &[&str] = &[
-        "doc-chapter",
-        "doc-part",
-        "doc-appendix",
-        "doc-prologue",
-        "doc-epilogue",
-        "doc-foreword",
-        "doc-preface",
-        "doc-introduction",
-        "doc-conclusion",
-        "doc-acknowledgments",
-        "doc-afterword",
-        "doc-bibliography",
-        "doc-glossary",
-        "doc-index",
-        "doc-colophon",
-    ];
-
-    EPUB_TYPES
-        .iter()
-        .any(|kind| has_epub_type(boxes, box_idx, kind))
-        || DPUB_ROLES
-            .iter()
-            .any(|role| has_token(boxes.attribute(box_idx, "role"), role))
-}
+use html::layout::ContentRole;
 
 pub fn initial_render_state() -> RenderState {
     RenderState {
@@ -373,11 +286,11 @@ fn pagination_boundary_anchors(
     for box_idx in candidates.iter().copied() {
         let next = if let Some(last) = last_line.get(&box_idx).copied() {
             line_owners.iter().find_map(|&(line_idx, owner)| {
-                (line_idx > last && !doc.box_descends_from(owner, box_idx)).then_some(line_idx)
+                (line_idx > last && !doc.view().semantics().contains(box_idx, owner)).then_some(line_idx)
             })
         } else {
             line_owners.iter().find_map(|&(line_idx, owner)| {
-                (owner > box_idx && !doc.box_descends_from(owner, box_idx)).then_some(line_idx)
+                (owner > box_idx && !doc.view().semantics().contains(box_idx, owner)).then_some(line_idx)
             })
         };
         if let Some(next) = next {
@@ -654,7 +567,7 @@ impl<'a> Paginator<'a> {
             // affects this work.
             leading_headers.clear();
             let mut scan = table_idx.saturating_add(1);
-            while scan < boxes.len() && self.doc.box_descends_from(scan, table_idx) {
+            while scan < boxes.len() && self.doc.view().semantics().contains(table_idx, scan) {
                 if !boxes.is_table_row(scan) {
                     scan += 1;
                     continue;
@@ -668,16 +581,14 @@ impl<'a> Paginator<'a> {
                 let mut header_cell_count = 0usize;
                 scan += 1;
                 while scan < boxes.len()
-                    && self.doc.box_descends_from(scan, table_idx)
+                    && self.doc.view().semantics().contains(table_idx, scan)
                     && !boxes.is_table_row(scan)
                 {
                     if boxes.is_table_cell(scan)
                         && boxes.ancestors(scan).any(|ancestor| ancestor == row)
                     {
                         cell_count += 1;
-                        if boxes
-                            .tag(scan)
-                            .is_some_and(|tag| tag.eq_ignore_ascii_case("th"))
+                        if self.doc.view().semantics().content(scan).has_role(ContentRole::TableHeaderCell)
                         {
                             header_cell_count += 1;
                         }
@@ -810,21 +721,21 @@ impl<'a> Paginator<'a> {
                 continue;
             };
             let bottom = point.y + size.height;
-            let tag = boxes.tag(box_idx);
+            let semantics = self.doc.view().semantics().content(box_idx);
             range_lines.clear();
             if boxes.is_block_container(box_idx) {
                 collect_lines_in_range(lines_by_y, point.y, bottom, range_lines);
             }
             let has_forced_inside = anchors.boxes().any(|descendant| {
                 descendant != box_idx
-                    && self.doc.box_descends_from(descendant, box_idx)
+                    && self.doc.view().semantics().contains(box_idx, descendant)
                     && (boxes.forces_break_before(descendant)
                         || boxes.forces_break_after(descendant))
             });
             if (boxes.avoids_break_inside(box_idx)
                 || (self.book_optimized
-                    && (tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figure"))
-                        || is_semantic_sidebar(boxes, box_idx))))
+                    && (semantics.has_role(ContentRole::Figure)
+                        || semantics.has_role(ContentRole::Sidebar))))
                 && !has_forced_inside
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && let Some(event) = self.keep_range_event(trigger_line, point.y, bottom)
@@ -898,14 +809,14 @@ impl<'a> Paginator<'a> {
                 };
                 let previous_bottom = previous_point.y + previous_size.height;
                 let next_bottom = next_point.y + next_size.height;
-                let previous_tag = boxes.tag(previous);
-                let next_tag = boxes.tag(next);
+                let previous_semantics = self.doc.view().semantics().content(previous);
+                let next_semantics = self.doc.view().semantics().content(next);
 
                 if boxes.avoids_break_after(previous)
                     || boxes.avoids_break_before(next)
                     || (self.book_optimized
-                        && (previous_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))
-                            || next_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))))
+                        && (previous_semantics.has_role(ContentRole::Caption)
+                            || next_semantics.has_role(ContentRole::Caption)))
                 {
                     let group_top = previous_point.y.min(next_point.y);
                     let group_bottom = previous_bottom.max(next_bottom);
@@ -916,11 +827,7 @@ impl<'a> Paginator<'a> {
                         events.push(event);
                     }
                 } else if self.book_optimized
-                    && previous_tag.is_some_and(|tag| {
-                        ["h1", "h2", "h3", "h4", "h5", "h6"]
-                            .iter()
-                            .any(|heading| tag.eq_ignore_ascii_case(heading))
-                    })
+                    && previous_semantics.has_role(ContentRole::Heading)
                 {
                     range_lines.clear();
                     collect_lines_in_range(lines_by_y, next_point.y, next_bottom, range_lines);
@@ -1026,7 +933,7 @@ impl<'a> Paginator<'a> {
         }
         for box_idx in anchors.boxes() {
             if self.book_optimized
-                && is_semantic_page_start(boxes, box_idx)
+                && self.doc.view().semantics().content(box_idx).has_role(ContentRole::MajorSection)
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && !authored_boundary.contains(&trigger_line)
                 && let Some(point) = boxes.point(box_idx)
@@ -1064,35 +971,7 @@ impl<'a> Paginator<'a> {
         events.extend(merged.drain(..));
     }
 
-    /// The row-group pagination bounds covering `y`, if any. Exercised by the
-    /// renderer's table-pagination tests, which live in another crate and so
-    /// cannot reach a `#[cfg(test)]` item here.
-    pub fn table_row_group_bounds_containing(&self, y: f64) -> Option<(f64, f64)> {
-        let start = self.doc.start_line_at(y, 0.1);
-        let mut anchors = BoundaryAnchors::default();
-        pagination_boundary_anchors(self.doc, start, start, &mut anchors);
-        let mut events = Vec::new();
-        let mut table_indices = Vec::new();
-        let mut rows_by_table = Vec::new();
-        let mut row_spans = HashMap::new();
-        let mut leading_headers = Vec::new();
-        self.table_pagination_events(
-            &anchors,
-            &mut events,
-            &mut table_indices,
-            &mut rows_by_table,
-            &mut row_spans,
-            &mut leading_headers,
-        );
-        events
-            .into_iter()
-            .find(|event| {
-                event.kind == TablePaginationEventKind::RowGroup
-                    && event.top <= y + 0.01
-                    && event.bottom > y + 0.01
-            })
-            .map(|event| (event.top, event.bottom))
-    }
+
 }
 
 impl Paginator<'_> {
@@ -1141,7 +1020,7 @@ impl Paginator<'_> {
                 next_start_offset_y: 0.0,
             };
         };
-        let end_height = self.doc.effective_line_height(end_line, end_data.height());
+        let end_height = self.doc.view().geometry().line_vertical_bounds(end_line).map_or(end_data.height(), |bounds| bounds.end - end_data.point().y);
         let end_bottom = end_data.point().y + end_height;
         let mut render_state = initial_render_state();
         let mut reversed = std::mem::take(&mut scratch.reverse_positions);
@@ -1151,7 +1030,7 @@ impl Paginator<'_> {
         let range_trigger = |top: f64, bottom: f64| {
             (minimum_line..=end_line).rev().find(|&line_idx| {
                 lines.get(line_idx).is_some_and(|line| {
-                    let height = self.doc.effective_line_height(line_idx, line.height());
+                    let height = self.doc.view().geometry().line_vertical_bounds(line_idx).map_or(line.height(), |bounds| bounds.end - line.point().y);
                     line.point().y < bottom - 0.01 && line.point().y + height > top + 0.01
                 })
             })
@@ -1190,7 +1069,7 @@ impl Paginator<'_> {
             let line = lines
                 .get(line_idx)
                 .expect("reverse line index must stay within line count");
-            let effective_height = self.doc.effective_line_height(line_idx, line.height());
+            let effective_height = self.doc.view().geometry().line_vertical_bounds(line_idx).map_or(line.height(), |bounds| bounds.end - line.point().y);
             let reverse_y = (end_bottom - (line.point().y + effective_height)).max(0.0);
 
             if line_idx < end_line
@@ -1298,7 +1177,7 @@ impl Paginator<'_> {
         rhythm_scratch: Option<&mut VerticalRhythmScratch>,
     ) -> PagePositions {
         let lines = self.doc.text().lines();
-        let start_line = self.doc.start_line_at(start_offset_y, 0.1);
+        let start_line = self.doc.view().geometry().start_line_at(start_offset_y, 0.1);
         let mut table_event_idx =
             table_events.partition_point(|event| event.trigger_line < start_line);
         let mut forced_break_event_idx =
@@ -1370,7 +1249,7 @@ impl Paginator<'_> {
             let line = lines
                 .get(line_idx)
                 .expect("line index must stay within line_count");
-            let effective_height = self.doc.effective_line_height(line_idx, line.height());
+            let effective_height = self.doc.view().geometry().line_vertical_bounds(line_idx).map_or(line.height(), |bounds| bounds.end - line.point().y);
             let oversized = effective_height > self.layout.size.height;
             // An indivisible line taller than a column can never satisfy the
             // normal fit check. Fit it as one column-high atomic item so a

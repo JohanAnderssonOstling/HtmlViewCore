@@ -6,7 +6,7 @@
 //! clipboard: the copy methods return the payload and the caller decides what
 //! to do with it.
 
-use html::layout::{RenderTable, RenderTableCell};
+use html::layout::{ContentRole, RenderTable, RenderTableCell};
 use html::render::Painter;
 use html_view_doc::TextGeometry;
 use kurbo::{Point, Rect};
@@ -224,11 +224,11 @@ struct SemanticTableSelection {
     cell_glyph_ranges: Vec<std::ops::Range<u32>>,
 }
 
-struct SemanticMarkdownUnit {
+struct SemanticTextUnit {
     glyph_start: u32,
     glyph_end: u32,
     glyph_ranges: Vec<Range<u32>>,
-    markdown: String,
+    box_idx: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,102 +240,10 @@ pub struct TableHit {
     column_end: usize,
 }
 
-fn markdown_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('|', "\\|").replace(['\r', '\n'], " ")
+
+fn table_selection_markdown(table: &RenderTable, range: TableCellRange) -> Option<String> {
+    table.markdown_in(range.row_start..range.row_end.saturating_add(1), range.column_start..range.column_end.saturating_add(1))
 }
-
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
-#[cfg(test)]
-fn table_plain_text(table: &RenderTable, selection: Option<TableCellRange>) -> Option<String> {
-    let (grid, _) = table_grid(table, selection)?;
-    Some(grid.into_iter().map(|row| row.join("\t")).collect::<Vec<_>>().join("\n"))
-}
-
-fn table_unstyled_html(table: &RenderTable) -> Option<String> {
-    if table.rows().is_empty() {
-        return None;
-    }
-    let mut html = String::from("<table>");
-    for row in table.rows() {
-        html.push_str("<tr>");
-        for cell in row.cells() {
-            let tag = if cell.is_header() { "th" } else { "td" };
-            html.push('<');
-            html.push_str(tag);
-            if cell.rowspan() > 1 {
-                html.push_str(&format!(" rowspan=\"{}\"", cell.rowspan()));
-            }
-            if cell.colspan() > 1 {
-                html.push_str(&format!(" colspan=\"{}\"", cell.colspan()));
-            }
-            html.push('>');
-            html.push_str(&html_escape(cell.text()));
-            html.push_str("</");
-            html.push_str(tag);
-            html.push('>');
-        }
-        html.push_str("</tr>");
-    }
-    html.push_str("</table>");
-    Some(html)
-}
-
-fn table_grid(table: &RenderTable, selection: Option<TableCellRange>) -> Option<(Vec<Vec<String>>, bool)> {
-    let (row_start, row_end, column_start, column_end) = selection.map_or_else(
-        || (0, table.rows().len().saturating_sub(1), 0, table.column_count().saturating_sub(1)),
-        |range| (range.row_start, range.row_end.min(table.rows().len().saturating_sub(1)), range.column_start, range.column_end.min(table.column_count().saturating_sub(1))),
-    );
-    if row_start > row_end || column_start > column_end {
-        return None;
-    }
-    let width = column_end - column_start + 1;
-    let mut grid = vec![vec![String::new(); width]; row_end - row_start + 1];
-    let mut first_row_has_header = false;
-    for row in table.rows() {
-        for cell in row.cells() {
-            let cell_row_end = cell.row().saturating_add(cell.rowspan()).saturating_sub(1);
-            let cell_column_end = cell.column().saturating_add(cell.colspan()).saturating_sub(1);
-            if cell_row_end < row_start || cell.row() > row_end || cell_column_end < column_start || cell.column() > column_end {
-                continue;
-            }
-            let target_row = cell.row().max(row_start) - row_start;
-            let target_column = cell.column().max(column_start) - column_start;
-            if cell.row() == row_start && cell.is_header() {
-                first_row_has_header = true;
-            }
-            grid[target_row][target_column] = cell.text().to_owned();
-        }
-    }
-    Some((grid, first_row_has_header))
-}
-
-fn table_markdown(table: &RenderTable, selection: Option<TableCellRange>) -> Option<String> {
-    let (mut grid, first_row_has_header) = table_grid(table, selection)?;
-    for row in &mut grid {
-        for cell in row {
-            *cell = markdown_escape(cell);
-        }
-    }
-    let width = grid.first()?.len();
-
-    let format_row = |row: &[String]| format!("| {} |", row.join(" | "));
-    let separator = format!("| {} |", std::iter::repeat_n("---", width).collect::<Vec<_>>().join(" | "));
-    let mut lines = Vec::new();
-    if first_row_has_header {
-        lines.push(format_row(&grid[0]));
-        lines.push(separator);
-        lines.extend(grid.iter().skip(1).map(|row| format_row(row)));
-    } else {
-        lines.push(format_row(&vec![String::new(); width]));
-        lines.push(separator);
-        lines.extend(grid.iter().map(|row| format_row(row)));
-    }
-    Some(lines.join("\n"))
-}
-
 
 impl TableSelectionState {
     pub fn is_active(&self) -> bool {
@@ -451,16 +359,8 @@ impl<'a> SelectionView<'a> {
                 continue;
             }
 
-            let mut ranges = self.geo.doc.line_text_intersections(line_idx, selection_start, selection_end).collect::<Vec<_>>();
-            for range in &promoted {
-                ranges.extend(self.geo.doc.line_text_intersections(line_idx, range.start, range.end));
-            }
-            for (start, end) in ranges {
-                let (x0, x1) = self.geo.glyph_x_span_in_line(&line, start, end);
-                let (x0, x1) = (screen.point.x + x0, screen.point.x + x1);
-                let (x0, x1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
-
-                if position.x >= x0 && position.x <= x1 {
+            for range in std::iter::once(selection_start..selection_end).chain(promoted.iter().cloned()) {
+                if self.geo.line_selection_rects(line_idx, range, screen.point).any(|rect| rect.contains(position)) {
                     return true;
                 }
             }
@@ -507,45 +407,40 @@ impl<'a> SelectionView<'a> {
         }
     }
 
-    fn semantic_text_units(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticMarkdownUnit> {
+    fn semantic_text_units(&self, selection_start: u32, selection_end: u32) -> Vec<SemanticTextUnit> {
         if !self.state.interaction().is_semantic() || selection_start >= selection_end {
             return Vec::new();
         }
+        let view = self.geo.doc.view();
+        let semantics = view.semantics();
+        let boxes = view.boxes();
         let mut list_items = HashSet::new();
         let mut code_blocks = HashSet::new();
-        for run in self.geo.doc.text().text_runs() {
+        for run in view.text().text_runs() {
             let glyphs = run.glyphs();
-            if glyphs.start >= selection_end || glyphs.end <= selection_start || self.geo.doc.nearest_table_ancestor(run.box_idx()).is_some() {
+            if glyphs.start >= selection_end || glyphs.end <= selection_start || semantics.nearest(run.box_idx(), ContentRole::Table).is_some() {
                 continue;
             }
-            if let Some(block) = self.geo.doc.nearest_code_block_ancestor(run.box_idx()) {
+            if let Some(block) = semantics.nearest(run.box_idx(), ContentRole::CodeBlock) {
                 code_blocks.insert(block);
-            } else if let Some(item) = self.geo.doc.nearest_tag_ancestor(run.box_idx(), "li") {
+            } else if let Some(item) = semantics.nearest(run.box_idx(), ContentRole::ListItem) {
                 list_items.insert(item);
             }
         }
         let selected_list_items = list_items.clone();
-        list_items.retain(|item| !self.geo.doc.boxes().ancestors(*item).any(|ancestor| selected_list_items.contains(&ancestor)));
-        code_blocks.retain(|block| !self.geo.doc.boxes().ancestors(*block).any(|ancestor| list_items.contains(&ancestor)));
+        list_items.retain(|item| !boxes.ancestors(*item).any(|ancestor| selected_list_items.contains(&ancestor)));
+        code_blocks.retain(|block| !boxes.ancestors(*block).any(|ancestor| list_items.contains(&ancestor)));
 
         let mut units = Vec::new();
-        for item in list_items {
-            let ranges = self.geo.doc.box_text_and_marker_glyph_ranges(item);
+        for (box_idx, is_list_item) in list_items.into_iter().map(|item| (item, true))
+            .chain(code_blocks.into_iter().map(|block| (block, false)))
+        {
+            let ranges = semantics.text_ranges(box_idx, is_list_item);
             if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
-                units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown: self.geo.doc.list_item_markdown(item, 0) });
-            }
-        }
-        for block in code_blocks {
-            let ranges = self.geo.doc.box_text_glyph_ranges(block);
-            if let (Some(start), Some(end)) = (ranges.iter().map(|range| range.start).min(), ranges.iter().map(|range| range.end).max()) {
-                // Code remains character-selectable while both ends of the
-                // selection stay inside it. Promote only when the drag crosses
-                // into or out of the block.
-                if selection_start >= start && selection_end <= end {
-                    continue;
-                }
-                let markdown = self.geo.doc.code_block_markdown(block, &ranges);
-                units.push(SemanticMarkdownUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, markdown });
+                // Code remains character-selectable until a drag crosses its
+                // boundary. List items also highlight their generated marker.
+                if !is_list_item && selection_start >= start && selection_end <= end { continue; }
+                units.push(SemanticTextUnit { glyph_start: start, glyph_end: end, glyph_ranges: ranges, box_idx });
             }
         }
         units.sort_by_key(|unit| unit.glyph_start);
@@ -556,11 +451,12 @@ impl<'a> SelectionView<'a> {
         if !self.state.interaction().is_semantic() || selection_start >= selection_end {
             return Vec::new();
         }
-        let boxes = self.geo.doc.boxes();
+        let view = self.geo.doc.view();
+        let boxes = view.boxes();
         let mut selections = Vec::new();
         for table_box in (0..boxes.len()).filter(|&index| boxes.is_table(index)) {
             let Some(table) = boxes.table(table_box) else { continue };
-            let cells = table.rows().iter().flat_map(|row| row.cells()).filter_map(|cell| self.geo.doc.cell_glyph_range(table_box, cell).map(|glyphs| (cell, glyphs))).collect::<Vec<_>>();
+            let cells = table.rows().iter().flat_map(|row| row.cells()).filter_map(|cell| cell.glyphs().map(|glyphs| (cell, glyphs))).collect::<Vec<_>>();
             let touched = cells.iter().filter(|(_, glyphs)| glyphs.start < selection_end && glyphs.end > selection_start).collect::<Vec<_>>();
             if touched.is_empty() {
                 continue;
@@ -598,15 +494,20 @@ impl<'a> SelectionView<'a> {
     }
 
     pub fn build_semantic_selection_text(&self, selection_start: u32, selection_end: u32) -> (Option<String>, Option<String>) {
-        let mut units = self.semantic_text_units(selection_start, selection_end);
+        let export = self.geo.doc.view().export();
+        // Discovery is shared with highlighting; serialization happens only
+        // when copying. Failed promotion leaves the ordinary selection intact.
+        let mut units = self.semantic_text_units(selection_start, selection_end).into_iter().filter_map(|unit| {
+            export.markdown_for_box(unit.box_idx).map(|markdown| (unit.glyph_start, unit.glyph_end, markdown))
+        }).collect::<Vec<_>>();
         units.extend(self.semantic_table_selections(selection_start, selection_end).into_iter().filter_map(|selection| {
-            table_markdown(&selection.table, Some(selection.range)).map(|markdown| SemanticMarkdownUnit { glyph_start: selection.glyph_start, glyph_end: selection.glyph_end, glyph_ranges: selection.cell_glyph_ranges, markdown })
+            table_selection_markdown(&selection.table, selection.range).map(|markdown| (selection.glyph_start, selection.glyph_end, markdown))
         }));
-        units.sort_by_key(|unit| unit.glyph_start);
+        units.sort_by_key(|unit| unit.0);
         if units.is_empty() {
-            return self.geo.doc.build_selection_text(selection_start, selection_end);
+            return export.selection_text(selection_start..selection_end);
         }
-        let plain = self.geo.doc.build_selection_text(selection_start, selection_end).0;
+        let plain = export.plain_text(selection_start..selection_end);
         let mut markdown = String::new();
         let mut cursor = selection_start;
         let append = |target: &mut String, value: &str| {
@@ -618,22 +519,16 @@ impl<'a> SelectionView<'a> {
             }
             target.push_str(value);
         };
-        for unit in units {
-            let ordinary_end = unit.glyph_start.min(selection_end);
-            if cursor < ordinary_end {
-                let (_, segment_markdown) = self.geo.doc.build_selection_text(cursor, ordinary_end);
-                if let Some(value) = segment_markdown.as_deref() {
-                    append(&mut markdown, value);
-                }
+        for (start, end, value) in units {
+            let ordinary_end = start.min(selection_end);
+            if cursor < ordinary_end && let Some(value) = export.markdown(cursor..ordinary_end) {
+                append(&mut markdown, &value);
             }
-            append(&mut markdown, &unit.markdown);
-            cursor = cursor.max(unit.glyph_end);
+            append(&mut markdown, &value);
+            cursor = cursor.max(end);
         }
-        if cursor < selection_end {
-            let (_, segment_markdown) = self.geo.doc.build_selection_text(cursor, selection_end);
-            if let Some(value) = segment_markdown.as_deref() {
-                append(&mut markdown, value);
-            }
+        if cursor < selection_end && let Some(value) = export.markdown(cursor..selection_end) {
+            append(&mut markdown, &value);
         }
         (plain, (!markdown.is_empty()).then_some(markdown))
     }
@@ -676,15 +571,13 @@ impl<'a> SelectionView<'a> {
     pub fn copy_table_at(&self, position: Point) -> Option<String> {
         let hit = self.table_hit(position)?;
         let table = self.geo.doc.boxes().table(hit.table_box)?;
-        let markdown = table_markdown(&table, None)?;
-        Some(markdown)
+        table.markdown()
     }
 
     pub fn copy_table_unstyled_html_at(&self, position: Point) -> Option<String> {
         let hit = self.table_hit(position)?;
         let table = self.geo.doc.boxes().table(hit.table_box)?;
-        let html = table_unstyled_html(&table)?;
-        Some(html)
+        table.unstyled_html()
     }
 
     pub fn copy_table_styled_html_at(&self, position: Point) -> Option<String> {
@@ -699,8 +592,7 @@ impl<'a> SelectionView<'a> {
     pub fn copy_table_selection(&self) -> Option<String> {
         let range = self.table.range()?;
         let table = self.geo.doc.boxes().table(range.table_box)?;
-        let markdown = table_markdown(&table, Some(range))?;
-        Some(markdown)
+        table_selection_markdown(&table, range)
     }
 
     pub fn paint_table_selection(&self, painter: &mut impl Painter) {
@@ -771,10 +663,7 @@ fn cell_intersects(cell: &RenderTableCell, range: TableCellRange) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SelectionMode, SelectionState, TableCellRange, table_markdown, table_plain_text,
-        table_unstyled_html,
-    };
+    use super::{SelectionMode, SelectionState, TableCellRange, table_selection_markdown};
     use html::layout::LayoutConstraints;
     use html::pipeline::DocumentFactory;
     use html::layout::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper};
@@ -862,14 +751,13 @@ mod tests {
         let document = shaped.layout(LayoutConstraints::new(500.0, 20.0).unwrap());
         let boxes = document.render_view().boxes();
         let table = (0..boxes.len()).find(|&index| boxes.is_table(index)).and_then(|index| boxes.table(index)).unwrap();
-        assert_eq!(table_markdown(&table, None).as_deref(), Some("| A \\| B |  |\n| --- | --- |\n| One | Two & more |\n|  | Three |"));
-        assert_eq!(table_plain_text(&table, None).as_deref(), Some("A | B\t\nOne\tTwo & more\n\tThree"));
-        assert_eq!(table_unstyled_html(&table).as_deref(), Some("<table><tr><th colspan=\"2\">A | B</th></tr><tr><td rowspan=\"2\">One</td><td>Two &amp; more</td></tr><tr><td>Three</td></tr></table>"));
+        assert_eq!(table.markdown().as_deref(), Some("| A \\| B |  |\n| --- | --- |\n| One | Two & more |\n|  | Three |"));
+        assert_eq!(table.unstyled_html().as_deref(), Some("<table><tr><th colspan=\"2\">A | B</th></tr><tr><td rowspan=\"2\">One</td><td>Two &amp; more</td></tr><tr><td>Three</td></tr></table>"));
         assert!(table.authored_html().contains("class=\"ledger\""));
         assert!(table.authored_html().contains("style=\"color:red\""));
         assert!(!table.authored_html().contains("onclick"));
 
         let range = TableCellRange { table_box: table.box_idx(), row_start: 1, row_end: 2, column_start: 1, column_end: 1 };
-        assert_eq!(table_markdown(&table, Some(range)).as_deref(), Some("|  |\n| --- |\n| Two & more |\n| Three |"));
+        assert_eq!(table_selection_markdown(&table, range).as_deref(), Some("|  |\n| --- |\n| Two & more |\n| Three |"));
     }
 }

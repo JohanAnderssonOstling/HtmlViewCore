@@ -1,18 +1,20 @@
 use kurbo::{Point, Size};
 
+use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPage;
+use crate::spine_item::SessionDocument;
 use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
 use html::pipeline::PipelineInputs;
 
 impl RendererCore {
-    fn visible_view_for_doc(&self, doc: usize) -> Option<&crate::document_view::DocumentView> {
+    fn visible_view_for_doc(&self, doc: usize) -> Option<&DocumentView<SessionDocument>> {
         (doc == self.nav.location().document()).then_some(&self.page.view)
     }
 
     fn visible_view_mut_for_doc(
         &mut self,
         doc: usize,
-    ) -> Option<&mut crate::document_view::DocumentView> {
+    ) -> Option<&mut DocumentView<SessionDocument>> {
         (doc == self.nav.location().document()).then_some(&mut self.page.view)
     }
 
@@ -119,7 +121,7 @@ impl RendererCore {
         Self::visible_text_for_view(&self.page.view)
     }
 
-    fn visible_text_for_view(view: &crate::document_view::DocumentView) -> String {
+    fn visible_text_for_view(view: &DocumentView<SessionDocument>) -> String {
         let text_view = view.document.render_view().text();
         let mut visible_glyphs = Vec::new();
         for (line_index, _) in view.frame.page().line_positions().iter() {
@@ -277,8 +279,7 @@ impl RendererCore {
         if self.nav.location().anchor_update_pending() {
             let view = html_view_navigate::NavView {
                 doc: html_view_doc::DocQuery::new(&self.page.view.document),
-                source: &self.page.source_index,
-                viewport: &self.viewport,
+                    viewport: &self.viewport,
                 frame: &self.page.view.frame,
             };
             self.nav.update_nav_anchor_from_layout(view);
@@ -337,7 +338,7 @@ impl RendererCore {
             return false;
         }
         let geometry = view.geometry();
-        let Some(line_idx) = view.doc().find_line_for_glyph(hit.glyph) else {
+        let Some(line_idx) = view.doc().text().line_index_for_glyph(hit.glyph) else {
             return false;
         };
         let Some(screen) = view.frame.page().line_positions().get(line_idx) else {
@@ -429,12 +430,12 @@ impl RendererCore {
             let suffix_end = end.saturating_add(48).min(glyph_count);
             let prefix = view
                 .doc()
-                .build_selection_text(prefix_start, start)
+                .view().export().selection_text(prefix_start..start)
                 .0
                 .filter(|value| !value.is_empty());
             let suffix = view
                 .doc()
-                .build_selection_text(end, suffix_end)
+                .view().export().selection_text(end..suffix_end)
                 .0
                 .filter(|value| !value.is_empty());
             self.host.emit(crate::RendererEvent::SelectionFinished {

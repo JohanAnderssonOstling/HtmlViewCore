@@ -18,7 +18,7 @@ impl RendererCore {
         if doc != self.nav.location().document() {
             return;
         }
-        let range = self.doc().glyph_range_for_anchor(&fragment);
+        let range = self.doc().view().addressing().glyph_range_for_anchor(&fragment);
         self.media_overlay.set_visible(range);
     }
 
