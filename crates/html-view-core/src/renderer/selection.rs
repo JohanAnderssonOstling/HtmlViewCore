@@ -23,7 +23,8 @@ impl RendererCore {
 
     /// The same, for an annotation already on the page.
     pub(crate) fn annotation_bounds(&self, id: &str) -> Option<Rect> {
-        let (start, end) = self.annotations.glyph_range(id)?;
+        let range = self.annotations.glyph_range(id)?;
+        let (start, end) = (range.start, range.end);
         self.painted_bounds(self.text_geometry().glyph_range_bounds(start, end))
     }
 

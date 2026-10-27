@@ -2,9 +2,11 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::document_view::DocumentView;
 use crate::spine_item::SpineItem;
-use crate::{DocAnchor, GlyphShaper, LaidOutDocument, NavigationState, RendererCore, RendererEvent, RendererHost, RendererInitialConfig, RendererPreparation, ResourceProvider, TocEntry, ViewportState, load};
+use crate::{
+    DocAnchor, GlyphShaper, NavigationState, RendererCore, RendererEvent, RendererHost,
+    RendererInitialConfig, RendererPreparation, ResourceProvider, ViewportState, load,
+};
 use html::resources::ImageLoader;
 use html_view_doc::DocQuery;
 use html_view_navigate::{NavContext, NavView};
@@ -13,11 +15,11 @@ use html_view_navigate::{NavContext, NavView};
 mod href;
 #[path = "nav/notes.rs"]
 mod notes;
-#[path = "nav/spine.rs"]
-mod spine;
 #[path = "nav/pending.rs"]
 mod pending;
-pub(crate) use pending::{PendingNavigation, NavigationRequest};
+#[path = "nav/spine.rs"]
+mod spine;
+pub(crate) use pending::{NavigationRequest, PendingNavigation};
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct ColumnViewportRequest {
@@ -41,7 +43,14 @@ impl RendererPreparation {
         nav_state: Option<&str>,
         config: RendererInitialConfig,
     ) -> Result<Self, String> {
-        Self::from_provider_with_nav_and_target(provider, document_uris, start_index, nav_state, None, config)
+        Self::from_provider_with_nav_and_target(
+            provider,
+            document_uris,
+            start_index,
+            nav_state,
+            None,
+            config,
+        )
     }
 
     pub fn from_provider_with_nav_and_target(
@@ -56,9 +65,14 @@ impl RendererPreparation {
             return Err("publication contains no HTML documents".to_owned());
         }
         let saved_nav_state = nav_state.map(str::to_owned);
-        let (saved_doc_index, saved_glyph_index) = saved_nav_state.as_deref().and_then(RendererCore::parse_nav_state).unwrap_or((start_index, 0));
+        let (saved_doc_index, saved_glyph_index) = saved_nav_state
+            .as_deref()
+            .and_then(RendererCore::parse_nav_state)
+            .unwrap_or((start_index, 0));
         let saved_doc_index = saved_doc_index.min(document_uris.len().saturating_sub(1));
-        let initial_location = initial_target.and_then(|href| Self::resolve_initial_target(provider.as_ref(), &document_uris, saved_doc_index, href));
+        let initial_location = initial_target.and_then(|href| {
+            Self::resolve_initial_target(provider.as_ref(), &document_uris, saved_doc_index, href)
+        });
         let (doc_index, glyph_index, nav_state, initial_anchor) = match initial_location {
             Some((doc_index, anchor)) => (doc_index, 0, None, anchor),
             None => (saved_doc_index, saved_glyph_index, saved_nav_state, None),
@@ -77,7 +91,17 @@ impl RendererPreparation {
                 note_display: config.note_display,
             },
         )?;
-        Ok(Self { loaded, provider, image_loader: None, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config })
+        Ok(Self {
+            loaded,
+            provider,
+            image_loader: None,
+            document_uris,
+            doc_index,
+            glyph_index,
+            nav_state,
+            initial_anchor,
+            config,
+        })
     }
 
     fn resolve_initial_target(
@@ -95,7 +119,11 @@ impl RendererPreparation {
         }
         let base_uri = document_uris.get(base_index)?;
         let resolved = provider.resolve(base_uri, path);
-        let mut matches = document_uris.iter().enumerate().filter(|(_, uri)| *uri == &resolved).map(|(index, _)| index);
+        let mut matches = document_uris
+            .iter()
+            .enumerate()
+            .filter(|(_, uri)| *uri == &resolved)
+            .map(|(index, _)| index);
         let doc_index = matches.next()?;
         if matches.next().is_some() {
             return None;
@@ -107,8 +135,7 @@ impl RendererPreparation {
 impl RendererCore {
     pub(crate) fn nav_view(&self) -> NavView<'_> {
         NavView {
-            doc: DocQuery::new(&self.page.view.document),
-            source: &self.page.source_index,
+            doc: DocQuery::from_view(self.page.view.document.render_view()),
             viewport: &self.viewport,
             frame: &self.page.view.frame,
         }
@@ -120,8 +147,7 @@ impl RendererCore {
         (
             &mut self.nav,
             NavContext {
-                doc: DocQuery::new(&self.page.view.document),
-                source: &self.page.source_index,
+                doc: DocQuery::from_view(self.page.view.document.render_view()),
                 viewport: &mut self.viewport,
                 frame: &self.page.view.frame,
                 host: self.host.as_ref(),
@@ -142,6 +168,7 @@ impl RendererCore {
     pub fn next_line(&mut self, glyph_shaper: &mut impl GlyphShaper) {
         let (nav, mut cx) = self.nav_cx();
         if nav.next_line(&mut cx) {
+            self.cancel_pending_navigation();
             return;
         }
         self.continue_past_page(glyph_shaper);
@@ -153,6 +180,7 @@ impl RendererCore {
             nav.prev_line(&mut cx)
         };
         if moved_within_document {
+            self.cancel_pending_navigation();
             return;
         }
         if self.nav.location().document() > 0 {
@@ -161,6 +189,8 @@ impl RendererCore {
                 self.nav.location().document() - 1,
                 DocAnchor::End,
             );
+        } else {
+            self.cancel_pending_navigation();
         }
     }
 
@@ -192,8 +222,16 @@ impl RendererCore {
         nav_state: Option<&str>,
         config: RendererInitialConfig,
     ) -> Self {
-        let prepared = RendererPreparation::from_provider_with_nav(provider, document_uris, start_index, nav_state, config).expect("initial renderer preparation should succeed");
-        Self::from_preparation(host, glyph_shaper, prepared).expect("initial renderer shaping should succeed")
+        let prepared = RendererPreparation::from_provider_with_nav(
+            provider,
+            document_uris,
+            start_index,
+            nav_state,
+            config,
+        )
+        .expect("initial renderer preparation should succeed");
+        Self::from_preparation(host, glyph_shaper, prepared)
+            .expect("initial renderer shaping should succeed")
     }
 
     pub fn from_preparation(
@@ -201,10 +239,31 @@ impl RendererCore {
         glyph_shaper: &mut impl GlyphShaper,
         prepared: RendererPreparation,
     ) -> Result<Self, String> {
-        let RendererPreparation { loaded, provider, image_loader, document_uris, doc_index, glyph_index, nav_state, initial_anchor, config } = prepared;
+        let RendererPreparation {
+            loaded,
+            provider,
+            image_loader,
+            document_uris,
+            doc_index,
+            glyph_index,
+            nav_state,
+            initial_anchor,
+            config,
+        } = prepared;
         let restoring_position = nav_state.is_some();
+        host.set_font_overrides(&loaded.inputs().reader_overrides);
+        host.set_glyph_document(doc_index);
+        host.prepare_font_faces(loaded.session.font_faces(), provider.clone());
         let loaded = load::finish_prepared_document(loaded, glyph_shaper)?;
-        let mut renderer = Self::new_with_image_loader(host, loaded, provider, document_uris, doc_index, config, image_loader);
+        let mut renderer = Self::new_with_image_loader(
+            host,
+            loaded,
+            provider,
+            document_uris,
+            doc_index,
+            config,
+            image_loader,
+        );
 
         if let Some(anchor) = initial_anchor {
             renderer.navigate_to_href(glyph_shaper, &format!("#{anchor}"));
@@ -227,25 +286,6 @@ impl RendererCore {
         }
         renderer.update_nav_signal();
         Ok(renderer)
-    }
-
-    pub fn build_document_toc_entries_for(document: &LaidOutDocument) -> Vec<TocEntry> {
-        fn convert_nodes(
-            view: html::layout::RenderView<'_>,
-            nodes: &[crate::DocumentTocNode],
-        ) -> Vec<TocEntry> {
-            nodes
-                .iter()
-                .map(|node| TocEntry {
-                    title: view.string(node.title).to_string(),
-                    link: view.string(node.href).to_string(),
-                    children: convert_nodes(view, node.children.as_slice()),
-                })
-                .collect()
-        }
-
-        let view = document.render_view();
-        convert_nodes(view, view.document_toc_entries())
     }
 
     /// Builds a spine item out of a freshly loaded document, at the column
@@ -292,6 +332,9 @@ impl RendererCore {
         } else if continuation.next_start_offset_y() > composition.start_offset_y() {
             next_start_offset_y = continuation.next_start_offset_y();
         }
+        // Local navigation supersedes an earlier chapter read. Boundary
+        // turns still go through load_document_at, which reuses pending reads.
+        self.cancel_pending_navigation();
         self.cache_current_prepared_page();
         let (nav, mut cx) = self.nav_cx();
         nav.advance_to_forward_offset(&mut cx, next_start_offset_y);
@@ -303,6 +346,8 @@ impl RendererCore {
         let next = self.nav.location().document() + 1;
         if next < self.nav.documents().uris().len() {
             self.load_document_at(glyph_shaper, next, DocAnchor::Start);
+        } else {
+            self.cancel_pending_navigation();
         }
     }
 
@@ -317,11 +362,13 @@ impl RendererCore {
                 );
                 return;
             }
+            self.cancel_pending_navigation();
             let (nav, mut cx) = self.nav_cx();
             nav.restore_forward_offset(&mut cx, 0.0);
             return;
         }
 
+        self.cancel_pending_navigation();
         let back_anchor_end_line = self
             .page
             .view
@@ -379,8 +426,8 @@ impl RendererCore {
         glyph_shaper: &mut impl GlyphShaper,
         column_width: f64,
     ) -> Result<(), html::pipeline::PipelineError> {
-        let next = self.next_pipeline_inputs_for_layout(column_width);
-        self.apply_pipeline_inputs(next, glyph_shaper)
+        let next = self.pipeline_changes_for_layout(column_width);
+        self.apply_pipeline_changes(next, glyph_shaper)
     }
 
     pub fn set_root_font_size(&mut self, glyph_shaper: &mut impl GlyphShaper, new_size: f32) {
@@ -389,8 +436,8 @@ impl RendererCore {
         if (rounded - self.root_font_size).abs() < f32::EPSILON {
             return;
         }
-        let next = self.next_pipeline_inputs_for_style(rounded);
-        match self.apply_pipeline_inputs(next, glyph_shaper) {
+        let next = self.pipeline_changes_for_style(rounded);
+        match self.apply_pipeline_changes(next, glyph_shaper) {
             Ok(()) => self
                 .host
                 .emit(RendererEvent::FontSizeChanged(self.root_font_size)),
@@ -431,8 +478,17 @@ impl RendererCore {
         }
     }
 
-    pub fn set_column_viewport_plan(&mut self, glyph_shaper: &mut impl GlyphShaper, available_width: f64, column_width: f64, column_count: u8, column_gap: f64) {
-        if !available_width.is_finite() || available_width <= 0.0 { return; }
+    pub fn set_column_viewport_plan(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        available_width: f64,
+        column_width: f64,
+        column_count: u8,
+        column_gap: f64,
+    ) {
+        if !available_width.is_finite() || available_width <= 0.0 {
+            return;
+        }
         let width = column_width.clamp(200.0, 1200.0).round();
         let layout = &self.page.view.layout;
         let request = ColumnViewportRequest {
@@ -453,10 +509,11 @@ impl RendererCore {
         }
         self.page.view.layout.size.width = request.available_width;
         if (width - self.page.view.layout.col_width).abs() >= 0.1
-            && let Err(error) = self.relayout_for_column_width(glyph_shaper, width) {
-                self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
-                return;
-            }
+            && let Err(error) = self.relayout_for_column_width(glyph_shaper, width)
+        {
+            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
+            return;
+        }
         self.page.view.layout.base_col_width = width;
         self.page.view.layout.col_width = width;
         self.page.view.layout.col_count = f64::from(request.column_count);

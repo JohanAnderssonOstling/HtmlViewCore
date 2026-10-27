@@ -20,7 +20,7 @@ pub(crate) struct PreparedPage {
 }
 
 impl PreparedPage {
-    pub(crate) fn install(self, view: &mut DocumentView, viewport: &mut ViewportState) {
+    pub(crate) fn install<D>(self, view: &mut DocumentView<D>, viewport: &mut ViewportState) {
         viewport.install_forward_page(self.frame.page().paint_start_offset_y(), self.continuation);
         view.frame = self.frame;
     }

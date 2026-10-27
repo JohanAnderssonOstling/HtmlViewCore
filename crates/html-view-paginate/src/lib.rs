@@ -18,94 +18,7 @@ use std::collections::{HashMap, HashSet};
 mod semantic_keeps;
 mod vertical_rhythm;
 
-// These epub/ARIA predicates are pagination's own. `semantic_keeps` carries a
-// similar pair whose `has_token` additionally matches namespace-prefixed tokens
-// (`foo:chapter`). The two have always differed; unifying them would widen what
-// counts as a sidebar or chapter start, so they stay separate until that is a
-// deliberate decision.
-const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
-
-fn has_token(value: Option<&str>, expected: &str) -> bool {
-    value.is_some_and(|value| {
-        value
-            .split_ascii_whitespace()
-            .any(|token| token.eq_ignore_ascii_case(expected))
-    })
-}
-
-fn has_epub_type(boxes: html::layout::RenderBoxView<'_>, box_idx: usize, expected: &str) -> bool {
-    has_token(
-        boxes
-            .attribute(box_idx, "epub:type")
-            .or_else(|| boxes.attribute_expanded(box_idx, Some(EPUB_NAMESPACE), "type")),
-        expected,
-    )
-}
-
-fn is_semantic_sidebar(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    let is_note = ["footnote", "endnote", "rearnote"]
-        .iter()
-        .any(|kind| has_epub_type(boxes, box_idx, kind))
-        || ["doc-footnote", "doc-endnote"]
-            .iter()
-            .any(|role| has_token(boxes.attribute(box_idx, "role"), role));
-    !is_note
-        && (has_epub_type(boxes, box_idx, "sidebar")
-            || has_token(boxes.attribute(box_idx, "role"), "complementary")
-            || boxes
-                .tag(box_idx)
-                .is_some_and(|tag| tag.eq_ignore_ascii_case("aside")))
-}
-
-fn is_semantic_page_start(boxes: html::layout::RenderBoxView<'_>, box_idx: usize) -> bool {
-    const EPUB_TYPES: &[&str] = &[
-        "chapter",
-        "part",
-        "appendix",
-        "prologue",
-        "epilogue",
-        "foreword",
-        "preface",
-        "introduction",
-        "conclusion",
-        "acknowledgments",
-        "afterword",
-        "bibliography",
-        "glossary",
-        "index",
-        "colophon",
-        "titlepage",
-        "halftitlepage",
-        "copyright-page",
-        "frontmatter",
-        "bodymatter",
-        "backmatter",
-    ];
-    const DPUB_ROLES: &[&str] = &[
-        "doc-chapter",
-        "doc-part",
-        "doc-appendix",
-        "doc-prologue",
-        "doc-epilogue",
-        "doc-foreword",
-        "doc-preface",
-        "doc-introduction",
-        "doc-conclusion",
-        "doc-acknowledgments",
-        "doc-afterword",
-        "doc-bibliography",
-        "doc-glossary",
-        "doc-index",
-        "doc-colophon",
-    ];
-
-    EPUB_TYPES
-        .iter()
-        .any(|kind| has_epub_type(boxes, box_idx, kind))
-        || DPUB_ROLES
-            .iter()
-            .any(|role| has_token(boxes.attribute(box_idx, "role"), role))
-}
+use html::layout::ContentRole;
 
 pub fn initial_render_state() -> RenderState {
     RenderState {
@@ -373,11 +286,13 @@ fn pagination_boundary_anchors(
     for box_idx in candidates.iter().copied() {
         let next = if let Some(last) = last_line.get(&box_idx).copied() {
             line_owners.iter().find_map(|&(line_idx, owner)| {
-                (line_idx > last && !doc.box_descends_from(owner, box_idx)).then_some(line_idx)
+                (line_idx > last && !doc.view().semantics().contains(box_idx, owner))
+                    .then_some(line_idx)
             })
         } else {
             line_owners.iter().find_map(|&(line_idx, owner)| {
-                (owner > box_idx && !doc.box_descends_from(owner, box_idx)).then_some(line_idx)
+                (owner > box_idx && !doc.view().semantics().contains(box_idx, owner))
+                    .then_some(line_idx)
             })
         };
         if let Some(next) = next {
@@ -654,7 +569,7 @@ impl<'a> Paginator<'a> {
             // affects this work.
             leading_headers.clear();
             let mut scan = table_idx.saturating_add(1);
-            while scan < boxes.len() && self.doc.box_descends_from(scan, table_idx) {
+            while scan < boxes.len() && self.doc.view().semantics().contains(table_idx, scan) {
                 if !boxes.is_table_row(scan) {
                     scan += 1;
                     continue;
@@ -668,16 +583,19 @@ impl<'a> Paginator<'a> {
                 let mut header_cell_count = 0usize;
                 scan += 1;
                 while scan < boxes.len()
-                    && self.doc.box_descends_from(scan, table_idx)
+                    && self.doc.view().semantics().contains(table_idx, scan)
                     && !boxes.is_table_row(scan)
                 {
                     if boxes.is_table_cell(scan)
                         && boxes.ancestors(scan).any(|ancestor| ancestor == row)
                     {
                         cell_count += 1;
-                        if boxes
-                            .tag(scan)
-                            .is_some_and(|tag| tag.eq_ignore_ascii_case("th"))
+                        if self
+                            .doc
+                            .view()
+                            .semantics()
+                            .content(scan)
+                            .has_role(ContentRole::TableHeaderCell)
                         {
                             header_cell_count += 1;
                         }
@@ -810,21 +728,21 @@ impl<'a> Paginator<'a> {
                 continue;
             };
             let bottom = point.y + size.height;
-            let tag = boxes.tag(box_idx);
+            let semantics = self.doc.view().semantics().content(box_idx);
             range_lines.clear();
             if boxes.is_block_container(box_idx) {
                 collect_lines_in_range(lines_by_y, point.y, bottom, range_lines);
             }
             let has_forced_inside = anchors.boxes().any(|descendant| {
                 descendant != box_idx
-                    && self.doc.box_descends_from(descendant, box_idx)
+                    && self.doc.view().semantics().contains(box_idx, descendant)
                     && (boxes.forces_break_before(descendant)
                         || boxes.forces_break_after(descendant))
             });
             if (boxes.avoids_break_inside(box_idx)
                 || (self.book_optimized
-                    && (tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figure"))
-                        || is_semantic_sidebar(boxes, box_idx))))
+                    && (semantics.has_role(ContentRole::Figure)
+                        || semantics.has_role(ContentRole::Sidebar))))
                 && !has_forced_inside
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && let Some(event) = self.keep_range_event(trigger_line, point.y, bottom)
@@ -898,14 +816,14 @@ impl<'a> Paginator<'a> {
                 };
                 let previous_bottom = previous_point.y + previous_size.height;
                 let next_bottom = next_point.y + next_size.height;
-                let previous_tag = boxes.tag(previous);
-                let next_tag = boxes.tag(next);
+                let previous_semantics = self.doc.view().semantics().content(previous);
+                let next_semantics = self.doc.view().semantics().content(next);
 
                 if boxes.avoids_break_after(previous)
                     || boxes.avoids_break_before(next)
                     || (self.book_optimized
-                        && (previous_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))
-                            || next_tag.is_some_and(|tag| tag.eq_ignore_ascii_case("figcaption"))))
+                        && (previous_semantics.has_role(ContentRole::Caption)
+                            || next_semantics.has_role(ContentRole::Caption)))
                 {
                     let group_top = previous_point.y.min(next_point.y);
                     let group_bottom = previous_bottom.max(next_bottom);
@@ -915,13 +833,7 @@ impl<'a> Paginator<'a> {
                     {
                         events.push(event);
                     }
-                } else if self.book_optimized
-                    && previous_tag.is_some_and(|tag| {
-                        ["h1", "h2", "h3", "h4", "h5", "h6"]
-                            .iter()
-                            .any(|heading| tag.eq_ignore_ascii_case(heading))
-                    })
-                {
+                } else if self.book_optimized && previous_semantics.has_role(ContentRole::Heading) {
                     range_lines.clear();
                     collect_lines_in_range(lines_by_y, next_point.y, next_bottom, range_lines);
                     let required_bottom = range_lines
@@ -1026,7 +938,12 @@ impl<'a> Paginator<'a> {
         }
         for box_idx in anchors.boxes() {
             if self.book_optimized
-                && is_semantic_page_start(boxes, box_idx)
+                && self
+                    .doc
+                    .view()
+                    .semantics()
+                    .content(box_idx)
+                    .has_role(ContentRole::MajorSection)
                 && let Some(trigger_line) = anchors.before(box_idx)
                 && !authored_boundary.contains(&trigger_line)
                 && let Some(point) = boxes.point(box_idx)
@@ -1062,36 +979,6 @@ impl<'a> Paginator<'a> {
         }
         events.clear();
         events.extend(merged.drain(..));
-    }
-
-    /// The row-group pagination bounds covering `y`, if any. Exercised by the
-    /// renderer's table-pagination tests, which live in another crate and so
-    /// cannot reach a `#[cfg(test)]` item here.
-    pub fn table_row_group_bounds_containing(&self, y: f64) -> Option<(f64, f64)> {
-        let start = self.doc.start_line_at(y, 0.1);
-        let mut anchors = BoundaryAnchors::default();
-        pagination_boundary_anchors(self.doc, start, start, &mut anchors);
-        let mut events = Vec::new();
-        let mut table_indices = Vec::new();
-        let mut rows_by_table = Vec::new();
-        let mut row_spans = HashMap::new();
-        let mut leading_headers = Vec::new();
-        self.table_pagination_events(
-            &anchors,
-            &mut events,
-            &mut table_indices,
-            &mut rows_by_table,
-            &mut row_spans,
-            &mut leading_headers,
-        );
-        events
-            .into_iter()
-            .find(|event| {
-                event.kind == TablePaginationEventKind::RowGroup
-                    && event.top <= y + 0.01
-                    && event.bottom > y + 0.01
-            })
-            .map(|event| (event.top, event.bottom))
     }
 }
 
@@ -1141,7 +1028,12 @@ impl Paginator<'_> {
                 next_start_offset_y: 0.0,
             };
         };
-        let end_height = self.doc.effective_line_height(end_line, end_data.height());
+        let end_height = self
+            .doc
+            .view()
+            .geometry()
+            .line_vertical_bounds(end_line)
+            .map_or(end_data.height(), |bounds| bounds.end - end_data.point().y);
         let end_bottom = end_data.point().y + end_height;
         let mut render_state = initial_render_state();
         let mut reversed = std::mem::take(&mut scratch.reverse_positions);
@@ -1151,7 +1043,12 @@ impl Paginator<'_> {
         let range_trigger = |top: f64, bottom: f64| {
             (minimum_line..=end_line).rev().find(|&line_idx| {
                 lines.get(line_idx).is_some_and(|line| {
-                    let height = self.doc.effective_line_height(line_idx, line.height());
+                    let height = self
+                        .doc
+                        .view()
+                        .geometry()
+                        .line_vertical_bounds(line_idx)
+                        .map_or(line.height(), |bounds| bounds.end - line.point().y);
                     line.point().y < bottom - 0.01 && line.point().y + height > top + 0.01
                 })
             })
@@ -1190,7 +1087,12 @@ impl Paginator<'_> {
             let line = lines
                 .get(line_idx)
                 .expect("reverse line index must stay within line count");
-            let effective_height = self.doc.effective_line_height(line_idx, line.height());
+            let effective_height = self
+                .doc
+                .view()
+                .geometry()
+                .line_vertical_bounds(line_idx)
+                .map_or(line.height(), |bounds| bounds.end - line.point().y);
             let reverse_y = (end_bottom - (line.point().y + effective_height)).max(0.0);
 
             if line_idx < end_line
@@ -1298,7 +1200,11 @@ impl Paginator<'_> {
         rhythm_scratch: Option<&mut VerticalRhythmScratch>,
     ) -> PagePositions {
         let lines = self.doc.text().lines();
-        let start_line = self.doc.start_line_at(start_offset_y, 0.1);
+        let start_line = self
+            .doc
+            .view()
+            .geometry()
+            .start_line_at(start_offset_y, 0.1);
         let mut table_event_idx =
             table_events.partition_point(|event| event.trigger_line < start_line);
         let mut forced_break_event_idx =
@@ -1370,7 +1276,12 @@ impl Paginator<'_> {
             let line = lines
                 .get(line_idx)
                 .expect("line index must stay within line_count");
-            let effective_height = self.doc.effective_line_height(line_idx, line.height());
+            let effective_height = self
+                .doc
+                .view()
+                .geometry()
+                .line_vertical_bounds(line_idx)
+                .map_or(line.height(), |bounds| bounds.end - line.point().y);
             let oversized = effective_height > self.layout.size.height;
             // An indivisible line taller than a column can never satisfy the
             // normal fit check. Fit it as one column-high atomic item so a
@@ -1452,8 +1363,8 @@ impl Paginator<'_> {
 mod tests {
     use super::*;
     use html::layout::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, LaidOutDocument,
-        LayoutConstraints,
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+        LaidOutDocument, LayoutConstraints,
     };
     use html::pipeline::DocumentFactory;
     use kurbo::Size;
@@ -1464,23 +1375,23 @@ mod tests {
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
-        glyph_store: GlyphResourceStore,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
+        generation: GlyphResourceGeneration,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
-            self.glyph_store.clear();
+            self.generation = GlyphResourceGeneration::default();
         }
 
-        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
-            &mut self.glyph_store
+        fn resource_generation(&self) -> GlyphResourceGeneration {
+            self.generation
         }
 
         fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
             assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
         }
 
@@ -1491,7 +1402,7 @@ mod tests {
         fn rollback_append_shaping(&mut self) {
             if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
                 self.glyphs = glyphs;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
             }
         }
 
@@ -1503,6 +1414,7 @@ mod tests {
             _slant: FontSlant,
             _color: u32,
             _family: Option<&str>,
+            resources: &mut GlyphResourceStore,
         ) -> Result<GlyphId, html::layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
@@ -1516,20 +1428,28 @@ mod tests {
                 font_size * 0.75,
             )
             .map_err(html::layout::ShapeError::rejected_metric)?;
-            let glyph = self.glyph_store.register(metric)?;
+            let glyph = resources.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
     }
 
-    fn layout(html: &str, width: f64) -> LaidOutDocument {
+    fn layout(
+        html: &str,
+        width: f64,
+        resources: &mut GlyphResourceStore,
+    ) -> LaidOutDocument<'static> {
         let mut factory = DocumentFactory::new();
         let mut shaper = TestShaper::default();
         factory
             .parse_with_new_pipeline(html, None)
-            .shape(&mut shaper)
+            .shape(&mut shaper, resources)
             .expect("the test shaper registers every glyph")
-            .layout(LayoutConstraints::new(width, 16.0).expect("constraints must be valid"))
+            .layout(
+                LayoutConstraints::new(width, 16.0).expect("constraints must be valid"),
+                resources,
+            )
+            .expect("test layout succeeds")
     }
 
     fn columns(width: f64, height: f64, count: f64) -> ColumnLayout {
@@ -1549,8 +1469,9 @@ mod tests {
         document: &LaidOutDocument,
         layout: &ColumnLayout,
         mode: PaginationMode,
+        resources: &GlyphResourceStore,
     ) -> Vec<(usize, i32, f64)> {
-        let paginator = Paginator::new(DocQuery::new(document), layout, mode);
+        let paginator = Paginator::new(DocQuery::new(document, resources), layout, mode);
         let page = paginator.page_at(0.0, Vec::new());
         page.positions
             .iter()
@@ -1569,15 +1490,21 @@ mod tests {
 
     #[test]
     fn page_retains_only_visible_lines_in_css_paint_order() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout(
             "<style>.front { position: relative; z-index: 2 }</style><p>first</p><p class='front'>front</p><p>last</p>",
             200.0,
+            &mut document_resources,
         );
         let geometry = columns(200.0, 200.0, 1.0);
-        let page = Paginator::new(DocQuery::new(&document), &geometry, PaginationMode::Book)
-            .page_at(0.0, Vec::new());
+        let page = Paginator::new(
+            DocQuery::new(&document, &document_resources),
+            &geometry,
+            PaginationMode::Book,
+        )
+        .page_at(0.0, Vec::new());
         let expected = document
-            .render_view()
+            .render_view(&document_resources)
             .text()
             .paint_order_indices()
             .iter()
@@ -1600,11 +1527,16 @@ mod tests {
                 format!("<p style='margin:0;height:20px;background:#{index:02x}0000'>row</p>")
             })
             .collect::<String>();
-        let document = layout(&content, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(&content, 200.0, &mut document_resources);
         let geometry = columns(200.0, 100.0, 1.0);
-        let page = Paginator::new(DocQuery::new(&document), &geometry, PaginationMode::Book)
-            .page_at(0.0, Vec::new());
-        let fragments = document.render_view().fragments();
+        let page = Paginator::new(
+            DocQuery::new(&document, &document_resources),
+            &geometry,
+            PaginationMode::Book,
+        )
+        .page_at(0.0, Vec::new());
+        let fragments = document.render_view(&document_resources).fragments();
         let expected = fragments
             .block_decorations()
             .iter()
@@ -1626,8 +1558,14 @@ mod tests {
 
     #[test]
     fn lines_that_do_not_fit_move_to_the_next_column() {
-        let document = layout(PARAGRAPHS, 200.0);
-        let placed = paginate(&document, &columns(200.0, 40.0, 2.0), PaginationMode::Book);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(PARAGRAPHS, 200.0, &mut document_resources);
+        let placed = paginate(
+            &document,
+            &columns(200.0, 40.0, 2.0),
+            PaginationMode::Book,
+            &document_resources,
+        );
 
         assert!(!placed.is_empty(), "something must be laid out");
         let columns_used: Vec<i32> = placed.iter().map(|(_, col, _)| *col).collect();
@@ -1643,9 +1581,15 @@ mod tests {
 
     #[test]
     fn every_placed_line_sits_within_its_column() {
-        let document = layout(PARAGRAPHS, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(PARAGRAPHS, 200.0, &mut document_resources);
         let geometry = columns(200.0, 40.0, 2.0);
-        for (line, _, y) in paginate(&document, &geometry, PaginationMode::Book) {
+        for (line, _, y) in paginate(
+            &document,
+            &geometry,
+            PaginationMode::Book,
+            &document_resources,
+        ) {
             assert!(y >= 0.0, "line {line} was placed above its column");
             assert!(
                 y < geometry.size.height,
@@ -1657,8 +1601,18 @@ mod tests {
 
     #[test]
     fn a_forced_break_before_moves_content_to_a_fresh_column() {
-        let document = layout("<p>aaa</p><p style='break-before: column'>bbb</p>", 200.0);
-        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), PaginationMode::Book);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(
+            "<p>aaa</p><p style='break-before: column'>bbb</p>",
+            200.0,
+            &mut document_resources,
+        );
+        let placed = paginate(
+            &document,
+            &columns(200.0, 200.0, 2.0),
+            PaginationMode::Book,
+            &document_resources,
+        );
 
         assert_eq!(column_of(&placed, 0), Some(0));
         assert_eq!(
@@ -1671,10 +1625,16 @@ mod tests {
     #[test]
     fn a_semantic_chapter_starts_a_fresh_page_under_book_composition() {
         let source = "<p>aaa</p><section epub:type='chapter'><p>bbb</p></section>";
-        let document = layout(source, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(source, 200.0, &mut document_resources);
         let layout = columns(200.0, 200.0, 2.0);
 
-        let book = paginate(&document, &layout, PaginationMode::Book);
+        let book = paginate(
+            &document,
+            &layout,
+            PaginationMode::Book,
+            &document_resources,
+        );
         assert_eq!(column_of(&book, 0), Some(0));
         assert_ne!(
             column_of(&book, 1),
@@ -1686,10 +1646,11 @@ mod tests {
     #[test]
     fn web_composition_ignores_semantic_chapter_breaks() {
         let source = "<p>aaa</p><section epub:type='chapter'><p>bbb</p></section>";
-        let document = layout(source, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(source, 200.0, &mut document_resources);
         let layout = columns(200.0, 200.0, 2.0);
 
-        let web = paginate(&document, &layout, PaginationMode::Web);
+        let web = paginate(&document, &layout, PaginationMode::Web, &document_resources);
         assert_eq!(column_of(&web, 0), Some(0));
         assert_eq!(
             column_of(&web, 1),
@@ -1703,10 +1664,16 @@ mod tests {
         // Four lines is the compact limit for a list item; the column below fits
         // three, so the whole item must move rather than split.
         let source = "<p>aaa</p><ul><li>one two three four five six seven eight</li></ul>";
-        let document = layout(source, 60.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(source, 60.0, &mut document_resources);
         let layout = columns(60.0, 60.0, 2.0);
 
-        let book = paginate(&document, &layout, PaginationMode::Book);
+        let book = paginate(
+            &document,
+            &layout,
+            PaginationMode::Book,
+            &document_resources,
+        );
         let item_lines: Vec<i32> = book.iter().skip(1).map(|(_, col, _)| *col).collect();
         assert!(
             item_lines.len() > 1,
@@ -1720,16 +1687,26 @@ mod tests {
 
     #[test]
     fn events_are_empty_under_web_composition() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout(
             "<table><tr><td>aaa</td></tr></table><section epub:type='chapter'><p>bbb</p></section>",
             200.0,
+            &mut document_resources,
         );
         let layout = columns(200.0, 200.0, 2.0);
-        let paginator = Paginator::new(DocQuery::new(&document), &layout, PaginationMode::Web);
+        let paginator = Paginator::new(
+            DocQuery::new(&document, &document_resources),
+            &layout,
+            PaginationMode::Web,
+        );
         let mut scratch = PaginationScratch::default();
         paginator.events_for_lines(
             0,
-            document.render_view().text().line_count().saturating_sub(1),
+            document
+                .render_view(&document_resources)
+                .text()
+                .line_count()
+                .saturating_sub(1),
             &mut scratch,
         );
 
@@ -1745,19 +1722,35 @@ mod tests {
 
     #[test]
     fn pagination_is_deterministic_for_the_same_inputs() {
-        let document = layout(PARAGRAPHS, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(PARAGRAPHS, 200.0, &mut document_resources);
         let layout = columns(200.0, 40.0, 2.0);
         assert_eq!(
-            paginate(&document, &layout, PaginationMode::Book),
-            paginate(&document, &layout, PaginationMode::Book)
+            paginate(
+                &document,
+                &layout,
+                PaginationMode::Book,
+                &document_resources
+            ),
+            paginate(
+                &document,
+                &layout,
+                PaginationMode::Book,
+                &document_resources
+            )
         );
     }
 
     #[test]
     fn a_later_start_offset_begins_at_a_later_line() {
-        let document = layout(PARAGRAPHS, 200.0);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout(PARAGRAPHS, 200.0, &mut document_resources);
         let layout = columns(200.0, 40.0, 2.0);
-        let paginator = Paginator::new(DocQuery::new(&document), &layout, PaginationMode::Book);
+        let paginator = Paginator::new(
+            DocQuery::new(&document, &document_resources),
+            &layout,
+            PaginationMode::Book,
+        );
         let first = paginator.page_at(0.0, Vec::new());
         let next = paginator.page_at(first.next_start_offset_y, Vec::new());
         assert!(
@@ -1770,8 +1763,14 @@ mod tests {
 
     #[test]
     fn an_empty_document_paginates_to_nothing() {
-        let document = layout("", 200.0);
-        let placed = paginate(&document, &columns(200.0, 200.0, 2.0), PaginationMode::Book);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout("", 200.0, &mut document_resources);
+        let placed = paginate(
+            &document,
+            &columns(200.0, 200.0, 2.0),
+            PaginationMode::Book,
+            &document_resources,
+        );
         assert!(placed.is_empty());
     }
 
@@ -1783,13 +1782,18 @@ mod tests {
         let trailing = (0..2_000)
             .map(|index| format!("<p>trailing {index}</p>"))
             .collect::<String>();
-        let short = layout(&prefix, 200.0);
-        let long = layout(&format!("{prefix}{trailing}"), 200.0);
+        let mut short_resources = GlyphResourceStore::default();
+        let short = layout(&prefix, 200.0, &mut short_resources);
+        let mut long_resources = GlyphResourceStore::default();
+        let long = layout(&format!("{prefix}{trailing}"), 200.0, &mut long_resources);
         let geometry = columns(200.0, 120.0, 1.0);
 
-        let candidate_count = |document: &LaidOutDocument| {
-            let paginator =
-                Paginator::new(DocQuery::new(document), &geometry, PaginationMode::Book);
+        let candidate_count = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
+            let paginator = Paginator::new(
+                DocQuery::new(document, resources),
+                &geometry,
+                PaginationMode::Book,
+            );
             let probe = paginator.build_forward_positions(0.0, Vec::new(), &[], &[], &[], None);
             let mut anchors = BoundaryAnchors::default();
             pagination_boundary_anchors(
@@ -1802,8 +1806,8 @@ mod tests {
         };
 
         assert_eq!(
-            candidate_count(&short),
-            candidate_count(&long),
+            candidate_count(&short, &short_resources),
+            candidate_count(&long, &long_resources),
             "content after the viewport must not add pagination candidates"
         );
     }
@@ -1813,12 +1817,18 @@ mod tests {
         let rows = (0..40)
             .map(|index| format!("<tr><td>body {index}</td></tr>"))
             .collect::<String>();
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout(
             &format!("<table><thead><tr><th>header</th></tr></thead><tbody>{rows}</tbody></table>"),
             200.0,
+            &mut document_resources,
         );
         let geometry = columns(200.0, 60.0, 1.0);
-        let paginator = Paginator::new(DocQuery::new(&document), &geometry, PaginationMode::Book);
+        let paginator = Paginator::new(
+            DocQuery::new(&document, &document_resources),
+            &geometry,
+            PaginationMode::Book,
+        );
 
         let first = paginator.page_at(0.0, Vec::new());
         let second = paginator.page_at(first.next_start_offset_y, Vec::new());
@@ -1839,15 +1849,17 @@ mod tests {
         let rows = (0..12)
             .map(|index| format!("<tr><td>body {index}</td></tr>"))
             .collect::<String>();
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout(
             &format!(
                 "<h1>Heading</h1><table><thead><tr><th>header</th></tr></thead><tbody>{rows}</tbody></table>"
             ),
             120.0,
+            &mut document_resources,
         );
         let geometry = columns(120.0, 80.0, 2.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document),
+            DocQuery::new(&document, &document_resources),
             &geometry,
             PaginationMode::BookWithVerticalRhythm,
         );

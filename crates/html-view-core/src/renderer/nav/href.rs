@@ -54,7 +54,9 @@ impl RendererCore {
         let Some((doc, anchor)) = self.resolve_href_target(href) else {
             return false;
         };
-        if self.defer_document_read(doc, NavigationRequest::Href(href.to_owned())) { return true; }
+        if self.defer_document_read(doc, NavigationRequest::Href(href.to_owned())) {
+            return true;
+        }
         let to = html_view_navigate::Location::new(doc, anchor);
         if !self.navigate_to_location(glyph_shaper, to.clone()) {
             return false;
@@ -66,12 +68,18 @@ impl RendererCore {
         true
     }
 
-    pub(super) fn navigate_history_step(&mut self, glyph_shaper: &mut impl GlyphShaper, step: isize) -> bool {
+    pub(super) fn navigate_history_step(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        step: isize,
+    ) -> bool {
         let Some(target) = self.nav.history.peek_step(step) else {
             self.nav.history.emit_availability(self.host.as_ref());
             return false;
         };
-        if self.defer_document_read(target.doc, NavigationRequest::History(step)) { return true; }
+        if self.defer_document_read(target.doc, NavigationRequest::History(step)) {
+            return true;
+        }
         if !self.navigate_to_location(glyph_shaper, target) {
             return false;
         }
@@ -117,8 +125,8 @@ impl RendererCore {
         }
     }
 
-    fn document_has_anchor(document: &LaidOutDocument, anchor: &str) -> bool {
-        let view = document.render_view();
+    fn document_has_anchor(document: html::layout::RenderView<'_>, anchor: &str) -> bool {
+        let view = document;
         let Some(id) = view.lookup_string(anchor) else {
             return false;
         };
@@ -136,17 +144,31 @@ impl RendererCore {
         anchor: &str,
     ) -> bool {
         if doc_index == self.nav.location().document() {
-            return Self::document_has_anchor(&self.page.view.document, anchor);
+            return Self::document_has_anchor(self.page.view.document.render_view(), anchor);
         }
         if let Some((index, loaded)) = &self.prepared_navigation {
-            if *index == doc_index { return Self::document_has_anchor(&loaded.document, anchor); }
+            if *index == doc_index {
+                return Self::document_has_anchor(
+                    loaded
+                        .session
+                        .render_view()
+                        .expect("loaded document has glyph resources"),
+                    anchor,
+                );
+            }
         }
         if let Some(item) = self.document_cache.document(doc_index) {
-            return Self::document_has_anchor(&item.view.document, anchor);
+            return Self::document_has_anchor(item.view.document.render_view(), anchor);
         }
 
         let loaded = self.load_document_for_index(glyph_shaper, doc_index);
-        let valid = Self::document_has_anchor(&loaded.document, anchor);
+        let valid = Self::document_has_anchor(
+            loaded
+                .session
+                .render_view()
+                .expect("loaded document has glyph resources"),
+            anchor,
+        );
         let item = self.spine_item(loaded);
         self.document_cache.insert_document(doc_index, item);
         self.host.set_glyph_document(self.nav.location().document());

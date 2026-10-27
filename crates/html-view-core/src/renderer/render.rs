@@ -1,10 +1,39 @@
+use crate::document_view::DocumentView;
 use crate::{PagePositions, Painter, RenderState, RendererCore};
+use html::engine::Engine;
+use html::render::{FragmentRenderOptions, RenderScene};
 
 use html_view_doc::DocQuery;
 use html_view_paginate::Paginator;
 use html_view_paint::PagePainter;
 
 impl RendererCore {
+    pub(crate) fn note_parts(&self) -> Option<(&DocumentView, &Engine)> {
+        let index = self.note_document?;
+        let owner = if index == self.nav.location().document() {
+            &self.page.view.document.session
+        } else {
+            &self.document_cache.document(index)?.view.document.session
+        };
+        let note = self.note.as_ref()?;
+        note.document
+            .render_view(owner.document()?, owner.glyph_resources())?;
+        Some((note, owner))
+    }
+
+    pub(crate) fn note_parts_mut(&mut self) -> Option<(&mut DocumentView, &Engine)> {
+        let index = self.note_document?;
+        let owner = if index == self.nav.location().document() {
+            &self.page.view.document.session
+        } else {
+            &self.document_cache.document(index)?.view.document.session
+        };
+        let note = self.note.as_mut()?;
+        note.document
+            .render_view(owner.document()?, owner.glyph_resources())?;
+        Some((note, owner))
+    }
+
     pub(crate) fn painter(&self) -> PagePainter<'_> {
         PagePainter {
             geo: self.text_geometry(),
@@ -37,17 +66,20 @@ impl RendererCore {
     /// decorations and images alike, content in paint order, and per-line
     /// overflow clipping. A note is an ordinary laid-out document, so it is
     /// drawn by the same machinery rather than by a second painter here.
-    pub(crate) fn note_scene(&self) -> Option<html::render::RenderScene> {
-        let note = &self.note.as_ref()?.document;
+    pub(crate) fn note_scene(&self) -> Option<RenderScene> {
+        let (note, owner) = self.note_parts()?;
+        let view = note
+            .document
+            .render_view(owner.document()?, owner.glyph_resources())?;
         let width = self.note_layout_width();
-        let options = html::render::FragmentRenderOptions::new(width, None)
+        let options = FragmentRenderOptions::new(width, None)
             .ok()?
             .with_typography(
                 self.root_font_size.max(1.0) as u32,
                 self.root_font_size as f64,
             )
             .ok()?;
-        Some(html::render::RenderScene::for_document(note, &options))
+        Some(RenderScene::for_view(view, &options))
     }
 
     pub(crate) fn close_note(&mut self) {
@@ -58,28 +90,28 @@ impl RendererCore {
     /// Paints the open note's selection highlight over its content. The note
     /// is framed whole, so the overlay walks every line it has.
     pub(crate) fn paint_note_selection(&self, cx: &mut impl Painter) {
-        let Some(note) = self.note.as_ref() else {
+        let Some((note, owner)) = self.note_parts() else {
             return;
         };
         if let Some(doc) = self.note_document {
             self.host.set_glyph_document(doc);
         }
         PagePainter {
-            geo: note.geometry(),
+            geo: note.geometry_for(owner),
             images: &self.page.images,
             reader_palette: self.reader_palette,
             interaction_palette: self.interaction_palette,
             highlight: &Default::default(),
             annotations: &Default::default(),
             media_overlay: &Default::default(),
-            selection: note.selection_view(),
+            selection: note.selection_view_for(owner),
         }
         .paint_interaction_overlay(cx);
         self.host.set_glyph_document(self.nav.location().document());
     }
 
     pub(crate) fn select_note_glyph_document(&self) {
-        if let Some(doc) = self.note_document {
+        if let Some(doc) = self.note_parts().and(self.note_document) {
             self.host.set_glyph_document(doc);
         }
     }
@@ -126,7 +158,7 @@ impl RendererCore {
     pub(crate) fn paginator(&self) -> Paginator<'_> {
         let mode = if self
             .page
-            .inputs
+            .inputs()
             .layout
             .text_composition_policy
             .is_book_optimized()
@@ -140,7 +172,7 @@ impl RendererCore {
             html_view_paginate::PaginationMode::Web
         };
         Paginator::new(
-            DocQuery::new(&self.page.view.document),
+            DocQuery::from_view(self.page.view.document.render_view()),
             &self.page.view.layout,
             mode,
         )
@@ -236,7 +268,9 @@ impl RendererCore {
             }
         }
 
-        self.page.images.ensure_window(&desired);
+        self.page
+            .images
+            .ensure_window(self.page.view.document.render_view().images(), &desired);
         self.frame_scratch.desired_images = desired;
     }
 
@@ -249,7 +283,12 @@ impl RendererCore {
         let backward = self.viewport.backward_composition();
         let end_line = if let Some(idx) = backward.anchor_end_line() {
             idx.min(lines.len().saturating_sub(1))
-        } else if let Some(idx) = self.doc().end_line_at(composition.end_offset_y(), 1e-6) {
+        } else if let Some(idx) = self
+            .doc()
+            .view()
+            .geometry()
+            .end_line_at(composition.end_offset_y(), 1e-6)
+        {
             idx
         } else {
             self.restart_forward_at(0.0);
@@ -280,7 +319,11 @@ impl RendererCore {
 
         self.viewport.finish_backward_composition(first_painted_y);
 
-        if first_painted == 0 && self.viewport.composition().start_offset_y() <= 0.0 {
+        // Line zero identifies the document boundary even when authored
+        // margins, padding, or leading blocks give it a positive y offset.
+        // Recompose from document zero to preserve that leading content and
+        // the same first-page geometry used by forward navigation.
+        if first_painted == 0 {
             self.restart_forward_at(0.0);
         }
     }

@@ -25,13 +25,21 @@ impl PendingNavigation {
 }
 
 impl RendererCore {
+    /// Local navigation supersedes a chapter read without waiting for its I/O.
+    /// Dropping the receiver discards the stale result when that read finishes.
+    pub(super) fn cancel_pending_navigation(&mut self) {
+        if self.pending_navigation.take().is_some() {
+            self.host.request_repaint();
+        }
+    }
+
     fn document_settings(&self) -> load::DocumentLoadSettings {
         load::DocumentLoadSettings {
             root_font_size: self.root_font_size,
-            column_width: self.page.inputs.layout.viewport_width,
-            reader_overrides: self.page.inputs.reader_overrides.clone(),
-            image_sizing_policy: self.page.inputs.layout.image_sizing_policy,
-            text_composition_policy: self.page.inputs.layout.text_composition_policy,
+            column_width: self.page.inputs().layout.viewport_width,
+            reader_overrides: self.page.inputs().reader_overrides.clone(),
+            image_sizing_policy: self.page.inputs().layout.image_sizing_policy,
+            text_composition_policy: self.page.inputs().layout.text_composition_policy,
             note_display: self.note_display,
         }
     }
@@ -102,7 +110,11 @@ impl RendererCore {
         }
         self.host.set_glyph_document(pending.doc);
         let loaded =
-            match result.and_then(|prepared| load::finish_prepared_document(prepared, shaper)) {
+            match result.and_then(|prepared| {
+                self.host.set_font_overrides(&prepared.inputs().reader_overrides);
+                self.host.prepare_font_faces(prepared.session.font_faces(), self.provider.clone());
+                load::finish_prepared_document(prepared, shaper)
+            }) {
                 Ok(loaded) => loaded,
                 Err(message) => {
                     self.host.set_glyph_document(self.nav.location().document());

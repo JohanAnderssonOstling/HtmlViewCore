@@ -18,13 +18,17 @@ impl RendererCore {
         if doc != self.nav.location().document() {
             return;
         }
-        let range = self.doc().glyph_range_for_anchor(&fragment);
+        let range = self
+            .doc()
+            .view()
+            .addressing()
+            .glyph_range_for_anchor(&fragment);
         self.media_overlay.set_visible(range);
     }
 
     pub(crate) fn resolve_visible_annotations(&mut self) {
         let current_doc = self.nav.location().document();
-        let doc = DocQuery::new(&self.page.view.document);
+        let doc = DocQuery::from_view(self.page.view.document.render_view());
         self.annotations.resolve(doc, current_doc);
     }
 }

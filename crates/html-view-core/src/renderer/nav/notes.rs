@@ -28,8 +28,13 @@ impl RendererCore {
         };
         let href = view.string(href_idx).to_string();
         if let Some((doc, _)) = self.resolve_href_target(&href) {
-            let hit = crate::DocumentGlyph { doc: self.nav.location().document(), glyph: glyph_idx };
-            if self.defer_document_read(doc, NavigationRequest::Click(hit, click_position)) { return true; }
+            let hit = crate::DocumentGlyph {
+                doc: self.nav.location().document(),
+                glyph: glyph_idx,
+            };
+            if self.defer_document_read(doc, NavigationRequest::Click(hit, click_position)) {
+                return true;
+            }
         }
         if let Some(mut preview) =
             self.footnote_preview_for_reference(glyph_shaper, &href, reference_kind)
@@ -53,7 +58,9 @@ impl RendererCore {
         hit: crate::DocumentGlyph,
         click_position: Option<Point>,
     ) -> bool {
-        if self.defer_document_read(hit.doc, NavigationRequest::Click(hit, click_position)) { return true; }
+        if self.defer_document_read(hit.doc, NavigationRequest::Click(hit, click_position)) {
+            return true;
+        }
         if hit.doc != self.nav.location().document() {
             self.load_document_at(glyph_shaper, hit.doc, DocAnchor::Glyph(hit.glyph));
         }
@@ -72,7 +79,9 @@ impl RendererCore {
         href: &str,
     ) -> Option<crate::FootnotePreview> {
         if let Some((doc, _)) = self.resolve_href_target(href) {
-            if self.defer_document_read(doc, NavigationRequest::Preview(href.to_owned())) { return None; }
+            if self.defer_document_read(doc, NavigationRequest::Preview(href.to_owned())) {
+                return None;
+            }
         }
         self.footnote_preview_for_reference(glyph_shaper, href, NoteReferenceKind::Inferred)
     }
@@ -113,16 +122,21 @@ impl RendererCore {
         // document's renderer resources changes that document.
         let is_note_target = {
             let laid_out = match freshly_loaded.as_ref() {
-                Some(loaded) => &loaded.document,
-                None if doc == self.nav.location().document() => &self.page.view.document,
-                None => &self.document_cache.document(doc)?.view.document,
+                Some(loaded) => &loaded.session,
+                None if doc == self.nav.location().document() => &self.page.view.document.session,
+                None => &self.document_cache.document(doc)?.view.document.session,
             };
-            laid_out.render_view().addressing().is_note_target(fragment)
+            laid_out
+                .render_view()?
+                .addressing()
+                .is_note_target(fragment)
         };
 
         // One authority for what a note is, whichever document it lives in.
         if matches!(reference_kind, NoteReferenceKind::Inferred) && !is_note_target {
-            if let Some(loaded) = freshly_loaded { self.prepared_navigation = Some((doc, loaded)); }
+            if let Some(loaded) = freshly_loaded {
+                self.prepared_navigation = Some((doc, loaded));
+            }
             return None;
         }
 
@@ -139,33 +153,42 @@ impl RendererCore {
             Some(loaded) => loaded
                 .session
                 .layout_note(fragment, constraints, glyph_shaper),
-            None if doc == self.nav.location().document() => {
-                self.page
-                    .session
-                    .layout_note(fragment, constraints, glyph_shaper)
-            }
-            None => self.document_cache.document_mut(doc)?.session.layout_note(
-                fragment,
-                constraints,
-                glyph_shaper,
-            ),
+            None if doc == self.nav.location().document() => self
+                .page
+                .view
+                .document
+                .session
+                .layout_note(fragment, constraints, glyph_shaper),
+            None => self
+                .document_cache
+                .document_mut(doc)?
+                .view
+                .document
+                .session
+                .layout_note(fragment, constraints, glyph_shaper),
         };
         let Some(note) = note else {
-            if let Some(loaded) = freshly_loaded { self.prepared_navigation = Some((doc, loaded)); }
+            if let Some(loaded) = freshly_loaded {
+                self.prepared_navigation = Some((doc, loaded));
+            }
             return None;
         };
         // Held as a view of its own, so selecting and hit testing inside it go
         // through the same code the page uses.
         self.note = Some(
             crate::document_view::DocumentView::new(
-                note.clone(),
+                note,
                 crate::ColumnLayout {
                     col_width: width,
                     base_col_width: width,
                     ..self.page.view.layout
                 },
             )
-            .framed_whole(),
+            .framed_whole_for(match freshly_loaded.as_ref() {
+                Some(loaded) => &loaded.session,
+                None if doc == self.nav.location().document() => &self.page.view.document.session,
+                None => &self.document_cache.document(doc)?.view.document.session,
+            }),
         );
         self.note_document = Some(doc);
 

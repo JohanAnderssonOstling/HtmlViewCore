@@ -29,6 +29,7 @@ impl DocumentCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_disabled(&self) -> bool {
         self.capacity == 0
     }

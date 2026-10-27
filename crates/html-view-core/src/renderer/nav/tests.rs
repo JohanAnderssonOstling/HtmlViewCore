@@ -1,5 +1,8 @@
 //! Renderer navigation, pagination, and note regressions.
 
+#[path = "tests/chapter_start.rs"]
+mod chapter_start;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -9,7 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kurbo::{Point, Size};
 
-use crate::text_backend::{FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper};
+use crate::text_backend::{
+    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+};
 use crate::{
     FileSystemProvider, RecordingPainter, RendererCore, RendererEvent, RendererHost,
     RendererInitialConfig, RendererOperation, load,
@@ -18,8 +23,8 @@ use crate::{
 #[derive(Default)]
 struct TestShaper {
     glyphs: HashMap<(char, u32), GlyphId>,
-    glyph_store: GlyphResourceStore,
-    append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceStore)>,
+    generation: GlyphResourceGeneration,
+    append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceGeneration)>,
     next_id: GlyphId,
     reject_glyphs: bool,
 }
@@ -27,17 +32,17 @@ struct TestShaper {
 impl GlyphShaper for TestShaper {
     fn reset(&mut self) {
         self.glyphs.clear();
-        self.glyph_store.clear();
+        self.generation = GlyphResourceGeneration::default();
         self.next_id = 0;
     }
 
-    fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
-        &mut self.glyph_store
+    fn resource_generation(&self) -> GlyphResourceGeneration {
+        self.generation
     }
 
     fn begin_append_shaping(&mut self) -> Result<(), crate::layout::ShapeError> {
         assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
         Ok(())
     }
 
@@ -48,8 +53,8 @@ impl GlyphShaper for TestShaper {
     fn rollback_append_shaping(&mut self) {
         if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
             self.glyphs = glyphs;
-            self.glyph_store = glyph_store;
-            self.next_id = self.glyph_store.len() as GlyphId;
+            self.generation = glyph_store;
+            self.next_id = self.glyphs.len() as GlyphId;
         }
     }
 
@@ -61,16 +66,17 @@ impl GlyphShaper for TestShaper {
         _font_slant: FontSlant,
         _color: u32,
         _family: Option<&str>,
+        resources: &mut GlyphResourceStore,
     ) -> Result<GlyphId, crate::layout::ShapeError> {
         if self.reject_glyphs {
             return Err(crate::layout::ShapeError::unregistered_glyph_id(
                 u32::MAX,
-                self.glyph_store.len(),
+                resources.len(),
             ));
         }
         let key = (ch, font_size.to_bits());
         if let Some(&glyph) = self.glyphs.get(&key)
-            && self.glyph_store.contains(glyph)
+            && resources.contains(glyph)
         {
             return Ok(glyph);
         }
@@ -82,7 +88,7 @@ impl GlyphShaper for TestShaper {
             font_size * 0.75,
         )
         .map_err(crate::layout::ShapeError::rejected_metric)?;
-        let glyph = self.glyph_store.register(metric)?;
+        let glyph = resources.register(metric)?;
         assert_eq!(
             glyph, self.next_id,
             "glyph shaper and document registry diverged"
@@ -100,6 +106,7 @@ fn activate_glyph(core: &mut RendererCore, shaper: &mut TestShaper, glyph: u32) 
 
 #[derive(Default)]
 struct TestHost {
+    font_preparations: RefCell<Vec<Vec<crate::FontFace>>>,
     events: RefCell<Vec<RendererEvent>>,
     repaint_requests: Cell<usize>,
     clipboard_text: RefCell<Option<String>>,
@@ -108,6 +115,10 @@ struct TestHost {
 }
 
 impl RendererHost for TestHost {
+    fn prepare_font_faces(&self, faces: &[crate::FontFace], _: Arc<dyn crate::ResourceProvider>) {
+        self.font_preparations.borrow_mut().push(faces.to_vec());
+    }
+
     fn note_popup_width(&self) -> Option<f64> {
         self.note_width.get()
     }
@@ -120,10 +131,15 @@ impl RendererHost for TestHost {
     }
     fn schedule_repaint(&self, _delay: Duration) {}
     fn resource_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        self.jobs.as_ref().map(|_| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>)
+        self.jobs
+            .as_ref()
+            .map(|_| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>)
     }
     fn blocking_job_spawner(&self) -> Arc<dyn html::resources::BlockingJobSpawner> {
-        self.jobs.clone().map(|jobs| jobs as Arc<dyn html::resources::BlockingJobSpawner>).unwrap_or_else(|| Arc::new(html::resources::InlineJobSpawner))
+        self.jobs
+            .clone()
+            .map(|jobs| jobs as Arc<dyn html::resources::BlockingJobSpawner>)
+            .unwrap_or_else(|| Arc::new(html::resources::InlineJobSpawner))
     }
     fn set_clipboard(&self, text: &str) -> Result<(), String> {
         *self.clipboard_text.borrow_mut() = Some(text.to_owned());
@@ -300,11 +316,8 @@ fn column_viewport_plan_does_not_repaint_unchanged_frames() {
         (Size::new(900.0, 640.0), 320.0, 2, 24.0, 1.0),
         (Size::new(900.0, 640.0), 320.0, 2, 24.0, 1.25),
     ] {
-        let (mut core, mut shaper) = pagination_core(
-            "<html><body>Idle reader</body></html>",
-            viewport,
-            columns,
-        );
+        let (mut core, mut shaper) =
+            pagination_core("<html><body>Idle reader</body></html>", viewport, columns);
         let host = Rc::new(TestHost::default());
         core.host = host.clone();
         core.set_scale(scale);
@@ -323,7 +336,11 @@ fn column_viewport_plan_does_not_repaint_unchanged_frames() {
             core.prepare_viewport(bounds);
         }
 
-        assert_eq!(host.repaint_requests.get(), 0, "an unchanged frame must settle");
+        assert_eq!(
+            host.repaint_requests.get(),
+            0,
+            "an unchanged frame must settle"
+        );
         assert_eq!(core.page.view.layout.geometry(), geometry);
     }
 }
@@ -376,8 +393,20 @@ fn glyph_index_for_character(core: &RendererCore, wanted: char) -> u32 {
         .expect("fixture character must exist")
 }
 
-fn laid_out_text(document: &crate::LaidOutDocument) -> String {
+fn laid_out_text(document: &crate::spine_item::SessionDocument) -> String {
     let text = document.render_view().text();
+    (0..text.glyph_count())
+        .filter_map(|index| {
+            text.glyph_at(index)
+                .and_then(|glyph| text.glyph_metric(glyph))
+                .map(|metric| metric.ch())
+        })
+        .collect()
+}
+
+fn open_note_text(core: &RendererCore) -> String {
+    let (note, owner) = core.note_parts().expect("valid open note");
+    let text = note.doc_for(owner).text();
     (0..text.glyph_count())
         .filter_map(|index| {
             text.glyph_at(index)
@@ -950,18 +979,58 @@ fn paginator_moves_an_oversized_image_line_to_a_fresh_column() {
 #[test]
 fn paginator_honors_forced_modern_and_legacy_css_breaks() {
     for property in ["break-before:page", "page-break-before:always"] {
-        let html = format!("<html><body style='margin:0'><div style='line-height:20px'>A</div><div style='line-height:20px;{property}'>B</div></body></html>");
+        let html = format!(
+            "<html><body style='margin:0'><div style='line-height:20px'>A</div><div style='line-height:20px;{property}'>B</div></body></html>"
+        );
         let (mut core, mut shaper) = pagination_core(&html, Size::new(200.0, 40.0), 1);
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
 
-        assert!(core.page.view.frame.page().line_positions().get(a).is_some());
-        assert!(core.page.view.frame.page().line_positions().get(b).is_none(), "{property} must start B in the next fragmentainer");
-        assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+        assert!(
+            core.page
+                .view
+                .frame
+                .page()
+                .line_positions()
+                .get(a)
+                .is_some()
+        );
+        assert!(
+            core.page
+                .view
+                .frame
+                .page()
+                .line_positions()
+                .get(b)
+                .is_none(),
+            "{property} must start B in the next fragmentainer"
+        );
+        assert_eq!(
+            core.page
+                .view
+                .document
+                .render_view()
+                .text()
+                .line(b)
+                .expect("B line")
+                .point()
+                .y,
+            20.0,
+            "document geometry stays continuous"
+        );
         // Page placement changes without introducing gaps into the document.
         core.next_page(&mut shaper);
         core.paint_forward(&mut RecordingPainter::default());
-        assert_eq!(core.page.view.frame.page().line_positions().get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
+        assert_eq!(
+            core.page
+                .view
+                .frame
+                .page()
+                .line_positions()
+                .get(b)
+                .map(|screen| (screen.col_index, screen.point.y)),
+            Some((0, 0.0))
+        );
     }
 }
 
@@ -1216,14 +1285,62 @@ fn paginator_forced_break_wins_over_an_adjoining_avoid() {
     let a = line_index_for_character(&core, 'A');
     let b = line_index_for_character(&core, 'B');
 
-    assert!(core.page.view.frame.page().line_positions().get(a).is_some());
-    assert!(core.page.view.frame.page().line_positions().get(b).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(a).expect("A line").point().y, 0.0);
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(a)
+            .is_some()
+    );
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .is_none()
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(a)
+            .expect("A line")
+            .point()
+            .y,
+        0.0
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(b)
+            .expect("B line")
+            .point()
+            .y,
+        20.0,
+        "document geometry stays continuous"
+    );
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(core.page.view.frame.page().line_positions().get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 0.0))
+    );
 }
 
 #[test]
@@ -1234,15 +1351,73 @@ fn paginator_keeps_a_break_inside_avoid_block_together() {
     let b = line_index_for_character(&core, 'B');
     let c = line_index_for_character(&core, 'C');
 
-    assert!(core.page.view.frame.page().line_positions().get(a).is_some());
-    assert!(core.page.view.frame.page().line_positions().get(b).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(a)
+            .is_some()
+    );
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .is_none()
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(b)
+            .expect("B line")
+            .point()
+            .y,
+        20.0,
+        "document geometry stays continuous"
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(c)
+            .expect("C line")
+            .point()
+            .y,
+        40.0,
+        "document geometry stays continuous"
+    );
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(core.page.view.frame.page().line_positions().get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
-    assert_eq!(core.page.view.frame.page().line_positions().get(c).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 0.0))
+    );
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(c)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 20.0))
+    );
 }
 
 #[test]
@@ -1322,15 +1497,73 @@ fn paginator_honors_break_after_avoid_as_keep_with_next() {
     let heading = line_index_for_character(&core, 'H');
     let b = line_index_for_character(&core, 'B');
 
-    assert!(core.page.view.frame.page().line_positions().get(a).is_some());
-    assert!(core.page.view.frame.page().line_positions().get(heading).is_none());
-    assert_eq!(core.page.view.document.render_view().text().line(heading).expect("heading line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("following line").point().y, 40.0, "document geometry stays continuous");
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(a)
+            .is_some()
+    );
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(heading)
+            .is_none()
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(heading)
+            .expect("heading line")
+            .point()
+            .y,
+        20.0,
+        "document geometry stays continuous"
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(b)
+            .expect("following line")
+            .point()
+            .y,
+        40.0,
+        "document geometry stays continuous"
+    );
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(core.page.view.frame.page().line_positions().get(heading).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
-    assert_eq!(core.page.view.frame.page().line_positions().get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(heading)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 0.0))
+    );
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 20.0))
+    );
 }
 
 #[test]
@@ -2979,7 +3212,7 @@ fn book_paginator_does_not_break_through_a_rowspan_group() {
 #[test]
 fn book_paginator_keeps_a_bottom_table_caption_with_the_last_row() {
     let html = "<html><body style='margin:0'><div style='line-height:20px'>P</div><table style='margin:0;border-spacing:0'><caption style='caption-side:bottom;line-height:20px'>C</caption><tr><td style='padding:0;line-height:20px'>A</td></tr><tr><td style='padding:0;line-height:20px'>B</td></tr></table></body></html>";
-    let (core, _) = pagination_core_with_policy(
+    let (mut core, mut shaper) = pagination_core_with_policy(
         html,
         Size::new(200.0, 50.0),
         1,
@@ -2998,24 +3231,30 @@ fn book_paginator_keeps_a_bottom_table_caption_with_the_last_row() {
         .expect("last row line")
         .point()
         .y;
-    let caption_line = core
-        .page
-        .view
-        .document
-        .render_view()
-        .text()
-        .line(caption)
-        .expect("bottom caption line");
     assert_eq!(row_y, 40.0, "layout geometry remains continuous");
-    let (group_top, group_bottom) = core
-        .paginator()
-        .table_row_group_bounds_containing(row_y)
-        .expect("the final row owns a pagination group");
-    assert_eq!(group_top, row_y);
-    assert!(
-        group_bottom >= caption_line.point().y + caption_line.height(),
-        "the final row's pagination group must include its bottom caption"
-    );
+    for _ in 0..4 {
+        if core
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(last_row)
+            .is_some()
+        {
+            break;
+        }
+        core.next_page(&mut shaper);
+        core.paint_forward(&mut RecordingPainter::default());
+    }
+    let positions = core.page.view.frame.page().line_positions();
+    let row_screen = positions
+        .get(last_row)
+        .expect("the final row must become visible");
+    let caption_screen = positions
+        .get(caption)
+        .expect("the bottom caption must accompany its final row");
+    assert_eq!(row_screen.col_index, caption_screen.col_index);
 }
 
 #[test]
@@ -3126,15 +3365,74 @@ fn paginator_applies_default_widow_and_orphan_limits() {
     let b = line_index_for_character(&core, 'B');
     let c = line_index_for_character(&core, 'C');
 
-    assert!(core.page.view.frame.page().line_positions().get(a).is_some());
-    assert!(core.page.view.frame.page().line_positions().get(b).is_none(), "a 1/1 paragraph split violates the default 2-line limits");
-    assert_eq!(core.page.view.document.render_view().text().line(b).expect("B line").point().y, 20.0, "document geometry stays continuous");
-    assert_eq!(core.page.view.document.render_view().text().line(c).expect("C line").point().y, 40.0, "document geometry stays continuous");
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(a)
+            .is_some()
+    );
+    assert!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .is_none(),
+        "a 1/1 paragraph split violates the default 2-line limits"
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(b)
+            .expect("B line")
+            .point()
+            .y,
+        20.0,
+        "document geometry stays continuous"
+    );
+    assert_eq!(
+        core.page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(c)
+            .expect("C line")
+            .point()
+            .y,
+        40.0,
+        "document geometry stays continuous"
+    );
     // Page placement changes without introducing gaps into the document.
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(core.page.view.frame.page().line_positions().get(b).map(|screen| (screen.col_index, screen.point.y)), Some((0, 0.0)));
-    assert_eq!(core.page.view.frame.page().line_positions().get(c).map(|screen| (screen.col_index, screen.point.y)), Some((0, 20.0)));
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(b)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 0.0))
+    );
+    assert_eq!(
+        core.page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(c)
+            .map(|screen| (screen.col_index, screen.point.y)),
+        Some((0, 20.0))
+    );
 }
 
 #[test]
@@ -3644,7 +3942,8 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
         .expect("fixture should contain a linked glyph");
     let line_idx = core
         .doc()
-        .find_line_for_glyph(linked_glyph)
+        .text()
+        .line_index_for_glyph(linked_glyph)
         .expect("linked glyph should be laid out");
     let screen = core
         .page
@@ -3825,7 +4124,7 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         RendererInitialConfig::default(),
     );
     assert_eq!(
-        core.page.inputs.layout.image_sizing_policy,
+        core.page.inputs().layout.image_sizing_policy,
         html::pipeline::ImageSizingPolicy::SmartStandalone,
         "reader UI documents should enable smart standalone image sizing at initial layout"
     );
@@ -3836,7 +4135,7 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
     assert_eq!(core.page.view.layout.base_col_width, 480.0);
     assert_eq!(core.root_font_size, 18.0);
     assert_eq!(core.page.view.layout.scale, 1.5);
-    let reader_overrides_before_theme = core.page.inputs.reader_overrides.clone();
+    let reader_overrides_before_theme = core.page.inputs().reader_overrides.clone();
     let repaint_before_theme = host.repaint_requests.get();
     core.apply(
         &mut shaper,
@@ -3846,7 +4145,8 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         }),
     );
     assert_eq!(
-        core.page.inputs.reader_overrides, reader_overrides_before_theme,
+        core.page.inputs().reader_overrides,
+        reader_overrides_before_theme,
         "theme changes must not rerun the style pipeline"
     );
     assert!(host.repaint_requests.get() > repaint_before_theme);
@@ -3878,7 +4178,8 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
     core.apply(&mut shaper, crate::RendererCommand::NavigateSearch(1));
     assert_eq!(core.highlight.current_match_index(), 1);
 
-    let (start, end) = core.highlight.matches()[0];
+    let range = &core.highlight.matches()[0];
+    let (start, end) = (range.start, range.end);
     core.page
         .view
         .selection
@@ -3931,7 +4232,11 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         &mut shaper,
         crate::RendererCommand::SetMediaOverlayTarget(Some("#spoken".to_owned())),
     );
-    assert!(core.media_overlay.visible().is_some_and(|(overlay_start, overlay_end)| overlay_start <= start && overlay_end > end));
+    assert!(
+        core.media_overlay
+            .visible()
+            .is_some_and(|range| range.start <= start && range.end > end)
+    );
     core.apply(
         &mut shaper,
         crate::RendererCommand::SetMediaOverlayTarget(None),
@@ -4001,7 +4306,7 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
         RendererInitialConfig::default(),
     );
     let committed_size = core.root_font_size;
-    let committed_input_size = core.page.inputs.style_environment.root_font_size;
+    let committed_input_size = core.page.inputs().style_environment.root_font_size;
     host.events.borrow_mut().clear();
 
     shaper.reject_glyphs = true;
@@ -4009,7 +4314,7 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
 
     assert_eq!(core.root_font_size, committed_size);
     assert_eq!(
-        core.page.inputs.style_environment.root_font_size,
+        core.page.inputs().style_environment.root_font_size,
         committed_input_size
     );
     let events = host.events.borrow();
@@ -4179,6 +4484,58 @@ fn navigation_reuses_cached_documents_between_adjacent_spine_entries() {
 }
 
 #[test]
+fn chapter_switches_move_sessions_with_a_single_cached_document_or_no_cache() {
+    for capacity in [0, 1] {
+        let (provider, reads) = CountingProvider::new(vec![
+            ("one.html", "<html><body>First chapter</body></html>"),
+            ("two.html", "<html><body>Second chapter</body></html>"),
+        ]);
+        let mut shaper = TestShaper::default();
+        let mut core = RendererCore::from_provider_with_nav(
+            Rc::new(TestHost::default()),
+            &mut shaper,
+            provider,
+            vec!["one.html".into(), "two.html".into()],
+            0,
+            None,
+            RendererInitialConfig::default(),
+        );
+        core.document_cache = crate::document_cache::DocumentCache::new(capacity);
+        let baseline = reads.load(Ordering::Relaxed);
+
+        for (turn, index) in [1, 0, 1, 0].into_iter().enumerate() {
+            core.load_document_at(&mut shaper, index, crate::DocAnchor::Start);
+            // Reflow each restored session and paint from its current document.
+            core.prepare_frame(&mut shaper, Size::new(400.0 + turn as f64 * 50.0, 600.0));
+            core.paint_forward(&mut RecordingPainter::default());
+            assert_eq!(core.nav.location().document(), index);
+            assert!(
+                laid_out_text(&core.page.view.document).contains(if index == 0 {
+                    "First chapter"
+                } else {
+                    "Second chapter"
+                })
+            );
+            assert!(
+                core.page
+                    .view
+                    .frame
+                    .page()
+                    .line_positions()
+                    .iter()
+                    .next()
+                    .is_some()
+            );
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                baseline + if capacity == 0 { turn + 1 } else { 1 },
+                "taking the incoming chapter must precede caching the outgoing chapter"
+            );
+        }
+    }
+}
+
+#[test]
 fn navigation_cache_uses_eviction_when_capacity_is_exceeded() {
     let (provider, read_count) = CountingProvider::new(vec![
         ("doc0.html", "<html><body><p>doc0</p></body></html>"),
@@ -4225,7 +4582,9 @@ fn navigation_cache_uses_eviction_when_capacity_is_exceeded() {
         core.nav.history.is_at_newest(),
         "walking back to the first document should leave the history cursor at its newest entry"
     );
-    assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 6);
+    // Taking the incoming item before caching the outgoing one avoids
+    // evicting the chapter that is about to become visible.
+    assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 5);
 }
 
 #[test]
@@ -4298,25 +4657,63 @@ fn publication_search_joins_to_layout_by_source_position_not_ordinal() {
     let source = "<html><body><p id='a'>needle A</p><p style='display:none'>needle hidden</p><p id='b'>needle B</p><p id='c'>needle C</p></body></html>";
     let (provider, reads) = CountingProvider::new(vec![("doc.html", source)]);
     let documents = vec!["doc.html".to_owned()];
-    let options = crate::SearchOptions { scope: crate::SearchScope::WholeBook, ..Default::default() };
+    let options = crate::SearchOptions {
+        scope: crate::SearchScope::WholeBook,
+        ..Default::default()
+    };
     let results = crate::search_publication(provider.as_ref(), &documents, "needle", options);
-    assert_eq!(results.len(), 4, "parse-level search sees text hidden later by style");
+    assert_eq!(
+        results.len(),
+        4,
+        "parse-level search sees text hidden later by style"
+    );
 
     let host = Rc::new(TestHost::default());
     let mut shaper = TestShaper::default();
-    let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, documents, 0, None, RendererInitialConfig::default());
+    let mut core = RendererCore::from_provider_with_nav(
+        host,
+        &mut shaper,
+        provider,
+        documents,
+        0,
+        None,
+        RendererInitialConfig::default(),
+    );
 
-    let expected = core.doc().glyph_range_for_anchor("b").expect("the visible target has glyphs").0;
-    for command in
-        [crate::RendererCommand::SetSearchResults { query: "needle".into(), options, results: vec![results[2].clone()] }, crate::RendererCommand::AppendSearchResults { query: "needle".into(), options, results: vec![results[2].clone()] }]
-    {
+    let expected = core
+        .doc()
+        .view()
+        .addressing()
+        .glyph_range_for_anchor("b")
+        .expect("the visible target has glyphs")
+        .start;
+    for command in [
+        crate::RendererCommand::SetSearchResults {
+            query: "needle".into(),
+            options,
+            results: vec![results[2].clone()],
+        },
+        crate::RendererCommand::AppendSearchResults {
+            query: "needle".into(),
+            options,
+            results: vec![results[2].clone()],
+        },
+    ] {
         core.highlight.restart(String::new(), options);
         core.viewport.begin_forward_at(5.0);
         let before = reads.load(Ordering::Relaxed);
         core.apply(&mut shaper, command);
         assert_eq!(core.highlight.current_local_match_start(), Some(expected));
-        assert_eq!(core.viewport.composition().start_offset_y(), 5.0, "arriving results must not move the reader");
-        assert_eq!(reads.load(Ordering::Relaxed), before, "highlighting must use the loaded document");
+        assert_eq!(
+            core.viewport.composition().start_offset_y(),
+            5.0,
+            "arriving results must not move the reader"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            before,
+            "highlighting must use the loaded document"
+        );
     }
 }
 
@@ -4350,7 +4747,7 @@ fn footnote_preview_requires_note_semantics_and_resolves_cross_spine_targets() {
         core.footnote_preview(&mut shaper, "notes.html#n1")
             .is_some()
     );
-    let rendered_note = laid_out_text(&core.note.as_ref().expect("open note").document);
+    let rendered_note = open_note_text(&core);
     assert!(rendered_note.contains("Structured note text"));
     assert!(rendered_note.contains("First source"));
     let indexed_reads = read_count.load(Ordering::Relaxed);
@@ -4421,44 +4818,106 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
     let (provider, _) = CountingProvider::new(vec![("document.html", source)]);
     let host = Rc::new(TestHost::default());
     let mut shaper = TestShaper::default();
-    let mut core = RendererCore::from_provider_with_nav(host, &mut shaper, provider, vec!["document.html".to_owned()], 0, Some("0:0"), RendererInitialConfig::default());
-    let fragments = core.page.view.document.render_view().addressing().reading_fragments(0);
-    assert_eq!(fragments.iter().map(|fragment| fragment.text.as_str()).collect::<Vec<_>>(), ["Chapter", "Hello bright world.", "Read this link."]);
+    let mut core = RendererCore::from_provider_with_nav(
+        host,
+        &mut shaper,
+        provider,
+        vec!["document.html".to_owned()],
+        0,
+        Some("0:0"),
+        RendererInitialConfig::default(),
+    );
+    let fragments = core
+        .page
+        .view
+        .document
+        .render_view()
+        .addressing()
+        .reading_fragments(0);
+    assert_eq!(
+        fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Chapter", "Hello bright world.", "Read this link."]
+    );
     let target = fragments[1].target.clone();
     let old_ranges = target.glyph_ranges.clone();
     assert!(!old_ranges.is_empty());
-    core.apply(&mut shaper, crate::RendererCommand::SetReadingTarget(Some(target.clone())));
+    core.apply(
+        &mut shaper,
+        crate::RendererCommand::SetReadingTarget(Some(target.clone())),
+    );
     core.apply(&mut shaper, crate::RendererCommand::SetColumnWidth(300.0));
-    let fragments_after = core.page.view.document.render_view().addressing().reading_fragments(0);
-    assert_eq!(fragments_after[1].target, target, "array indices survive relayout");
+    let fragments_after = core
+        .page
+        .view
+        .document
+        .render_view()
+        .addressing()
+        .reading_fragments(0);
+    assert_eq!(
+        fragments_after[1].target, target,
+        "array indices survive relayout"
+    );
     assert_eq!(fragments_after[1].text, "Hello bright world.");
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
     let clipped_start = old_ranges[1].start;
-    let clipped = core.page.view.document.render_view().addressing().reading_fragments(clipped_start);
+    let clipped = core
+        .page
+        .view
+        .document
+        .render_view()
+        .addressing()
+        .reading_fragments(clipped_start);
     assert!(!clipped.iter().any(|fragment| fragment.text == "Chapter"));
     assert!(clipped[0].text.starts_with("bright"));
     core.apply(&mut shaper, crate::RendererCommand::SetFontSize(24.0));
-    let reshaped = core.page.view.document.render_view().addressing().reading_fragments(0);
-    assert_eq!(reshaped[1].target, target, "element and glyph indices survive font changes");
+    let reshaped = core
+        .page
+        .view
+        .document
+        .render_view()
+        .addressing()
+        .reading_fragments(0);
+    assert_eq!(
+        reshaped[1].target, target,
+        "element and glyph indices survive font changes"
+    );
     assert_eq!(reshaped[1].text, "Hello bright world.");
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
     let reference = glyph_index_for_character(&core, '1');
-    assert!(!target.glyph_ranges.iter().any(|range| range.contains(&reference)), "excluded references must not be highlighted");
+    assert!(
+        !target
+            .glyph_ranges
+            .iter()
+            .any(|range| range.contains(&reference)),
+        "excluded references must not be highlighted"
+    );
     core.apply(&mut shaper, crate::RendererCommand::SetReadingTarget(None));
     assert!(core.media_overlay.reading_target().is_none());
     let mut session = crate::RendererSession::from_core(core, shaper);
     let (_, fragments) = session.reading_fragments().unwrap();
     let revision = session.navigation_revision();
     session.follow_reading_target(fragments.last().unwrap().target.clone());
-    assert_eq!(session.navigation_revision(), revision, "following narration is not a manual page change");
+    assert_eq!(
+        session.navigation_revision(),
+        revision,
+        "following narration is not a manual page change"
+    );
     session.next_page();
     assert_ne!(session.navigation_revision(), revision);
 }
 
 #[test]
 fn narration_retains_earlier_elements_but_starts_on_the_visible_page() {
-    let prose = (0..160).map(|index| format!("word{index}")).collect::<Vec<_>>().join(" ");
-    let source = format!("<html><body style='margin:17px'><p>Earlier element</p><p>{prose}</p><p>Later element</p></body></html>");
+    let prose = (0..160)
+        .map(|index| format!("word{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source = format!(
+        "<html><body style='margin:17px'><p>Earlier element</p><p>{prose}</p><p>Later element</p></body></html>"
+    );
     let (core, shaper) = pagination_core(&source, Size::new(240.0, 180.0), 1);
     let mut session = crate::RendererSession::from_core(core, shaper);
     let (_, initial) = session.reading_fragments().unwrap();
@@ -4467,37 +4926,144 @@ fn narration_retains_earlier_elements_but_starts_on_the_visible_page() {
     let (_, onward) = session.reading_fragments().unwrap();
     let (_, start, all) = session.document_reading_fragments().unwrap();
     assert!(start > 0, "backwards skips need the earlier elements");
-    assert_eq!(&all[start..], onward.as_slice(), "starting TTS must keep the visible-page boundary");
+    assert_eq!(
+        &all[start..],
+        onward.as_slice(),
+        "starting TTS must keep the visible-page boundary"
+    );
     assert!(all[0].text.contains("Earlier element"));
     assert!(session.reading_target_cfi(&all[start].target).is_some());
 }
 
 #[test]
+fn ruler_detects_narration_page_changes_without_manual_navigation() {
+    let paragraphs = (0..40)
+        .map(|index| format!("<p>Line {index}</p>"))
+        .collect::<String>();
+    let source = format!(
+        "<html><body style='margin:0'><style>p {{margin:0;line-height:28px}}</style>{paragraphs}</body></html>"
+    );
+    let viewport = Size::new(400.0, 140.0);
+    let (core, shaper) = pagination_core(&source, viewport, 1);
+    let mut session = crate::RendererSession::from_core(core, shaper);
+    let (_, _, _, targets) = session.reading_items().unwrap();
+    let revision = session.navigation_revision();
+    assert!(
+        !session.follow_reading_target(targets[0].clone()),
+        "a visible target must leave the ruler alone"
+    );
+    assert!(
+        session.follow_reading_target(targets[20].clone()),
+        "an offscreen target must reset the ruler"
+    );
+    assert_eq!(session.navigation_revision(), revision);
+    session.prepare_frame(viewport);
+    assert!(!session.follow_reading_target(targets[20].clone()));
+    assert_eq!(session.navigation_revision(), revision);
+}
+
+#[test]
+fn ruler_skips_overflow_clipped_lines_and_keeps_partial_lines() {
+    let fixtures = [
+        (
+            "<div style='height:28px;overflow:hidden'><p>First</p><p>Hidden</p><p>Hidden</p></div><p>Last</p>",
+            vec![28.0, 28.0],
+        ),
+        (
+            "<div style='height:42px;overflow:hidden'><p>First</p><p>Partial</p><p>Hidden</p></div><p>Last</p>",
+            vec![28.0, 14.0, 28.0],
+        ),
+        (
+            "<div style='height:0;overflow:hidden'><p>Hidden</p></div><p>Last</p>",
+            vec![28.0],
+        ),
+        (
+            "<p style='width:40px;overflow:hidden;white-space:nowrap;text-indent:80px'>Hidden</p><p>Last</p>",
+            vec![28.0],
+        ),
+        (
+            "<div style='height:28px;overflow:visible'><p>First</p><p>Visible</p><p>Visible</p></div><p>Last</p>",
+            vec![28.0, 28.0, 28.0, 28.0],
+        ),
+    ];
+    for (markup, heights) in fixtures {
+        let source = format!(
+            "<html><body style='margin:0'><style>p {{margin:0;line-height:28px}}</style>{markup}</body></html>"
+        );
+        let (core, shaper) = pagination_core(&source, Size::new(600.0, 400.0), 1);
+        let session = crate::RendererSession::from_core(core, shaper);
+        let lines = session.visible_reading_lines();
+        assert_eq!(lines.len(), heights.len(), "{markup}: {lines:?}");
+        for (line, height) in lines.iter().zip(heights) {
+            assert!(
+                (line.bounds.height() - height).abs() < 0.01,
+                "{markup}: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn reading_fragments_continue_a_single_element_across_pages() {
-    let prose = (0..160).map(|index| format!("word{index}")).collect::<Vec<_>>().join(" ");
+    let prose = (0..160)
+        .map(|index| format!("word{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let source = format!("<html><body style='margin:0'><p>{prose}</p></body></html>");
     let (core, shaper) = pagination_core(&source, Size::new(240.0, 180.0), 1);
     let mut session = crate::RendererSession::from_core(core, shaper);
     let (_, fragments) = session.reading_fragments().unwrap();
-    assert!(fragments.len() > 1, "a long paragraph needs multiple page fragments");
-    assert_eq!(fragments.iter().map(|fragment| fragment.text.as_str()).collect::<Vec<_>>().join(" "), prose, "page boundaries must neither lose nor repeat words");
+    assert!(
+        fragments.len() > 1,
+        "a long paragraph needs multiple page fragments"
+    );
+    assert_eq!(
+        fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        prose,
+        "page boundaries must neither lose nor repeat words"
+    );
     let element = fragments[0].target.element;
     for pair in fragments.windows(2) {
         assert_eq!(pair[0].target.element, element);
         assert_eq!(pair[1].target.element, element);
-        assert!(pair[0].target.glyph_ranges.last().unwrap().end <= pair[1].target.glyph_ranges[0].start);
+        assert!(
+            pair[0].target.glyph_ranges.last().unwrap().end <= pair[1].target.glyph_ranges[0].start
+        );
     }
     let revision = session.navigation_revision();
     let first_position = session.current_cfi();
     session.follow_reading_target(fragments[1].target.clone());
-    assert_ne!(session.current_cfi(), first_position, "continuation must turn the displayed page");
+    assert_ne!(
+        session.current_cfi(),
+        first_position,
+        "continuation must turn the displayed page"
+    );
     assert_eq!(session.navigation_revision(), revision);
     session.apply(crate::RendererCommand::SetFontSize(24.0));
-    let text = session.document().render_view().text();
-    let still_readable: String = fragments[1].target.glyph_ranges.iter().flat_map(|range| range.clone())
-        .filter_map(|index| text.glyph_at(index as usize).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch()))
+    let text = session.render_view().text();
+    let still_readable: String = fragments[1]
+        .target
+        .glyph_ranges
+        .iter()
+        .flat_map(|range| range.clone())
+        .filter_map(|index| {
+            text.glyph_at(index as usize)
+                .and_then(|glyph| text.glyph_metric(glyph))
+                .map(|metric| metric.ch())
+        })
         .collect();
-    assert_eq!(still_readable.split_whitespace().collect::<Vec<_>>().join(" "), fragments[1].text, "stored glyph indices still address the same passage after font changes");
+    assert_eq!(
+        still_readable
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        fragments[1].text,
+        "stored glyph indices still address the same passage after font changes"
+    );
 }
 
 #[test]
@@ -4529,10 +5095,7 @@ fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
         "the footnote body must not consume paginated layout space"
     );
     assert!(core.footnote_preview(&mut shaper, "#note").is_some());
-    assert!(
-        laid_out_text(&core.note.as_ref().expect("open note").document)
-            .contains("Popup-only zebra")
-    );
+    assert!(open_note_text(&core).contains("Popup-only zebra"));
 }
 
 #[test]
@@ -4555,7 +5118,8 @@ fn clicked_footnote_emits_a_viewport_overlay_anchor() {
     let noteref = glyph_index_for_character(&core, '1');
     let line_idx = core
         .doc()
-        .find_line_for_glyph(noteref)
+        .text()
+        .line_index_for_glyph(noteref)
         .expect("note reference line");
     let screen = core
         .page
@@ -4845,8 +5409,19 @@ fn source_position_reader(source: &str) -> (RendererCore, TestShaper, Rc<TestHos
         text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
         ..RendererInitialConfig::default()
     };
-    let mut core = RendererCore::from_provider_with_nav(host.clone(), &mut shaper, provider, vec!["chapter.html".into()], 0, None, config);
-    core.apply(&mut shaper, crate::RendererCommand::SetDocumentTextLengths(vec![source.chars().count() as u64]));
+    let mut core = RendererCore::from_provider_with_nav(
+        host.clone(),
+        &mut shaper,
+        provider,
+        vec!["chapter.html".into()],
+        0,
+        None,
+        config,
+    );
+    core.apply(
+        &mut shaper,
+        crate::RendererCommand::SetDocumentTextLengths(vec![source.chars().count() as u64]),
+    );
     (core, shaper, host)
 }
 
@@ -4863,16 +5438,30 @@ fn reading_positions(host: &TestHost) -> Vec<crate::ReadingPosition> {
 
 #[test]
 fn reading_position_snapshot_waits_for_pagination_and_deduplicates_repaints() {
-    let source = format!("<html><head></head><body><p>{}</p></body></html>", "Page text. ".repeat(800));
+    let source = format!(
+        "<html><head></head><body><p>{}</p></body></html>",
+        "Page text. ".repeat(800)
+    );
     let (mut core, mut shaper, host) = source_position_reader(&source);
-    assert!(reading_positions(&host).is_empty(), "construction has no settled page to publish");
+    assert!(
+        reading_positions(&host).is_empty(),
+        "construction has no settled page to publish"
+    );
     let viewport = Size::new(340.0, 600.0);
     core.prepare_frame(&mut shaper, viewport);
     let first = reading_positions(&host).last().unwrap().clone();
     core.prepare_frame(&mut shaper, viewport);
-    assert_eq!(reading_positions(&host).len(), 1, "a repaint is not a new reading location");
+    assert_eq!(
+        reading_positions(&host).len(),
+        1,
+        "a repaint is not a new reading location"
+    );
     core.next_page(&mut shaper);
-    assert_eq!(reading_positions(&host).len(), 1, "navigation must not publish the previous frame's location");
+    assert_eq!(
+        reading_positions(&host).len(),
+        1,
+        "navigation must not publish the previous frame's location"
+    );
     core.prepare_frame(&mut shaper, viewport);
     let second = reading_positions(&host).last().unwrap().clone();
     assert_ne!(second.source, first.source);
@@ -4886,9 +5475,15 @@ fn reading_position_snapshot_waits_for_pagination_and_deduplicates_repaints() {
 
 #[test]
 fn reading_position_moves_even_when_reported_progress_does_not() {
-    let source = format!("<html><body><p>{}</p></body></html>", "Page text. ".repeat(800));
+    let source = format!(
+        "<html><body><p>{}</p></body></html>",
+        "Page text. ".repeat(800)
+    );
     let (mut core, mut shaper, host) = source_position_reader(&source);
-    core.apply(&mut shaper, crate::RendererCommand::SetDocumentTextLengths(vec![1]));
+    core.apply(
+        &mut shaper,
+        crate::RendererCommand::SetDocumentTextLengths(vec![1]),
+    );
     let viewport = Size::new(340.0, 600.0);
     core.prepare_frame(&mut shaper, viewport);
     let first = reading_positions(&host).last().unwrap().clone();
@@ -4896,38 +5491,75 @@ fn reading_position_moves_even_when_reported_progress_does_not() {
     core.prepare_frame(&mut shaper, viewport);
     let second = reading_positions(&host).last().unwrap().clone();
     assert_eq!(first.fraction, second.fraction);
-    assert_ne!(first.source, second.source, "chapter tracking must not depend on a progress change");
+    assert_ne!(
+        first.source, second.source,
+        "chapter tracking must not depend on a progress change"
+    );
 }
 
 #[test]
 fn reading_position_waits_for_background_document_navigation() {
-    let (mut core, mut shaper) = spine_core(vec![("one.html", "<html><body><p>First</p></body></html>"), ("two.html", "<html><body><img src='picture.svg' width='300' height='500'/></body></html>")], Size::new(340.0, 600.0), 340.0, 1);
+    let (mut core, mut shaper) = spine_core(
+        vec![
+            ("one.html", "<html><body><p>First</p></body></html>"),
+            (
+                "two.html",
+                "<html><body><img src='picture.svg' width='300' height='500'/></body></html>",
+            ),
+        ],
+        Size::new(340.0, 600.0),
+        340.0,
+        1,
+    );
     let jobs = Arc::new(DeferredFileJobs::default());
-    let host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
+    let host = Rc::new(TestHost {
+        jobs: Some(jobs.clone()),
+        ..Default::default()
+    });
     core.host = host.clone();
     core.next_page(&mut shaper);
     assert!(reading_positions(&host).is_empty());
     jobs.run();
     core.finish_pending_navigation(&mut shaper);
-    assert!(reading_positions(&host).is_empty(), "loading does not publish unpaginated coordinates");
+    assert!(
+        reading_positions(&host).is_empty(),
+        "loading does not publish unpaginated coordinates"
+    );
     core.prepare_frame(&mut shaper, Size::new(340.0, 600.0));
     let position = reading_positions(&host).last().unwrap().clone();
     assert_eq!(position.source.document, 1);
     assert_eq!(position.document_count, 2);
-    assert_eq!(position.source.path, core.page.source_index.image_path(0).unwrap());
+    assert_eq!(position.source.path, vec![4, 2]);
     assert_eq!(position.source.utf16_offset, None);
     core.prev_page(&mut shaper);
     core.prepare_frame(&mut shaper, Size::new(340.0, 600.0));
-    assert_eq!(reading_positions(&host).last().unwrap().source.document, 0, "cached documents carry their own source index");
+    assert_eq!(
+        reading_positions(&host).last().unwrap().source.document,
+        0,
+        "cached documents resolve their own source addresses"
+    );
 }
 
 #[test]
 fn reading_position_source_crosses_empty_chapter_markers() {
     let filler = "<p>Some text in the current section. More text follows here.</p>".repeat(12);
-    let source = format!("<html><head></head><body style='margin:0'><h1 id='first'>First</h1>{filler}<div id='second'></div><h2>Second</h2>{filler}</body></html>");
-    let parsed = html::document::parse_document(&source, html::document::MarkupSyntax::Html).unwrap().build_dom_checked().unwrap();
-    let marker = parsed.node_ids().find(|node| parsed.get_dom_id(*node) == Some("second")).unwrap();
-    let boundary = parsed.get_dom_path_to_node(marker).into_iter().skip(1).map(|node| parsed.get_element_step(node).unwrap()).collect::<Vec<_>>();
+    let source = format!(
+        "<html><head></head><body style='margin:0'><h1 id='first'>First</h1>{filler}<div id='second'></div><h2>Second</h2>{filler}</body></html>"
+    );
+    let parsed = html::document::parse_document(&source, html::document::MarkupSyntax::Html)
+        .unwrap()
+        .build_dom_checked()
+        .unwrap();
+    let marker = parsed
+        .node_ids()
+        .find(|node| parsed.get_dom_id(*node) == Some("second"))
+        .unwrap();
+    let boundary = parsed
+        .get_dom_path_to_node(marker)
+        .into_iter()
+        .skip(1)
+        .map(|node| parsed.get_element_step(node).unwrap())
+        .collect::<Vec<_>>();
     let (mut core, mut shaper, host) = source_position_reader(&source);
     core.set_toc_anchor_strings_by_doc(vec![vec!["first".into(), "second".into()]]);
     let viewport = Size::new(340.0, 600.0);
@@ -4937,23 +5569,32 @@ fn reading_position_source_crosses_empty_chapter_markers() {
         core.next_page(&mut shaper);
         core.prepare_frame(&mut shaper, viewport);
     }
-    assert!(reading_positions(&host).last().unwrap().source.path > boundary, "source addresses cross the empty marker even though it owns no glyph");
+    assert!(
+        reading_positions(&host).last().unwrap().source.path > boundary,
+        "source addresses cross the empty marker even though it owns no glyph"
+    );
     for _ in 0..5 {
         core.prev_page(&mut shaper);
         core.prepare_frame(&mut shaper, viewport);
     }
-    assert!(reading_positions(&host).last().unwrap().source.path < boundary, "backward navigation uses the same ordering");
+    assert!(
+        reading_positions(&host).last().unwrap().source.path < boundary,
+        "backward navigation uses the same ordering"
+    );
 }
 
 #[test]
 fn reading_position_image_pages_restore_and_survive_reflow() {
     let source = "<html><head></head><body style='margin:0'><img src='one.svg' width='300' height='500'/><img src='two.svg' width='300' height='500'/></body></html>";
     let (mut core, mut shaper, host) = source_position_reader(source);
-    let second_path = core.page.source_index.image_path(1).unwrap().to_vec();
+    let second_path = vec![4, 4];
     let viewport = Size::new(340.0, 600.0);
     core.prepare_frame(&mut shaper, viewport);
     let first = reading_positions(&host).last().unwrap().clone();
-    assert!(first.source.utf16_offset.is_none(), "an image has an element address rather than a borrowed text address");
+    assert!(
+        first.source.utf16_offset.is_none(),
+        "an image has an element address rather than a borrowed text address"
+    );
     for _ in 0..5 {
         if reading_positions(&host).last().unwrap().source.path == second_path {
             break;
@@ -4969,14 +5610,24 @@ fn reading_position_image_pages_restore_and_survive_reflow() {
     core.prepare_frame(&mut shaper, viewport);
     assert!(core.restore_position_from_cfi(&saved));
     core.prepare_frame(&mut shaper, viewport);
-    assert_eq!(reading_positions(&host).last().unwrap().source, second.source);
+    assert_eq!(
+        reading_positions(&host).last().unwrap().source,
+        second.source
+    );
     core.apply(&mut shaper, crate::RendererCommand::SetFontSize(20.0));
     core.prepare_frame(&mut shaper, viewport);
-    assert_eq!(reading_positions(&host).last().unwrap().source, second.source, "reflow must restore the element source position");
+    assert_eq!(
+        reading_positions(&host).last().unwrap().source,
+        second.source,
+        "reflow must restore the element source position"
+    );
     let (mut reopened, mut reopened_shaper, reopened_host) = source_position_reader(source);
     assert!(reopened.restore_position_from_cfi(&saved));
     reopened.prepare_frame(&mut reopened_shaper, viewport);
-    assert_eq!(reading_positions(&reopened_host).last().unwrap().source, second.source);
+    assert_eq!(
+        reading_positions(&reopened_host).last().unwrap().source,
+        second.source
+    );
 }
 
 #[test]
@@ -5009,36 +5660,38 @@ fn text_can_be_selected_inside_an_open_note() {
 
     // A note is a document view, so selection is the page's code applied
     // to it rather than a second implementation.
-    let note = core.note.as_ref().expect("an open note is held as a view");
-    let last_line = note.doc().text().line_count().saturating_sub(1);
+    let (note, owner) = core.note_parts().expect("an open note is held as a view");
+    let last_line = note.doc_for(owner).text().line_count().saturating_sub(1);
     let bottom = note
-        .doc()
+        .doc_for(owner)
         .text()
         .line(last_line)
         .map(|line| line.point().y + line.height())
         .unwrap_or(10.0);
 
     assert!(
-        core.note
-            .as_mut()
-            .expect("open note")
-            .begin_selection_at(Point::new(1.0, 1.0), crate::SelectionMode::Plain),
+        {
+            let (note, owner) = core.note_parts_mut().expect("open note");
+            note.begin_selection_at_for(Point::new(1.0, 1.0), crate::SelectionMode::Plain, owner)
+        },
         "a press inside the note starts a selection"
     );
     assert!(
-        core.note
-            .as_mut()
-            .expect("open note")
-            .update_selection_at(Point::new(280.0, bottom - 1.0), crate::SelectionMode::Plain),
+        {
+            let (note, owner) = core.note_parts_mut().expect("open note");
+            note.update_selection_at_for(
+                Point::new(280.0, bottom - 1.0),
+                crate::SelectionMode::Plain,
+                owner,
+            )
+        },
         "dragging extends it"
     );
     core.note.as_mut().expect("open note").finish_selection();
 
     let selected = core
-        .note
-        .as_ref()
-        .expect("open note")
-        .selection_text()
+        .note_parts()
+        .and_then(|(note, owner)| note.selection_text_for(owner))
         .expect("the note yields selected text");
     assert!(
         selected.contains("Selectable"),
@@ -5120,13 +5773,10 @@ fn a_note_is_laid_out_to_the_width_its_host_will_show_it_at() {
         core.configure_layout_for_viewport(&mut shaper, Size::new(600.0, 400.0));
         core.footnote_preview(&mut shaper, "#note")
             .expect("the note must preview");
-        core.note
-            .as_ref()
-            .expect("open note")
-            .document
-            .render_view()
-            .text()
-            .line_count()
+        {
+            let (note, owner) = core.note_parts().expect("open note");
+            note.doc_for(owner).text().line_count()
+        }
     };
 
     let wide = lines_at(None);
@@ -5237,44 +5887,70 @@ fn namespaced_xhtml_footnotes_are_popup_only_and_absent_from_paginated_text() {
         "the namespaced XHTML footnote body must not consume paginated layout space"
     );
     assert!(core.footnote_preview(&mut shaper, "#note").is_some());
-    assert!(
-        laid_out_text(&core.note.as_ref().expect("open note").document)
-            .contains("Popup-only magenta")
-    );
+    assert!(open_note_text(&core).contains("Popup-only magenta"));
 }
 
 #[derive(Default)]
 struct DeferredFileJobs(std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>);
 impl html::resources::BlockingJobSpawner for DeferredFileJobs {
-    fn spawn(&self, job: Box<dyn FnOnce() + Send>) { self.0.lock().unwrap().push(job); }
+    fn spawn(&self, job: Box<dyn FnOnce() + Send>) {
+        self.0.lock().unwrap().push(job);
+    }
 }
 impl DeferredFileJobs {
     fn run(&self) {
         let jobs = std::mem::take(&mut *self.0.lock().unwrap());
-        std::thread::spawn(move || { for job in jobs { job(); } }).join().unwrap();
+        std::thread::spawn(move || {
+            for job in jobs {
+                job();
+            }
+        })
+        .join()
+        .unwrap();
     }
 }
 
 #[test]
 fn reading_waits_for_the_next_document_without_replaying_the_old_one() {
-    let (mut core, shaper) = spine_core(vec![
-        ("one.html", "<html><body><p>First chapter</p></body></html>"),
-        ("two.html", "<html><body><p>Second chapter</p></body></html>"),
-    ], Size::new(600.0, 800.0), 600.0, 1);
+    let (mut core, shaper) = spine_core(
+        vec![
+            ("one.html", "<html><body><p>First chapter</p></body></html>"),
+            (
+                "two.html",
+                "<html><body><p>Second chapter</p></body></html>",
+            ),
+        ],
+        Size::new(600.0, 800.0),
+        600.0,
+        1,
+    );
     let jobs = Arc::new(DeferredFileJobs::default());
-    core.host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
+    core.host = Rc::new(TestHost {
+        jobs: Some(jobs.clone()),
+        ..Default::default()
+    });
     let mut session = crate::RendererSession::from_core(core, shaper);
     let revision = session.navigation_revision();
     session.advance_reading_document();
-    assert!(session.reading_fragments().is_none(), "old chapter fragments must be unavailable while the next chapter loads");
+    assert!(
+        session.reading_fragments().is_none(),
+        "old chapter fragments must be unavailable while the next chapter loads"
+    );
     session.update_resources();
-    assert!(session.reading_fragments().is_none(), "a slow file read must keep narration waiting");
+    assert!(
+        session.reading_fragments().is_none(),
+        "a slow file read must keep narration waiting"
+    );
     jobs.run();
     session.update_resources();
     let (doc, fragments) = session.reading_fragments().unwrap();
     assert_eq!(doc, 1);
     assert_eq!(fragments[0].text, "Second chapter");
-    assert_eq!(session.navigation_revision(), revision, "automatic chapter advancement is not manual navigation");
+    assert_eq!(
+        session.navigation_revision(),
+        revision,
+        "automatic chapter advancement is not manual navigation"
+    );
 }
 
 #[test]
@@ -5285,17 +5961,45 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
         } else {
             "<html><body><p><a href='two.html#target'>Jump</a></p></body></html>"
         };
-        let (mut core, shaper) = spine_core(vec![
-            ("one.html", source),
-            ("two.html", "<html><body><p id='target'>Second chapter</p><aside id='note' role='doc-footnote'>A note</aside></body></html>"),
-        ], Size::new(600.0, 800.0), 600.0, 1);
+        let (mut core, shaper) = spine_core(
+            vec![
+                ("one.html", source),
+                (
+                    "two.html",
+                    "<html><body><p id='target'>Second chapter</p><aside id='note' role='doc-footnote'>A note</aside></body></html>",
+                ),
+            ],
+            Size::new(600.0, 800.0),
+            600.0,
+            1,
+        );
         let jobs = Arc::new(DeferredFileJobs::default());
-        core.host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
+        core.host = Rc::new(TestHost {
+            jobs: Some(jobs.clone()),
+            ..Default::default()
+        });
         let glyph = glyph_index_for_character(&core, 'J');
-        let line_index = core.doc().find_line_for_glyph(glyph).unwrap();
-        let line = core.page.view.document.render_view().text().line(line_index).unwrap();
-        let screen = core.page.view.frame.page().line_positions().get(line_index).unwrap();
-        let click = Point::new(screen.point.x + core.text_geometry().glyph_x_in_line(&line, glyph) + 0.1, screen.point.y + line.height() / 2.0);
+        let line_index = core.doc().text().line_index_for_glyph(glyph).unwrap();
+        let line = core
+            .page
+            .view
+            .document
+            .render_view()
+            .text()
+            .line(line_index)
+            .unwrap();
+        let screen = core
+            .page
+            .view
+            .frame
+            .page()
+            .line_positions()
+            .get(line_index)
+            .unwrap();
+        let click = Point::new(
+            screen.point.x + core.text_geometry().glyph_x_in_line(&line, glyph) + 0.1,
+            screen.point.y + line.height() / 2.0,
+        );
         let mut session = crate::RendererSession::from_core(core, shaper);
         let revision = session.navigation_revision();
         assert!(session.pointer_down(click, crate::PointerDownOptions::default()));
@@ -5304,10 +6008,18 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
         jobs.run();
         session.update_resources();
         if note {
-            assert_eq!(session.navigation_revision(), revision, "opening a note does not interrupt narration");
+            assert_eq!(
+                session.navigation_revision(),
+                revision,
+                "opening a note does not interrupt narration"
+            );
             assert_eq!(session.reading_fragments().unwrap().0, 0);
         } else {
-            assert_ne!(session.navigation_revision(), revision, "a delayed chapter link must restart narration");
+            assert_ne!(
+                session.navigation_revision(),
+                revision,
+                "a delayed chapter link must restart narration"
+            );
             assert_eq!(session.reading_fragments().unwrap().0, 1);
         }
     }
@@ -5317,17 +6029,34 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
 fn remote_file_navigation_waits_for_background_reads_and_preserves_failed_page() {
     let (provider, reads) = CountingProvider::new(vec![
         ("one.html", "<html><body>First</body></html>"),
-        ("two.html", "<html><body><p id='target'>Second</p></body></html>"),
+        (
+            "two.html",
+            "<html><body><p id='target'>Second</p></body></html>",
+        ),
     ]);
     let jobs = Arc::new(DeferredFileJobs::default());
-    let host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
+    let host = Rc::new(TestHost {
+        jobs: Some(jobs.clone()),
+        ..Default::default()
+    });
     let mut shaper = TestShaper::default();
-    let mut core = RendererCore::from_provider_with_nav(host.clone(), &mut shaper, provider,
-        vec!["one.html".into(), "two.html".into(), "missing.html".into()], 0, None, RendererInitialConfig::default());
+    let mut core = RendererCore::from_provider_with_nav(
+        host.clone(),
+        &mut shaper,
+        provider,
+        vec!["one.html".into(), "two.html".into(), "missing.html".into()],
+        0,
+        None,
+        RendererInitialConfig::default(),
+    );
     let before = reads.load(Ordering::Relaxed);
     assert!(core.navigate_to_href(&mut shaper, "two.html#target"));
     assert_eq!(core.nav.location().document(), 0);
-    assert_eq!(reads.load(Ordering::Relaxed), before, "UI navigation must not read the file");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        before,
+        "UI navigation must not read the file"
+    );
     jobs.run();
     core.finish_pending_navigation(&mut shaper);
     assert_eq!(core.nav.location().document(), 1);
@@ -5337,21 +6066,183 @@ fn remote_file_navigation_waits_for_background_reads_and_preserves_failed_page()
     jobs.run();
     core.finish_pending_navigation(&mut shaper);
     assert_eq!(core.nav.location().document(), 0);
-    assert!(host.events.borrow().iter().any(|event| matches!(event, RendererEvent::OperationFailed { .. })));
+    assert!(
+        host.events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, RendererEvent::OperationFailed { .. }))
+    );
     // Failure does not poison the source or prevent another request.
     core.load_document_at(&mut shaper, 2, crate::DocAnchor::Start);
     assert!(core.pending_navigation.is_some());
 }
 
 #[test]
+fn local_navigation_cancels_a_pending_chapter_turn() {
+    let viewport = Size::new(200.0, 40.0);
+    for (source, can_move) in [
+        (
+            "<html><body style='margin:0;line-height:20px'>A<br>B<br>C<br>D<br>E<br>F</body></html>",
+            true,
+        ),
+        (
+            "<html><body style='margin:0;line-height:20px'>A</body></html>",
+            false,
+        ),
+    ] {
+        for forward in [true, false] {
+            for by_line in [false, true] {
+                let (provider, _) =
+                    CountingProvider::new(vec![("one.html", source), ("two.html", source)]);
+                let mut shaper = TestShaper::default();
+                let current_doc = usize::from(!forward);
+                let mut core = RendererCore::from_provider_with_nav(
+                    Rc::new(TestHost::default()),
+                    &mut shaper,
+                    provider,
+                    vec!["one.html".into(), "two.html".into()],
+                    current_doc,
+                    None,
+                    RendererInitialConfig {
+                        column_width: 200.0,
+                        max_column_count: Some(1),
+                        ..Default::default()
+                    },
+                );
+                core.prepare_frame(&mut shaper, viewport);
+                if forward {
+                    for _ in 0..10 {
+                        if core.viewport.continuation().reached_end() {
+                            break;
+                        }
+                        core.next_page(&mut shaper);
+                        core.prepare_frame(&mut shaper, viewport);
+                    }
+                    assert!(core.viewport.continuation().reached_end());
+                }
+                let jobs = Arc::new(DeferredFileJobs::default());
+                let host = Rc::new(TestHost {
+                    jobs: Some(jobs.clone()),
+                    ..Default::default()
+                });
+                core.host = host.clone();
+                if forward {
+                    core.next_page(&mut shaper);
+                } else {
+                    core.prev_page(&mut shaper);
+                }
+                assert!(
+                    core.pending_navigation.is_some(),
+                    "the adjacent chapter must still be loading"
+                );
+                let before = core.nav.current_cfi(core.nav_view());
+
+                let repaints = host.repaint_requests.get();
+                match (forward, by_line) {
+                    (true, false) => core.prev_page(&mut shaper),
+                    (true, true) => core.prev_line(&mut shaper),
+                    (false, false) => core.next_page(&mut shaper),
+                    (false, true) => core.next_line(&mut shaper),
+                }
+                assert!(
+                    host.repaint_requests.get() > repaints,
+                    "cancelling a chapter read must repaint even at a book boundary"
+                );
+                core.prepare_frame(&mut shaper, viewport);
+                let after = core.nav.current_cfi(core.nav_view());
+                if can_move {
+                    assert_ne!(
+                        after, before,
+                        "the later navigation must move within the current chapter"
+                    );
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "a turn past a book boundary keeps its position"
+                    );
+                }
+
+                jobs.run();
+                core.finish_pending_navigation(&mut shaper);
+                core.prepare_frame(&mut shaper, viewport);
+                assert_eq!(
+                    core.nav.location().document(),
+                    current_doc,
+                    "a delayed chapter request must not override local navigation (forward={forward}, by_line={by_line})"
+                );
+                assert_eq!(
+                    core.nav.current_cfi(core.nav_view()),
+                    after,
+                    "the later reading position must survive completion of the stale read"
+                );
+                assert!(core.pending_navigation.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_chapter_turns_reuse_the_pending_read() {
+    let viewport = Size::new(200.0, 200.0);
+    let source = "<html><body>Chapter</body></html>";
+    for forward in [true, false] {
+        let (provider, _) = CountingProvider::new(vec![("one.html", source), ("two.html", source)]);
+        let mut shaper = TestShaper::default();
+        let current_doc = usize::from(!forward);
+        let jobs = Arc::new(DeferredFileJobs::default());
+        let mut core = RendererCore::from_provider_with_nav(
+            Rc::new(TestHost {
+                jobs: Some(jobs.clone()),
+                ..Default::default()
+            }),
+            &mut shaper,
+            provider,
+            vec!["one.html".into(), "two.html".into()],
+            current_doc,
+            None,
+            RendererInitialConfig {
+                column_width: 200.0,
+                max_column_count: Some(1),
+                ..Default::default()
+            },
+        );
+        core.prepare_frame(&mut shaper, viewport);
+        for _ in 0..3 {
+            if forward {
+                core.next_page(&mut shaper);
+            } else {
+                core.prev_page(&mut shaper);
+            }
+        }
+        assert_eq!(
+            jobs.0.lock().unwrap().len(),
+            1,
+            "holding an arrow must reuse the chapter read"
+        );
+        jobs.run();
+        core.finish_pending_navigation(&mut shaper);
+        core.prepare_frame(&mut shaper, viewport);
+        assert_eq!(core.nav.location().document(), usize::from(forward));
+    }
+}
+
+#[test]
 fn remote_file_navigation_discards_superseded_results() {
-    let (mut core, mut shaper) = spine_core(vec![
-        ("one.html", "<html><body>First</body></html>"),
-        ("two.html", "<html><body>Second</body></html>"),
-        ("three.html", "<html><body>Third</body></html>"),
-    ], Size::new(600.0, 800.0), 600.0, 1);
+    let (mut core, mut shaper) = spine_core(
+        vec![
+            ("one.html", "<html><body>First</body></html>"),
+            ("two.html", "<html><body>Second</body></html>"),
+            ("three.html", "<html><body>Third</body></html>"),
+        ],
+        Size::new(600.0, 800.0),
+        600.0,
+        1,
+    );
     let jobs = Arc::new(DeferredFileJobs::default());
-    core.host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
+    core.host = Rc::new(TestHost {
+        jobs: Some(jobs.clone()),
+        ..Default::default()
+    });
     core.load_document_at(&mut shaper, 1, crate::DocAnchor::Start);
     core.load_document_at(&mut shaper, 2, crate::DocAnchor::Start);
     assert_eq!(core.nav.location().document(), 0);
@@ -5362,12 +6253,35 @@ fn remote_file_navigation_discards_superseded_results() {
 
 #[test]
 fn remote_file_search_navigation_finishes_on_the_loaded_document() {
-    let (mut core, mut shaper) = spine_core(vec![("one.html", "<html><body>First</body></html>"), ("two.html", "<html><body>Second needle</body></html>")], Size::new(600.0, 800.0), 600.0, 1);
+    let (mut core, mut shaper) = spine_core(
+        vec![
+            ("one.html", "<html><body>First</body></html>"),
+            ("two.html", "<html><body>Second needle</body></html>"),
+        ],
+        Size::new(600.0, 800.0),
+        600.0,
+        1,
+    );
     let jobs = Arc::new(DeferredFileJobs::default());
-    core.host = Rc::new(TestHost { jobs: Some(jobs.clone()), ..Default::default() });
-    core.set_search_results(&mut shaper, "needle".into(), crate::SearchOptions::default(), vec![crate::BookSearchMatch { doc: 1, target: crate::BookSearchTarget::LocalOccurrence(0), excerpt: "Second needle".into() }]);
+    core.host = Rc::new(TestHost {
+        jobs: Some(jobs.clone()),
+        ..Default::default()
+    });
+    core.set_search_results(
+        &mut shaper,
+        "needle".into(),
+        crate::SearchOptions::default(),
+        vec![crate::BookSearchMatch {
+            doc: 1,
+            target: crate::BookSearchTarget::LocalOccurrence(0),
+            excerpt: "Second needle".into(),
+        }],
+    );
     assert_eq!(core.nav.location().document(), 0);
-    assert!(core.pending_navigation.is_none(), "arriving search results must not load another chapter");
+    assert!(
+        core.pending_navigation.is_none(),
+        "arriving search results must not load another chapter"
+    );
     assert!(jobs.0.lock().unwrap().is_empty());
     core.next_match(&mut shaper);
     assert_eq!(core.nav.location().document(), 0);
@@ -5379,24 +6293,36 @@ fn remote_file_search_navigation_finishes_on_the_loaded_document() {
 
 #[test]
 fn narration_items_are_unpaginated_and_materialize_text_on_demand() {
-    let prose = (0..160).map(|index| format!("word{index}")).collect::<Vec<_>>().join(" ");
-    let source = format!("<html><body style='margin:0'><p>Earlier element</p><p>{prose}</p><p>Later element</p></body></html>");
+    let prose = (0..160)
+        .map(|index| format!("word{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source = format!(
+        "<html><body style='margin:0'><p>Earlier element</p><p>{prose}</p><p>Later element</p></body></html>"
+    );
     let (core, shaper) = pagination_core(&source, Size::new(240.0, 180.0), 1);
     let mut session = crate::RendererSession::from_core(core, shaper);
     let (_, start, offset, items) = session.reading_items().unwrap();
     assert_eq!(items.len(), 3, "visual pages must not split logical items");
     assert_eq!(start, 0);
     assert!(offset <= items[0].glyph_ranges[0].start);
-    let addressing = session.document().render_view().addressing();
+    let addressing = session.render_view().addressing();
     assert_eq!(addressing.reading_text(&items[1]), prose);
     let mut middle = items[1].clone();
-    middle.glyph_ranges = vec![middle.glyph_ranges[0].start + 400..middle.glyph_ranges[0].start + 405];
+    middle.glyph_ranges =
+        vec![middle.glyph_ranges[0].start + 400..middle.glyph_ranges[0].start + 405];
     session.follow_reading_target(middle);
     session.prepare_frame(Size::new(240.0, 180.0));
     let (_, start, offset, later) = session.reading_items().unwrap();
     assert_eq!(start, 1);
-    assert!(offset > items[1].glyph_ranges[0].start, "start inside the visible paragraph");
-    assert_eq!(later, items, "previous-item navigation retains the original paragraph start");
+    assert!(
+        offset > items[1].glyph_ranges[0].start,
+        "start inside the visible paragraph"
+    );
+    assert_eq!(
+        later, items,
+        "previous-item navigation retains the original paragraph start"
+    );
 }
 
 #[test]
@@ -5406,8 +6332,11 @@ fn narration_chunks_carry_normalized_text_and_original_glyphs() {
     let session = crate::RendererSession::from_core(core, shaper);
     let (_, _, _, items) = session.reading_items().unwrap();
     assert_eq!(items.len(), 1);
-    let addressing = session.document().render_view().addressing();
-    assert_eq!(addressing.reading_text(&items[0]), "First ångström. Second cafés. Third.");
+    let addressing = session.render_view().addressing();
+    assert_eq!(
+        addressing.reading_text(&items[0]),
+        "First ångström. Second cafés. Third."
+    );
     let mut cursor = 0;
     let mut texts = Vec::new();
     loop {
@@ -5426,7 +6355,12 @@ fn narration_chunks_carry_normalized_text_and_original_glyphs() {
         cursor = next;
     }
     assert_eq!(texts, ["First ångström.", "Second cafés.", "Third."]);
-    assert!(addressing.reading_chunk(&items[0], u32::MAX, 400, |text| (!text.is_empty()).then_some(0..text.len())).is_none());
+    assert!(
+        addressing
+            .reading_chunk(&items[0], u32::MAX, 400, |text| (!text.is_empty())
+                .then_some(0..text.len()))
+            .is_none()
+    );
 }
 
 #[test]
@@ -5435,15 +6369,23 @@ fn narration_bounded_chunks_preserve_unicode_and_disjoint_source_ranges() {
     let (core, shaper) = pagination_core(source, Size::new(240.0, 180.0), 1);
     let session = crate::RendererSession::from_core(core, shaper);
     let (_, _, _, items) = session.reading_items().unwrap();
-    let addressing = session.document().render_view().addressing();
+    let addressing = session.render_view().addressing();
     let expected = addressing.reading_text(&items[0]);
     let mut actual = String::new();
     let mut cursor = 0;
     loop {
         let (chunk, next) = addressing
             .reading_chunk(&items[0], cursor, 7, |text| {
-                assert!(text.chars().count() <= 8, "extraction is bounded, including lookahead");
-                Some(0..text.char_indices().nth(7).map_or(text.len(), |(offset, _)| offset))
+                assert!(
+                    text.chars().count() <= 8,
+                    "extraction is bounded, including lookahead"
+                );
+                Some(
+                    0..text
+                        .char_indices()
+                        .nth(7)
+                        .map_or(text.len(), |(offset, _)| offset),
+                )
             })
             .unwrap();
         assert!(chunk.text.chars().count() <= 7);
@@ -5453,29 +6395,208 @@ fn narration_bounded_chunks_preserve_unicode_and_disjoint_source_ranges() {
         assert!(next > cursor);
         cursor = next;
     }
-    assert_eq!(actual.chars().filter(|ch| !ch.is_whitespace()).collect::<String>(), expected.chars().filter(|ch| !ch.is_whitespace()).collect::<String>());
-    let (whole, next) = addressing.reading_chunk(&items[0], 0, 400, |text| Some(0..text.len())).unwrap();
+    assert_eq!(
+        actual
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>(),
+        expected
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    );
+    let (whole, next) = addressing
+        .reading_chunk(&items[0], 0, 400, |text| Some(0..text.len()))
+        .unwrap();
     assert_eq!(whole.text, expected);
-    assert!(whole.target.glyph_ranges.len() > 1, "excluded note references leave gaps in source ranges");
+    assert!(
+        whole.target.glyph_ranges.len() > 1,
+        "excluded note references leave gaps in source ranges"
+    );
     assert_eq!(next, None);
 }
 
 #[test]
+fn reader_hyphenation_changes_apply_immediately_and_book_restores_publication_rules() {
+    use html::style::Hyphens;
+    for (authored, book_hyphenates) in [("none", false), ("auto", true)] {
+        let html = format!(
+            "<html lang='en'><body style='margin:0'><p style='margin:0;text-align:justify;hyphens:{authored}'>internationalization internationalization</p></body></html>"
+        );
+        let (mut core, mut shaper) = pagination_core(&html, Size::new(72.0, 300.0), 1);
+        for (selection, expected) in [
+            (Some(Hyphens::Auto), true),
+            (Some(Hyphens::None), false),
+            (None, book_hyphenates),
+        ] {
+            core.apply(
+                &mut shaper,
+                crate::RendererCommand::SetReaderStyleOverrides(
+                    html::pipeline::ReaderStyleOverrides {
+                        hyphens: selection,
+                        ..Default::default()
+                    },
+                ),
+            );
+            let text = core.page.view.document.render_view().text();
+            assert_eq!(
+                (0..text.line_count()).any(|index| text.hyphen_for_line(index).is_some()),
+                expected,
+                "switching modes must reflow the current book: {authored}, {selection:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reader_word_spacing_keeps_carets_selection_and_hit_testing_aligned() {
+    let (mut core, mut shaper) = pagination_core(
+        "<html><body style='margin:0'><p style='margin:0'>a a</p></body></html>",
+        Size::new(400.0, 300.0),
+        1,
+    );
+    for factor in [1.5, 0.5, 1.0] {
+        core.apply(
+            &mut shaper,
+            crate::RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
+                word_spacing_factor: (factor != 1.0).then_some(factor),
+                ..Default::default()
+            }),
+        );
+        core.paint_forward(&mut RecordingPainter::default());
+        let geometry = core.text_geometry();
+        let text = core.page.view.document.render_view().text();
+        let line_idx = text.line_index_for_glyph(1).expect("space line");
+        let line = text.line(line_idx).unwrap();
+        let first_x = geometry.glyph_x_in_line(&line, 0);
+        let second_x = geometry.glyph_x_in_line(&line, 2);
+        let expected_gap = 8.0 * f64::from(factor);
+        assert!(
+            (second_x - first_x - 8.0 - expected_gap).abs() < 1.0e-6,
+            "word origins must use the scaled gap"
+        );
+        let bounds = geometry.glyph_range_bounds(1, 2).expect("space selection");
+        assert!(
+            (bounds.width() - expected_gap).abs() < 1.0e-6,
+            "selection must cover the complete adjusted space"
+        );
+        let y = (bounds.y0 + bounds.y1) / 2.0;
+        assert_eq!(
+            geometry.hit_test_glyph(Point::new(bounds.x0 + expected_gap * 0.25, y)),
+            Some(1)
+        );
+        assert_eq!(
+            geometry.hit_test_glyph(Point::new(bounds.x0 + expected_gap * 0.75, y)),
+            Some(2)
+        );
+    }
+}
+
+#[test]
 fn reader_color_update_preserves_chapter_text_selection_and_geometry() {
-    let (mut core, mut shaper) = pagination_core("<p id='anchor'>Selected <a href='#anchor'>link</a> and ordinary text.</p>", Size::new(400.0, 300.0), 1);
-    core.page.view.selection.select_range(0, 8, crate::SelectionMode::Plain);
+    let (mut core, mut shaper) = pagination_core(
+        "<p id='anchor'>Selected <a href='#anchor'>link</a> and ordinary text.</p>",
+        Size::new(400.0, 300.0),
+        1,
+    );
+    core.page
+        .view
+        .selection
+        .select_range(0, 8, crate::SelectionMode::Plain);
     core.page.view.update_selection_text();
-    let selected = core.page.view.selection.content().plain().map(str::to_owned);
-    let text = core.page.inputs.source.clone();
+    let selected = core
+        .page
+        .view
+        .selection
+        .content()
+        .plain()
+        .map(str::to_owned);
+    let text = core.page.inputs().source.as_ptr();
     let layout_revision = core.revisions.layout;
     let display_revision = core.revisions.base_display;
     let line_count = core.page.view.doc().text().line_count();
     shaper.reject_glyphs = true;
-    core.apply(&mut shaper, crate::RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides { link_foreground: Some(0x123456ff), ..Default::default() }));
-    assert!(Arc::ptr_eq(&text, &core.page.inputs.source));
-    assert_eq!(core.page.view.selection.content().plain(), selected.as_deref());
+    core.apply(
+        &mut shaper,
+        crate::RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
+            link_foreground: Some(0x123456ff),
+            ..Default::default()
+        }),
+    );
+    assert_eq!(text, core.page.inputs().source.as_ptr());
+    assert_eq!(
+        core.page.view.selection.content().plain(),
+        selected.as_deref()
+    );
     assert_eq!(core.revisions.layout, layout_revision);
     assert!(core.revisions.base_display > display_revision);
     assert_eq!(core.page.view.doc().text().line_count(), line_count);
-    assert_eq!(core.page.inputs.reader_overrides.link_foreground, Some(0x123456ff));
+    assert_eq!(
+        core.page.inputs().reader_overrides.link_foreground,
+        Some(0x123456ff)
+    );
+}
+
+#[test]
+fn publication_fonts_follow_navigation_and_refresh_preserves_reading_position() {
+    let (provider, _) = CountingProvider::new(vec![
+        (
+            "one.html",
+            "<html><head><style>@font-face { font-family: First; src: url(first.ttf) }</style></head><body><p>First chapter</p></body></html>",
+        ),
+        (
+            "two.html",
+            "<html><head><style>@font-face { font-family: Second; src: url(second.ttf) }</style></head><body><p>Second chapter</p></body></html>",
+        ),
+    ]);
+    let host = Rc::new(TestHost::default());
+    let mut session = crate::RendererSession::from_provider_with_nav(
+        host.clone(),
+        TestShaper::default(),
+        provider,
+        vec!["one.html".into(), "two.html".into()],
+        0,
+        None,
+        RendererInitialConfig::default(),
+    );
+    assert_eq!(
+        host.font_preparations.borrow().last().unwrap()[0].family,
+        "First"
+    );
+    let before = session.revisions().shape;
+    let position = session.current_cfi();
+    session.apply(crate::RendererCommand::RefreshFonts);
+    assert!(session.revisions().shape > before);
+    assert_eq!(session.current_cfi(), position);
+    session.next_document();
+    assert_eq!(
+        host.font_preparations.borrow().last().unwrap()[0].family,
+        "Second"
+    );
+    session.previous_document();
+    assert_eq!(
+        host.font_preparations.borrow().last().unwrap()[0].family,
+        "First"
+    );
+}
+
+#[test]
+fn malformed_cfi_zero_steps_return_none_for_points_and_ranges() {
+    let (core, _, _) = source_position_reader("<html><body><p>Text</p></body></html>");
+    let doc = &core.page.view.document;
+    for cfi in [
+        "epubcfi(/6/2!/0)",
+        "epubcfi(/6/2!/4/0/1:0)",
+        "epubcfi(/6/2!/4/2/0:0)",
+    ] {
+        assert_eq!(crate::cfi::parse_cfi(doc, cfi), None);
+        assert_eq!(crate::cfi::parse_source_position(cfi), None);
+    }
+    for cfi in [
+        "epubcfi(/6/2!/4/0,/1:0,/1:2)",
+        "epubcfi(/6/2!/4/2,/0:0,/1:2)",
+        "epubcfi(/6/2!/4/2,/1:0,/0:2)",
+    ] {
+        assert_eq!(crate::cfi::parse_cfi_range(doc, cfi), None);
+    }
 }

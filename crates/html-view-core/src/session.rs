@@ -4,13 +4,27 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use html_view_paginate::PaginationScratch;
-use kurbo::{Point, Size};
+use kurbo::{Point, Rect, Size};
 
 use crate::{
     FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter,
     ReadingFragment, ReadingTarget, RendererCommand, RendererCore, RendererHost, RendererOperation,
-    RendererRevisions, ResourceProvider, TocEntry,
+    RendererRevisions, ResourceProvider,
 };
+
+/// One rendered line, retaining its reading region even when other lines
+/// occupy the same vertical space. Coordinates match painted selection bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadingLine {
+    pub glyphs: Range<u32>,
+    pub bounds: Rect,
+    /// The page-column band at this line's height, spanning adjacent cells.
+    pub column_bounds: Rect,
+    pub column: i32,
+    /// The nearest laid-out table cell, including CSS table cells.
+    /// This identity is local to the current document layout.
+    pub cell: Option<usize>,
+}
 
 /// The high-level renderer API used by UI backends.
 ///
@@ -61,35 +75,37 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// Starts a selection inside the open note. Positions are relative to the
     /// note's own origin, as the host draws it.
     pub fn note_pointer_down(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        let Some(note) = self.core.note.as_mut() else {
+        let Some((note, owner)) = self.core.note_parts_mut() else {
             return false;
         };
-        let handled = note.begin_selection_at(position, mode);
-        note.update_selection_text();
+        let handled = note.begin_selection_at_for(position, mode, owner);
+        note.update_selection_text_for(owner);
         handled
     }
 
     pub fn note_pointer_move(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        let Some(note) = self.core.note.as_mut() else {
+        let Some((note, owner)) = self.core.note_parts_mut() else {
             return false;
         };
-        let handled = note.update_selection_at(position, mode);
-        note.update_selection_text();
+        let handled = note.update_selection_at_for(position, mode, owner);
+        note.update_selection_text_for(owner);
         handled
     }
 
     pub fn note_pointer_up(&mut self) -> bool {
-        let Some(note) = self.core.note.as_mut() else {
+        let Some((note, owner)) = self.core.note_parts_mut() else {
             return false;
         };
         note.finish_selection();
-        note.update_selection_text();
+        note.update_selection_text_for(owner);
         true
     }
 
     /// Text currently selected inside the note, for the host to copy.
     pub fn note_selection_text(&self) -> Option<String> {
-        self.core.note.as_ref()?.selection_text()
+        self.core
+            .note_parts()
+            .and_then(|(note, owner)| note.selection_text_for(owner))
     }
 
     /// Paints the note's selection highlight. The note's own content comes
@@ -165,14 +181,145 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.annotation_bounds(id)
     }
 
-    pub fn document(&self) -> &LaidOutDocument {
+    /// Visible rendered lines in document order, retaining table-cell and
+    /// page-column boundaries. Each line counts separately even if it overlaps
+    /// another line vertically. Bands follow the cell or text block's width.
+    pub fn visible_reading_lines(&self) -> Vec<ReadingLine> {
+        if self.reading_document().is_none() {
+            return Vec::new();
+        }
+        let view = &self.core.page.view;
+        let rendered = view.document.render_view();
+        let text = rendered.text();
+        let boxes = rendered.boxes();
+        let geometry = self.core.text_geometry();
+        let mut lines: Vec<ReadingLine> = view
+            .frame
+            .page()
+            .line_positions()
+            .iter()
+            .filter_map(|(index, screen)| {
+                let line = text.line(index)?;
+                if line.height() <= 0.0 {
+                    return None;
+                }
+                // Project the formatting context's clip exactly as the painter
+                // does, including pagination's translation into another column.
+                let clip = text.line_overflow_clip(index).map(|clip| {
+                    let rect = clip.rect() + (screen.point - line.point());
+                    Rect::new(
+                        if clip.clips_x() {
+                            rect.x0
+                        } else {
+                            f64::NEG_INFINITY
+                        },
+                        if clip.clips_y() {
+                            rect.y0
+                        } else {
+                            f64::NEG_INFINITY
+                        },
+                        if clip.clips_x() {
+                            rect.x1
+                        } else {
+                            f64::INFINITY
+                        },
+                        if clip.clips_y() {
+                            rect.y1
+                        } else {
+                            f64::INFINITY
+                        },
+                    )
+                });
+                let clipped = |rect: Rect| clip.map_or(rect, |clip| rect.intersect(clip));
+                // Hidden text still contributes layout lines. Only painted text
+                // should consume ruler steps, and anchors must start in visible ink.
+                let glyphs = text
+                    .line_text_fragments(index)?
+                    .filter(|fragment| fragment.visible())
+                    .map(|fragment| fragment.glyphs())
+                    .filter(|range| !range.is_empty())
+                    .filter(|range| {
+                        if clip.is_none() {
+                            return true;
+                        }
+                        let (x0, x1) = geometry.glyph_x_span_in_line(&line, range.start, range.end);
+                        let bounds = clipped(Rect::new(
+                            screen.point.x + x0,
+                            screen.point.y,
+                            screen.point.x + x1,
+                            screen.point.y + line.height(),
+                        ));
+                        bounds.width() > 0.0 && bounds.height() > 0.0
+                    })
+                    .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))?;
+                let owner = line.owner_box_idx();
+                let cell = std::iter::once(owner)
+                    .chain(boxes.ancestors(owner))
+                    .find(|&index| boxes.is_table_cell(index));
+                let region = cell.unwrap_or(owner);
+                let (x, width) = boxes
+                    .point(region)
+                    .zip(boxes.size(region))
+                    .filter(|(_, size)| size.width > 0.0)
+                    .map(|(point, size)| (screen.point.x + point.x - line.point().x, size.width))
+                    .unwrap_or_else(|| {
+                        (
+                            view.layout.col_x(f64::from(screen.col_index), 0.0),
+                            view.layout.col_width,
+                        )
+                    });
+                let bounds = clipped(Rect::new(
+                    x,
+                    screen.point.y,
+                    x + width,
+                    screen.point.y + line.height(),
+                ));
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    return None;
+                }
+                let start = self
+                    .core
+                    .from_layout_point(Point::new(bounds.x0, bounds.y0));
+                let end = self
+                    .core
+                    .from_layout_point(Point::new(bounds.x1, bounds.y1));
+                let column_x = view.layout.col_x(f64::from(screen.col_index), 0.0);
+                let column_start = self
+                    .core
+                    .from_layout_point(Point::new(column_x, screen.point.y));
+                let column_end = self.core.from_layout_point(Point::new(
+                    column_x + view.layout.col_width,
+                    screen.point.y + line.height(),
+                ));
+                let column_bounds =
+                    Rect::new(column_start.x, column_start.y, column_end.x, column_end.y);
+                Some(ReadingLine {
+                    glyphs,
+                    bounds: Rect::new(start.x, start.y, end.x, end.y),
+                    column_bounds,
+                    column: screen.col_index,
+                    cell,
+                })
+            })
+            .collect();
+        // Spatial line indexes interleave adjacent table cells. Source glyph
+        // order completes each cell/block while retaining page-column order.
+        lines.sort_by_key(|line| (line.column, line.glyphs.start));
+        lines
+    }
+
+    pub fn render_view(&self) -> html::layout::RenderView<'_> {
+        self.core.page.view.document.render_view()
+    }
+
+    pub fn document(&self) -> &LaidOutDocument<'static> {
         &self.core.page.view.document
     }
 
     /// The reader palette for hosts adapting image paint. This is separate
     /// from text foreground overrides and never changes image resources.
     pub fn image_theme(&self) -> Option<html::pipeline::ThemeAdaptation> {
-        self.core.page.inputs.reader_overrides.theme
+        self.core.page.inputs().reader_overrides.theme
     }
 
     pub fn glyph_shaper(&self) -> &S {
@@ -215,15 +362,6 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn advance_reading_document(&mut self) {
         self.core.next_document(&mut self.glyph_shaper);
-    }
-
-    /// Builds the navigation list from headings in the current document.
-    pub fn toc(&self) -> std::io::Result<Option<Vec<TocEntry>>> {
-        Ok(Some(self.document_toc()))
-    }
-
-    pub fn document_toc(&self) -> Vec<TocEntry> {
-        RendererCore::build_document_toc_entries_for(&self.core.page.view.document)
     }
 
     pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
@@ -394,13 +532,17 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     /// Highlights a block and follows it only if its beginning is off screen.
-    pub fn follow_reading_target(&mut self, target: ReadingTarget) {
+    /// Returns whether following it changed the page, without recording manual
+    /// navigation (which would interrupt narration).
+    pub fn follow_reading_target(&mut self, target: ReadingTarget) -> bool {
+        let mut moved = false;
         let start = target.glyph_ranges.first().map(|range| range.start);
         if let Some(start) = start {
             let visible = self
                 .core
                 .doc()
-                .find_line_for_glyph(start)
+                .text()
+                .line_index_for_glyph(start)
                 .is_some_and(|line| {
                     self.core
                         .page
@@ -416,9 +558,11 @@ impl<S: GlyphShaper> RendererSession<S> {
                     self.core.nav.location().document(),
                     Some(start),
                 );
+                moved = true;
             }
         }
         self.apply(RendererCommand::SetReadingTarget(Some(target)));
+        moved
     }
 
     pub fn resolve_href(&self, href: &str) -> Option<(usize, Option<String>)> {
@@ -590,20 +734,32 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn equation_at(&self, position: Point) -> bool {
-        self.core.hit_test_document_image(position).is_some_and(|image| {
-            self.core.page.view.document.render_view().image_mathml(image.image).is_some()
-        })
+        self.core
+            .hit_test_document_image(position)
+            .is_some_and(|image| {
+                self.core
+                    .page
+                    .view
+                    .document
+                    .render_view()
+                    .export()
+                    .is_equation(image.image)
+            })
     }
 
     /// Convert the retained equation only on request; no LaTeX cache is kept.
     pub fn copy_equation_latex_at(&self, position: Point) -> bool {
-        let Some(image) = self.core.hit_test_document_image(position) else { return false };
+        let Some(image) = self.core.hit_test_document_image(position) else {
+            return false;
+        };
         let view = self.core.page.view.document.render_view();
-        let Some(markup) = view.image_mathml(image.image) else { return false };
-        let result = crate::mathml::to_latex(markup)
-            .and_then(|latex| self.core.host.set_clipboard(&latex));
+        let Some(result) = html::export::equation_latex(view, image.image) else {
+            return false;
+        };
+        let result = result.and_then(|latex| self.core.host.set_clipboard(&latex));
         if let Err(message) = result {
-            self.core.emit_operation_failed(RendererOperation::CopyEquationLatex, message);
+            self.core
+                .emit_operation_failed(RendererOperation::CopyEquationLatex, message);
         }
         true
     }
@@ -668,7 +824,7 @@ impl<S: GlyphShaper> RendererSession<S> {
                 .glyph_range_bounds(glyph, glyph + 1)
                 .is_some_and(|bounds| bounds.contains(position))
             {
-                return view.doc().word_range_at(glyph);
+                return view.doc().text().word_range_at(glyph);
             }
         }
         if require_ink {
@@ -681,7 +837,7 @@ impl<S: GlyphShaper> RendererSession<S> {
                 // A caret at the edge of the last visible line can address the
                 // first character on the next page. Clamp to visible text instead.
                 view.geometry().glyph_range_bounds(glyph, glyph + 1)?;
-                view.doc().word_range_at(glyph)
+                view.doc().text().word_range_at(glyph)
             })
     }
 
@@ -1026,11 +1182,12 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use html::document::ImageSource;
-    use html::resources::DecodedImage;
     use html::pipeline::{ReaderStyleOverrides, ThemeAdaptation};
+    use html::resources::DecodedImage;
 
     use crate::text_backend::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, ShapedLine, TextShapeRequest,
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, ShapedLine,
+        TextShapeRequest,
     };
     use crate::{FileSystemProvider, Painter, RecordingPainter, RendererEvent};
     use kurbo::Rect;
@@ -1041,10 +1198,10 @@ mod tests {
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
-        glyph_store: GlyphResourceStore,
+        generation: GlyphResourceGeneration,
         append_checkpoint: Option<(
             HashMap<(char, u32), GlyphId>,
-            GlyphResourceStore,
+            GlyphResourceGeneration,
             HashMap<u32, usize>,
         )>,
         line_shape_calls: usize,
@@ -1055,18 +1212,18 @@ mod tests {
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
-            self.glyph_store.clear();
+            self.generation = GlyphResourceGeneration::default();
         }
 
-        fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
-            &mut self.glyph_store
+        fn resource_generation(&self) -> GlyphResourceGeneration {
+            self.generation
         }
 
         fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
             assert!(self.append_checkpoint.is_none());
             self.append_checkpoint = Some((
                 self.glyphs.clone(),
-                self.glyph_store.clone(),
+                self.generation.clone(),
                 self.active_line_runs.clone(),
             ));
             Ok(())
@@ -1079,7 +1236,7 @@ mod tests {
         fn rollback_append_shaping(&mut self) {
             if let Some((glyphs, glyph_store, active_line_runs)) = self.append_checkpoint.take() {
                 self.glyphs = glyphs;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
                 self.active_line_runs = active_line_runs;
             }
         }
@@ -1092,6 +1249,7 @@ mod tests {
             _font_slant: FontSlant,
             _color: u32,
             _family: Option<&str>,
+            resources: &mut GlyphResourceStore,
         ) -> Result<GlyphId, crate::layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.glyphs.get(&key) {
@@ -1105,7 +1263,7 @@ mod tests {
                 font_size * 0.75,
             )
             .map_err(crate::layout::ShapeError::rejected_metric)?;
-            let glyph = self.glyph_store.register(metric)?;
+            let glyph = resources.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
@@ -1204,7 +1362,14 @@ mod tests {
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
         fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {}
         fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
-        fn draw_math_svg(&mut self, _bytes: &[u8], _hash: &[u8], _size: (u32, u32), _rect: Rect, color: u32) {
+        fn draw_math_svg(
+            &mut self,
+            _bytes: &[u8],
+            _hash: &[u8],
+            _size: (u32, u32),
+            _rect: Rect,
+            color: u32,
+        ) {
             self.colors.push(color);
         }
     }
@@ -1251,15 +1416,23 @@ mod tests {
 
     #[test]
     fn equation_context_copy_uses_retained_mathml_and_reports_clipboard_failure() {
-        let file = std::env::temp_dir().join(format!("html-view-mathml-{}.html", std::process::id()));
+        let file =
+            std::env::temp_dir().join(format!("html-view-mathml-{}.html", std::process::id()));
         std::fs::write(&file, "<!doctype html><p>Equation <math><mfrac><mn>1</mn><mi>x</mi></mfrac></math></p><svg width='20' height='20'><rect width='20' height='20'/></svg>").unwrap();
         let host = Rc::new(TestHost::default());
         let uri = file.to_string_lossy().into_owned();
         let mut renderer = RendererSession::from_provider_with_nav(
-            host.clone(), TestShaper::default(), Arc::new(FileSystemProvider::new()),
-            vec![uri], 0, None, crate::RendererInitialConfig::default(),
+            host.clone(),
+            TestShaper::default(),
+            Arc::new(FileSystemProvider::new()),
+            vec![uri],
+            0,
+            None,
+            crate::RendererInitialConfig::default(),
         );
-        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut RecordingPainter::default());
+        renderer
+            .prepare_frame(Size::new(600.0, 400.0))
+            .paint(&mut RecordingPainter::default());
         let mut equation = None;
         let mut ordinary_svg = None;
         for y in (0..250).step_by(2) {
@@ -1279,64 +1452,130 @@ mod tests {
         assert_eq!(*host.clipboard.borrow(), r"\frac{1}{x}");
         host.fail_clipboard.set(true);
         assert!(renderer.copy_equation_latex_at(equation));
-        assert!(host.events.borrow().iter().any(|event| matches!(event,
-            RendererEvent::OperationFailed { operation: RendererOperation::CopyEquationLatex, .. })));
-        let old_source = renderer.core.page.view.document.render_view().images()[0].source.clone();
+        assert!(host.events.borrow().iter().any(|event| matches!(
+            event,
+            RendererEvent::OperationFailed {
+                operation: RendererOperation::CopyEquationLatex,
+                ..
+            }
+        )));
+        let old_source = renderer.core.page.view.document.render_view().images()[0]
+            .source
+            .clone();
         let old_width = renderer.core.page.view.document.render_view().images()[0].width;
-        renderer.apply(RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
-            foreground: Some(0xeeeeeeff), ..Default::default()
-        }));
+        renderer.apply(RendererCommand::SetReaderStyleOverrides(
+            html::pipeline::ReaderStyleOverrides {
+                foreground: Some(0xeeeeeeff),
+                ..Default::default()
+            },
+        ));
         renderer.update_resources();
         let mut painter = EquationPainter::default();
-        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut painter);
-        assert_eq!(painter.colors, [0xeeeeeeff], "equation painting must use the current reader theme");
+        renderer
+            .prepare_frame(Size::new(600.0, 400.0))
+            .paint(&mut painter);
+        assert_eq!(
+            painter.colors,
+            [0xeeeeeeff],
+            "equation painting must use the current reader theme"
+        );
         renderer.apply(RendererCommand::SetFontSize(32.0));
-        renderer.prepare_frame(Size::new(600.0, 400.0)).paint(&mut RecordingPainter::default());
+        renderer
+            .prepare_frame(Size::new(600.0, 400.0))
+            .paint(&mut RecordingPainter::default());
         renderer.update_resources();
         assert!(renderer.core.page.view.document.render_view().images()[0].width > old_width);
-        let ImageSource::MathMl { svg: old_svg, .. } = old_source else { panic!("equation source") };
-        let ImageSource::MathMl { svg: new_svg, .. } = &renderer.core.page.view.document.render_view().images()[0].source else { panic!("equation source") };
+        let ImageSource::MathMl { svg: old_svg, .. } = old_source else {
+            panic!("equation source")
+        };
+        let ImageSource::MathMl { svg: new_svg, .. } =
+            &renderer.core.page.view.document.render_view().images()[0].source
+        else {
+            panic!("equation source")
+        };
         assert_ne!(&old_svg, new_svg);
-        let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(0).unwrap() else { panic!("decoded math SVG") };
-        assert_eq!(bytes, new_svg, "font-size changes must replace the decoded SVG source");
+        let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(0).unwrap()
+        else {
+            panic!("decoded math SVG")
+        };
+        assert_eq!(
+            bytes, new_svg,
+            "font-size changes must replace the decoded SVG source"
+        );
         std::fs::remove_file(file).unwrap();
     }
 
     #[test]
     fn inline_and_external_svgs_receive_current_theme_without_replacing_decoded_sources() {
-        let directory = std::env::temp_dir().join(format!("html-view-svg-theme-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("html-view-svg-theme-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let file = directory.join("chapter.html");
         let source = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><rect width='20' height='20' fill='black'/></svg>";
         std::fs::write(directory.join("diagram.svg"), source).unwrap();
-        std::fs::write(&file, format!("<!doctype html><p>Diagram {source}<img src='diagram.svg'></p>")).unwrap();
+        std::fs::write(
+            &file,
+            format!("<!doctype html><p>Diagram {source}<img src='diagram.svg'></p>"),
+        )
+        .unwrap();
         let mut renderer = RendererSession::from_provider_with_nav(
-            Rc::new(TestHost::default()), TestShaper::default(), Arc::new(FileSystemProvider::new()),
-            vec![file.to_string_lossy().into_owned()], 0, None, crate::RendererInitialConfig::default(),
+            Rc::new(TestHost::default()),
+            TestShaper::default(),
+            Arc::new(FileSystemProvider::new()),
+            vec![file.to_string_lossy().into_owned()],
+            0,
+            None,
+            crate::RendererInitialConfig::default(),
         );
         let size = Size::new(600.0, 400.0);
-        renderer.prepare_frame(size).paint(&mut RecordingPainter::default());
+        renderer
+            .prepare_frame(size)
+            .paint(&mut RecordingPainter::default());
         renderer.update_resources();
         let mut painter = SvgThemePainter::default();
         renderer.prepare_frame(size).paint(&mut painter);
         assert_eq!(painter.ordinary_svgs, 2);
         assert_eq!(renderer.image_theme(), None);
-        let sources: Vec<_> = (0..2).map(|index| {
-            let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(index).unwrap() else { panic!("decoded SVG") };
-            bytes.clone()
-        }).collect();
+        let sources: Vec<_> = (0..2)
+            .map(|index| {
+                let DecodedImage::Svg { bytes, .. } =
+                    renderer.core.page.images.get_decoded(index).unwrap()
+                else {
+                    panic!("decoded SVG")
+                };
+                bytes.clone()
+            })
+            .collect();
         for theme in [
-            ThemeAdaptation { ink: 0xe8e7e4ff, surface: 0x2d2b28ff },
-            ThemeAdaptation { ink: 0x272624ff, surface: 0xfef8edff },
+            ThemeAdaptation {
+                ink: 0xe8e7e4ff,
+                surface: 0x2d2b28ff,
+            },
+            ThemeAdaptation {
+                ink: 0x272624ff,
+                surface: 0xfef8edff,
+            },
         ] {
-            renderer.apply(RendererCommand::SetReaderStyleOverrides(ReaderStyleOverrides { theme: Some(theme), ..Default::default() }));
+            renderer.apply(RendererCommand::SetReaderStyleOverrides(
+                ReaderStyleOverrides {
+                    theme: Some(theme),
+                    ..Default::default()
+                },
+            ));
             let mut painter = SvgThemePainter::default();
             renderer.prepare_frame(size).paint(&mut painter);
             assert_eq!(renderer.image_theme(), Some(theme));
             assert_eq!(painter.ordinary_svgs, 2);
             for (index, original) in sources.iter().enumerate() {
-                let DecodedImage::Svg { bytes, .. } = renderer.core.page.images.get_decoded(index as u32).unwrap() else { panic!("decoded SVG") };
-                assert_eq!(bytes, original, "theme changes only affect rasterized paint");
+                let DecodedImage::Svg { bytes, .. } =
+                    renderer.core.page.images.get_decoded(index as u32).unwrap()
+                else {
+                    panic!("decoded SVG")
+                };
+                assert_eq!(
+                    bytes, original,
+                    "theme changes only affect rasterized paint"
+                );
             }
         }
         renderer.apply(RendererCommand::SetReaderStyleOverrides(Default::default()));
@@ -1372,7 +1611,14 @@ mod tests {
             .paint(&mut RecordingPainter::default());
         let point_at = |renderer: &RendererSession<TestShaper>, word: &str| {
             let doc = renderer.core.doc();
-            let all = doc.glyph_text(&[0..doc.text().glyph_count() as u32]);
+            let text = doc.text();
+            let all: String = (0..text.glyph_count())
+                .filter_map(|index| {
+                    text.glyph_at(index)
+                        .and_then(|glyph| text.glyph_metric(glyph))
+                        .map(|metric| metric.ch())
+                })
+                .collect();
             let byte = all.find(word).unwrap();
             let glyph = all[..byte].chars().count() as u32;
             let bounds = renderer
@@ -1402,7 +1648,9 @@ mod tests {
             renderer
                 .core
                 .doc()
-                .build_selection_text(first, last)
+                .view()
+                .export()
+                .selection_text(first..last)
                 .0
                 .unwrap(),
             text
@@ -1436,7 +1684,9 @@ mod tests {
                 renderer
                     .core
                     .doc()
-                    .build_selection_text(first, last)
+                    .view()
+                    .export()
+                    .selection_text(first..last)
                     .0
                     .as_deref(),
                 Some(word)
@@ -1500,7 +1750,8 @@ mod tests {
         let line_idx = renderer
             .core
             .doc()
-            .find_line_for_glyph(linked_glyph)
+            .text()
+            .line_index_for_glyph(linked_glyph)
             .unwrap();
         let screen = renderer
             .core
@@ -2093,10 +2344,16 @@ mod tests {
         let outer_line = renderer
             .core
             .doc()
-            .find_line_for_glyph(glyph_for('A'))
+            .text()
+            .line_index_for_glyph(glyph_for('A'))
             .unwrap();
         let nested = glyph_for('I');
-        let nested_line = renderer.core.doc().find_line_for_glyph(nested).unwrap();
+        let nested_line = renderer
+            .core
+            .doc()
+            .text()
+            .line_index_for_glyph(nested)
+            .unwrap();
 
         assert_ne!(outer_line, nested_line);
         assert_eq!(
@@ -2116,7 +2373,11 @@ mod tests {
             Some((nested, nested + 1))
         );
         assert_eq!(
-            renderer.core.doc().find_line_for_glyph(glyph_for('B')),
+            renderer
+                .core
+                .doc()
+                .text()
+                .line_index_for_glyph(glyph_for('B')),
             Some(outer_line)
         );
         assert_eq!(

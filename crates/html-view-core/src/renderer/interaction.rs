@@ -1,18 +1,20 @@
 use kurbo::{Point, Size};
 
+use crate::document_view::DocumentView;
 use crate::prepared_page::PreparedPage;
+use crate::spine_item::SessionDocument;
 use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
-use html::pipeline::PipelineInputs;
+use html::pipeline::{PipelineChanges, PipelineInputs};
 
 impl RendererCore {
-    fn visible_view_for_doc(&self, doc: usize) -> Option<&crate::document_view::DocumentView> {
+    fn visible_view_for_doc(&self, doc: usize) -> Option<&DocumentView<SessionDocument>> {
         (doc == self.nav.location().document()).then_some(&self.page.view)
     }
 
     fn visible_view_mut_for_doc(
         &mut self,
         doc: usize,
-    ) -> Option<&mut crate::document_view::DocumentView> {
+    ) -> Option<&mut DocumentView<SessionDocument>> {
         (doc == self.nav.location().document()).then_some(&mut self.page.view)
     }
 
@@ -119,7 +121,7 @@ impl RendererCore {
         Self::visible_text_for_view(&self.page.view)
     }
 
-    fn visible_text_for_view(view: &crate::document_view::DocumentView) -> String {
+    fn visible_text_for_view(view: &DocumentView<SessionDocument>) -> String {
         let text_view = view.document.render_view().text();
         let mut visible_glyphs = Vec::new();
         for (line_index, _) in view.frame.page().line_positions().iter() {
@@ -182,7 +184,7 @@ impl RendererCore {
 
         let images = self.page.view.document.render_view().images();
         let (next_inputs, layout_needed) = apply_image_poll_updates(
-            &self.page.inputs,
+            self.page.inputs(),
             &image_poll.dimensions_changed,
             |image_idx| {
                 images.get(image_idx as usize).map(|resource| {
@@ -206,9 +208,7 @@ impl RendererCore {
             return;
         }
 
-        let mut next_inputs = next_inputs;
-        next_inputs.image_metrics_revision = next_inputs.image_metrics_revision.next();
-        if let Err(error) = self.apply_pipeline_inputs_without_repaint(next_inputs, glyph_shaper) {
+        if let Err(error) = self.apply_pipeline_changes_without_repaint(next_inputs, glyph_shaper) {
             self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
         }
     }
@@ -276,8 +276,7 @@ impl RendererCore {
         self.prefetch_images_for_current_page();
         if self.nav.location().anchor_update_pending() {
             let view = html_view_navigate::NavView {
-                doc: html_view_doc::DocQuery::new(&self.page.view.document),
-                source: &self.page.source_index,
+                doc: html_view_doc::DocQuery::from_view(self.page.view.document.render_view()),
                 viewport: &self.viewport,
                 frame: &self.page.view.frame,
             };
@@ -337,7 +336,7 @@ impl RendererCore {
             return false;
         }
         let geometry = view.geometry();
-        let Some(line_idx) = view.doc().find_line_for_glyph(hit.glyph) else {
+        let Some(line_idx) = view.doc().text().line_index_for_glyph(hit.glyph) else {
             return false;
         };
         let Some(screen) = view.frame.page().line_positions().get(line_idx) else {
@@ -429,12 +428,16 @@ impl RendererCore {
             let suffix_end = end.saturating_add(48).min(glyph_count);
             let prefix = view
                 .doc()
-                .build_selection_text(prefix_start, start)
+                .view()
+                .export()
+                .selection_text(prefix_start..start)
                 .0
                 .filter(|value| !value.is_empty());
             let suffix = view
                 .doc()
-                .build_selection_text(end, suffix_end)
+                .view()
+                .export()
+                .selection_text(end..suffix_end)
                 .0
                 .filter(|value| !value.is_empty());
             self.host.emit(crate::RendererEvent::SelectionFinished {
@@ -449,9 +452,8 @@ impl RendererCore {
 
     pub fn copy_selection_to_clipboard(&self) -> Result<bool, String> {
         if let Some(text) = self
-            .note
-            .as_ref()
-            .and_then(|note| note.selection.content().markdown())
+            .note_parts()
+            .and_then(|(note, _)| note.selection.content().markdown())
         {
             self.host.set_clipboard(text)?;
             return Ok(true);
@@ -510,8 +512,8 @@ fn apply_image_poll_updates(
     dimensions_changed: &[u32],
     image_metadata: impl Fn(u32) -> Option<(u32, u32, Option<u32>, Option<u32>)>,
     decode_sizes: impl Fn(u32) -> Option<(u32, u32)>,
-) -> (PipelineInputs, bool) {
-    let mut next_inputs = pipeline_inputs.clone();
+) -> (PipelineChanges, bool) {
+    let mut next_inputs = pipeline_inputs.image_metrics.clone();
     let mut layout_needed = false;
 
     for image_idx in dimensions_changed {
@@ -529,7 +531,6 @@ fn apply_image_poll_updates(
         let uses_intrinsic_width = width_attr.is_none();
         let uses_intrinsic_height = height_attr.is_none();
         let previous = next_inputs
-            .image_metrics
             .get(*image_idx)
             .unwrap_or((resource_width, resource_height));
         if (uses_intrinsic_width && previous.0 != decoded_width)
@@ -537,12 +538,18 @@ fn apply_image_poll_updates(
         {
             layout_needed = true;
         }
-        next_inputs
-            .image_metrics
-            .set(*image_idx, decoded_width, decoded_height);
+        next_inputs.set(*image_idx, decoded_width, decoded_height);
     }
 
-    (next_inputs, layout_needed)
+    (
+        PipelineChanges {
+            image_metrics: Some(next_inputs),
+            image_metrics_revision: layout_needed
+                .then(|| pipeline_inputs.image_metrics_revision.next()),
+            ..Default::default()
+        },
+        layout_needed,
+    )
 }
 
 #[cfg(test)]
@@ -605,9 +612,18 @@ mod tests {
             !layout_needed,
             "intrinsic-only image changes should not force layout if no intrinsic dimensions changed"
         );
-        assert_eq!(updated.image_metrics.get(0), Some((64, 32)));
-        assert_eq!(updated.image_metrics.get(1), Some((16, 16)));
-        assert_eq!(updated.image_metrics.get(2), Some((40, 80)));
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(0),
+            Some((64, 32))
+        );
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(1),
+            Some((16, 16))
+        );
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(2),
+            Some((40, 80))
+        );
     }
 
     #[test]
@@ -646,26 +662,26 @@ mod tests {
         assert!(layout_ba);
 
         assert_eq!(
-            updated_ab.image_metrics.get(0),
-            updated_ba.image_metrics.get(0)
+            updated_ab.image_metrics.as_ref().unwrap().get(0),
+            updated_ba.image_metrics.as_ref().unwrap().get(0)
         );
         assert_eq!(
-            updated_ab.image_metrics.get(1),
-            updated_ba.image_metrics.get(1)
+            updated_ab.image_metrics.as_ref().unwrap().get(1),
+            updated_ba.image_metrics.as_ref().unwrap().get(1)
         );
         assert_eq!(
-            updated_ab.image_metrics.get(2),
-            updated_ba.image_metrics.get(2)
+            updated_ab.image_metrics.as_ref().unwrap().get(2),
+            updated_ba.image_metrics.as_ref().unwrap().get(2)
         );
 
         // A caller applying this batch should only need one revision bump.
         assert_eq!(
-            updated_ab.image_metrics_revision.next(),
-            base.image_metrics_revision.next()
+            updated_ab.image_metrics_revision,
+            Some(base.image_metrics_revision.next())
         );
         assert_eq!(
-            updated_ba.image_metrics_revision.next(),
-            base.image_metrics_revision.next()
+            updated_ba.image_metrics_revision,
+            Some(base.image_metrics_revision.next())
         );
     }
 
@@ -690,9 +706,21 @@ mod tests {
         );
 
         assert!(layout_needed);
-        assert_eq!(updated.image_metrics.get(0), Some((20, 10)));
-        assert_eq!(updated.image_metrics.get(1), Some((11, 12)));
-        assert_eq!(updated.image_metrics.get(2), Some((13, 99)));
-        assert_eq!(updated.image_metrics.get(0), Some((20, 10)));
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(0),
+            Some((20, 10))
+        );
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(1),
+            Some((11, 12))
+        );
+        assert_eq!(
+            updated.image_metrics.as_ref().unwrap().get(2),
+            Some((13, 99))
+        );
+        assert_eq!(
+            updated.image_metrics_revision,
+            Some(base.image_metrics_revision.next())
+        );
     }
 }

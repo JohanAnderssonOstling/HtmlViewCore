@@ -14,8 +14,10 @@ use std::time::Duration;
 use kurbo::{Point, Size};
 pub use peniko::Color;
 
-use html::pipeline::EarliestStage;
-/// A document-derived navigation entry exposed by the renderer.
+use html::pipeline::{EarliestStage, ReaderStyleOverrides};
+use html::resources::ResourceProvider;
+use html::style::FontFace;
+/// A publication navigation entry supplied by the host application.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TocEntry {
     pub title: String,
@@ -219,6 +221,8 @@ pub enum RendererCommand {
     SetColumnViewportPlan { available_width: f64, column_width: f64, column_count: u8, column_gap: f64 },
     SetMaxColumnCount(Option<u8>),
     SetFontSize(f32),
+    /// Rebuild text after the host registers newly available publication fonts.
+    RefreshFonts,
     SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides),
     SetImageSizingPolicy(html::pipeline::ImageSizingPolicy),
     /// Switches how notes are presented. This re-lays-out the document, since
@@ -295,7 +299,6 @@ pub enum RendererEvent {
         anchor: Option<String>,
     },
     TitleChanged(Option<String>),
-    TocChanged(Vec<TocEntry>),
     MatchInfo {
         current: usize,
         total: usize,
@@ -358,6 +361,16 @@ impl fmt::Display for RendererOperation {
 }
 
 pub trait RendererHost {
+    /// Applies font-selection policy before the backend shapes any text. This
+    /// keeps publication aliases from shadowing a reader-selected system font.
+    fn set_font_overrides(&self, _overrides: &ReaderStyleOverrides) {}
+
+
+    /// Supplies the active publication font declarations before shaping. Hosts
+    /// may schedule I/O and later issue `RendererCommand::RefreshFonts`.
+    /// Hosts also refresh shaping when a new declaration selects cached faces.
+    fn prepare_font_faces(&self, _faces: &[FontFace], _provider: Arc<dyn ResourceProvider>) {}
+
     fn request_repaint(&self);
     fn request_style(&self);
     fn schedule(&self, delay: Duration, f: Box<dyn FnOnce() + Send>);
@@ -520,10 +533,7 @@ pub struct LineShapeFrameKey {
     pub last_line: Option<usize>,
 }
 
-pub struct VisibleShapedLineFragment {
-    pub offset_x: f64,
-    pub shaped: html::layout::ShapedLine,
-}
+pub use html::layout::PositionedShapedLine as VisibleShapedLineFragment;
 
 #[derive(Clone, Copy)]
 pub enum DocAnchor {
@@ -656,14 +666,6 @@ impl VisibleLinePositions {
         self.positions.clear();
         self.positions
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FormatState {
-    pub bold: bool,
-    pub italic: bool,
-    pub strike: bool,
-    pub code: bool,
 }
 
 #[derive(Clone)]
@@ -1478,5 +1480,11 @@ mod renderer_revision_tests {
         assert_ne!(revisions.resources, 1);
         assert_ne!(revisions.base_display, 1);
         assert_eq!(revisions.overlay, overlay);
+    }
+}
+
+impl From<SearchOptions> for html::layout::TextSearchOptions {
+    fn from(options: SearchOptions) -> Self {
+        Self { match_case: options.match_case, whole_word: options.whole_word, match_diacritics: options.match_diacritics }
     }
 }
