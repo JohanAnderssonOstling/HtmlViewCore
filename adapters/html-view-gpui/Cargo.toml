@@ -1,0 +1,22 @@
+[package]
+name = "html-view-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-channel = "2"
+gpui.workspace = true
+html-gpui.workspace = true
+skrift-column-paginator.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+kurbo.workspace = true
+web-time = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"

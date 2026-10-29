@@ -218,7 +218,7 @@ html-view-cfi     EPUB CFI generation and parsing            -> html
 html-view-load    document loading through the pipeline      -> html
 html-view-doc     32 read-only document queries              -> types, cfi
 html-view-paginate pagination rules and page building        -> types, doc
-html-view-core    RendererCore, session, painting, navigation, interaction
+skrift-column-paginator    RendererCore, session, painting, navigation, interaction
 ```
 
 The orphan rule shaped this more than anything else: an inherent impl must live
@@ -249,10 +249,10 @@ enforced.
 
 `#[cfg(test)]` does not cross crates. `table_row_group_bounds_containing` was
 test-only in `render.rs` and is exercised by a test that stayed in
-`html-view-core`, so it is now an ordinary public query with a comment saying
+`skrift-column-paginator`, so it is now an ordinary public query with a comment saying
 why.
 
-`html-view-core` re-exports `html-view-types` and the `cfi` and `load` modules
+`skrift-column-paginator` re-exports `html-view-types` and the `cfi` and `load` modules
 under their old paths, so the public API is unchanged.
 
 148 tests pass across the workspace; warning count unchanged at 4.
@@ -269,7 +269,7 @@ more than 4,000 lines.
 
 | crate | code | tests | depends on |
 | --- | ---: | ---: | --- |
-| `html-view-core` | 3880 | 2805 | all of the below |
+| `skrift-column-paginator` | 3880 | 2805 | all of the below |
 | `html-view-paginate` | 877 | 0 | types, doc |
 | `html-view-doc` | 840 | 0 | types, cfi |
 | `html-view-types` | 569 | 37 | html |
@@ -277,7 +277,7 @@ more than 4,000 lines.
 | `html-view-load` | 192 | 338 | html |
 | `html-view-cfi` | 136 | 72 | html |
 
-`html-view-core` holds what genuinely coordinates: the `RendererCore` facade and
+`skrift-column-paginator` holds what genuinely coordinates: the `RendererCore` facade and
 `RendererSession` public API, painting, cross-document navigation orchestration,
 frame preparation and pointer handling.
 

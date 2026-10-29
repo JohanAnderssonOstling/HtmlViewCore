@@ -6,16 +6,19 @@
 //! navigation logic lives here -- those are separate crates that agree on these
 //! types.
 
-use std::collections::HashSet;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kurbo::{Point, Size};
 pub use peniko::Color;
 
-use html::pipeline::EarliestStage;
-/// A document-derived navigation entry exposed by the renderer.
+use html::pipeline::{EarliestStage, ReaderStyleOverrides};
+use html::resources::ResourceProvider;
+use html::revisions::DocumentRevisions;
+use html::style::FontFace;
+/// A publication navigation entry supplied by the host application.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TocEntry {
     pub title: String,
@@ -216,9 +219,16 @@ pub enum RendererCommand {
     SetProgressFraction(f32),
     SetDocumentTextLengths(Vec<u64>),
     SetColumnWidth(f64),
-    SetColumnViewportPlan { available_width: f64, column_width: f64, column_count: u8, column_gap: f64 },
+    SetColumnViewportPlan {
+        available_width: f64,
+        column_width: f64,
+        column_count: u8,
+        column_gap: f64,
+    },
     SetMaxColumnCount(Option<u8>),
     SetFontSize(f32),
+    /// Rebuild text after the host registers newly available publication fonts.
+    RefreshFonts,
     SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides),
     SetImageSizingPolicy(html::pipeline::ImageSizingPolicy),
     /// Switches how notes are presented. This re-lays-out the document, since
@@ -295,7 +305,6 @@ pub enum RendererEvent {
         anchor: Option<String>,
     },
     TitleChanged(Option<String>),
-    TocChanged(Vec<TocEntry>),
     MatchInfo {
         current: usize,
         total: usize,
@@ -358,6 +367,15 @@ impl fmt::Display for RendererOperation {
 }
 
 pub trait RendererHost {
+    /// Applies font-selection policy before the backend shapes any text. This
+    /// keeps publication aliases from shadowing a reader-selected system font.
+    fn set_font_overrides(&self, _overrides: &ReaderStyleOverrides) {}
+
+    /// Supplies the active publication font declarations before shaping. Hosts
+    /// may schedule I/O and later issue `RendererCommand::RefreshFonts`.
+    /// Hosts also refresh shaping when a new declaration selects cached faces.
+    fn prepare_font_faces(&self, _faces: &[FontFace], _provider: Arc<dyn ResourceProvider>) {}
+
     fn request_repaint(&self);
     fn request_style(&self);
     fn schedule(&self, delay: Duration, f: Box<dyn FnOnce() + Send>);
@@ -411,26 +429,30 @@ pub enum PaintDirection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RendererRevisions {
-    pub document: u64,
-    pub style: u64,
-    pub shape: u64,
-    pub layout: u64,
+    document_state: DocumentRevisions,
     pub base_display: u64,
     pub overlay: u64,
-    pub resources: u64,
 }
 
 impl Default for RendererRevisions {
     fn default() -> Self {
         Self {
-            document: 1,
-            style: 1,
-            shape: 1,
-            layout: 1,
+            document_state: Default::default(),
             base_display: 1,
             overlay: 1,
-            resources: 1,
         }
+    }
+}
+
+impl Deref for RendererRevisions {
+    type Target = DocumentRevisions;
+    fn deref(&self) -> &Self::Target {
+        &self.document_state
+    }
+}
+impl DerefMut for RendererRevisions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.document_state
     }
 }
 
@@ -438,59 +460,31 @@ impl RendererRevisions {
     fn next(value: &mut u64) {
         *value = value.wrapping_add(1).max(1);
     }
-
     pub fn invalidate_pipeline_from(&mut self, stage: EarliestStage) {
-        match stage {
-            EarliestStage::Parse => {
-                Self::next(&mut self.document);
-                Self::next(&mut self.style);
-                Self::next(&mut self.shape);
-                Self::next(&mut self.layout);
-            }
-            EarliestStage::Style | EarliestStage::Prepare => {
-                Self::next(&mut self.style);
-                Self::next(&mut self.shape);
-                Self::next(&mut self.layout);
-            }
-            EarliestStage::Shape => {
-                Self::next(&mut self.shape);
-                Self::next(&mut self.layout);
-            }
-            EarliestStage::Layout => Self::next(&mut self.layout),
-            EarliestStage::Paint => {}
-            EarliestStage::None => return,
+        if stage == EarliestStage::None {
+            return;
         }
+        self.document_state.invalidate_from(stage);
         Self::next(&mut self.base_display);
         Self::next(&mut self.overlay);
     }
-
     pub fn invalidate_base(&mut self) {
         Self::next(&mut self.base_display);
     }
-
     pub fn invalidate_overlay(&mut self) {
         Self::next(&mut self.overlay);
     }
-
     pub fn invalidate_resources(&mut self) {
-        Self::next(&mut self.resources);
+        self.document_state.invalidate_resources();
         Self::next(&mut self.base_display);
     }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct DisplayCacheKey {
-    pub layout_revision: u64,
+    pub geometry: FrameGeometryCacheKey,
     pub display_revision: u64,
     pub resources_revision: u64,
-    pub viewport_width_bits: u64,
-    pub viewport_height_bits: u64,
-    pub column_width_bits: u64,
-    pub column_gap_bits: u64,
-    pub column_count: u8,
-    pub scale_bits: u64,
-    pub page_offset_bits: u64,
-    pub direction: u8,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -512,17 +506,16 @@ pub struct FrameGeometryCacheKey {
     pub direction: u8,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct LineShapeFrameKey {
-    pub shape_revision: u64,
-    pub layout_revision: u64,
-    pub first_line: Option<usize>,
-    pub last_line: Option<usize>,
-}
-
-pub struct VisibleShapedLineFragment {
-    pub offset_x: f64,
-    pub shaped: html::layout::ShapedLine,
+impl FrameGeometryCacheKey {
+    /// Page position and navigation direction do not affect layout compatibility.
+    pub fn same_layout(self, other: Self) -> bool {
+        let normalize = |key: Self| Self {
+            page_offset_bits: 0,
+            direction: 0,
+            ..key
+        };
+        normalize(self) == normalize(other)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -658,14 +651,6 @@ impl VisibleLinePositions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FormatState {
-    pub bold: bool,
-    pub italic: bool,
-    pub strike: bool,
-    pub code: bool,
-}
-
 #[derive(Clone)]
 pub struct ColumnLayout {
     pub col_width: f64,
@@ -783,13 +768,19 @@ impl ColumnLayout {
     /// start at the host-provided outer margin and use slack only as gaps.
     #[inline]
     pub fn leading_offset_for(viewport_width: f64, column_width: f64, column_count: f64) -> f64 {
-        if column_count == 1.0 { ((viewport_width - column_width) / 2.0).max(0.0) } else { 0.0 }
+        if column_count == 1.0 {
+            ((viewport_width - column_width) / 2.0).max(0.0)
+        } else {
+            0.0
+        }
     }
 
     /// Compute x-coordinate for a column given a local x offset.
     #[inline]
     pub fn col_x(&self, col_index: f64, local_x: f64) -> f64 {
-        Self::leading_offset_for(self.size.width, self.col_width, self.col_count) + col_index * (self.col_width + self.col_gap) + local_x
+        Self::leading_offset_for(self.size.width, self.col_width, self.col_count)
+            + col_index * (self.col_width + self.col_gap)
+            + local_x
     }
 
     pub fn resolve_point_at(
@@ -1019,7 +1010,6 @@ impl Default for ViewportState {
 pub struct VisibleFrame {
     page: VisiblePageGeometry,
     geometry_key: Option<FrameGeometryCacheKey>,
-    shaping: VisibleShapeCache,
 }
 
 #[derive(Default)]
@@ -1068,27 +1058,6 @@ impl VisiblePageGeometry {
     }
 }
 
-#[derive(Default)]
-pub struct VisibleShapeCache {
-    shaped_lines: Vec<VisibleShapedLineFragment>,
-    native_failures: HashSet<usize>,
-    key: Option<LineShapeFrameKey>,
-}
-
-impl VisibleShapeCache {
-    pub fn shaped_lines(&self) -> &[VisibleShapedLineFragment] {
-        &self.shaped_lines
-    }
-
-    pub fn native_failures(&self) -> &HashSet<usize> {
-        &self.native_failures
-    }
-
-    pub fn key(&self) -> Option<LineShapeFrameKey> {
-        self.key
-    }
-}
-
 #[derive(Clone, Copy)]
 enum InlinePositionMode {
     Flow,
@@ -1098,10 +1067,6 @@ enum InlinePositionMode {
 impl VisibleFrame {
     pub fn page(&self) -> &VisiblePageGeometry {
         &self.page
-    }
-
-    pub fn shaping(&self) -> &VisibleShapeCache {
-        &self.shaping
     }
 
     pub fn geometry_key(&self) -> Option<FrameGeometryCacheKey> {
@@ -1212,16 +1177,6 @@ impl VisibleFrame {
         previous_positions
     }
 
-    pub fn clear_backend_shaping(&mut self) {
-        self.shaping.shaped_lines.clear();
-        self.shaping.native_failures.clear();
-        self.shaping.key = None;
-    }
-
-    pub fn record_native_shape_failure(&mut self, line: usize) {
-        self.shaping.native_failures.insert(line);
-    }
-
     pub fn clear(&mut self) {
         self.page.start_line = None;
         self.page.end_line = None;
@@ -1232,7 +1187,6 @@ impl VisibleFrame {
         self.page.repeated_table_headers.clear();
         self.page.block_decoration_indices = None;
         self.geometry_key = None;
-        self.clear_backend_shaping();
     }
 }
 
@@ -1314,7 +1268,10 @@ mod renderer_revision_tests {
     #[test]
     fn resizing_a_single_column_reprojects_its_centered_lines() {
         let mut positions = VisibleLinePositions::with_buffer(0, Vec::new());
-        positions.push(LineScreen { point: Point::new(250.0, 12.0), col_index: 0 });
+        positions.push(LineScreen {
+            point: Point::new(250.0, 12.0),
+            col_index: 0,
+        });
         let mut frame = VisibleFrame::default();
         frame.install_whole_document(1, positions);
 
@@ -1478,5 +1435,15 @@ mod renderer_revision_tests {
         assert_ne!(revisions.resources, 1);
         assert_ne!(revisions.base_display, 1);
         assert_eq!(revisions.overlay, overlay);
+    }
+}
+
+impl From<SearchOptions> for html::layout::TextSearchOptions {
+    fn from(options: SearchOptions) -> Self {
+        Self {
+            match_case: options.match_case,
+            whole_word: options.whole_word,
+            match_diacritics: options.match_diacritics,
+        }
     }
 }

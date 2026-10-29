@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use html_view_core::{
+use skrift_column_paginator::{
     FileSystemProvider, FootnotePopupAnchor, NoteDisplay, PointerDownOptions, RendererEvent,
     RendererHost, RendererInitialConfig, RendererSession, ResourceProvider, SelectionMode,
 };

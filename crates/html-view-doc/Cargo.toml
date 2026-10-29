@@ -1,4 +1,5 @@
 [package]
+license.workspace = true
 name = "html-view-doc"
 version = "0.1.0"
 edition = "2024"
@@ -10,5 +11,3 @@ html.workspace = true
 kurbo.workspace = true
 html-view-cfi.workspace = true
 html-view-types.workspace = true
-unicode-normalization.workspace = true
-unicode-segmentation = "1.12"
