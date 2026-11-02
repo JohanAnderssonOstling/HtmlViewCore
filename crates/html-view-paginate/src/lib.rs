@@ -1108,11 +1108,11 @@ mod tests {
     use html::text::{GlyphRequest, ShapedGlyph};
 
     use super::*;
-    use html::layout::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-        LaidOutDocument, LayoutConstraints,
-    };
-    use html::pipeline::DocumentFactory;
+    use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use html::text::{
+    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+};
+    use html_pipeline::DocumentFactory;
     use kurbo::Size;
     use std::collections::HashMap;
 
@@ -1135,7 +1135,7 @@ mod tests {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), html::text::ShapeError> {
             assert!(self.append_checkpoint.is_none());
             self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
@@ -1155,14 +1155,14 @@ mod tests {
         fn shape_glyph(
             &mut self,
             request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, html::layout::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+        ) -> Result<ShapedGlyph, html::text::ShapeError> {
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
@@ -1209,7 +1209,7 @@ mod tests {
         mode: PaginationMode,
         resources: &GlyphResourceStore,
     ) -> Vec<(usize, i32, f64)> {
-        let paginator = Paginator::new(DocQuery::new(document, resources), layout, mode);
+        let paginator = Paginator::new(DocQuery::from_view((document).render_view(resources)), layout, mode);
         let page = paginator.page_at(0.0, Vec::new());
         page.positions
             .iter()
@@ -1248,7 +1248,7 @@ mod tests {
             PaginationMode::Book,
             PaginationMode::BookWithVerticalRhythm,
         ] {
-            let paginator = Paginator::new(DocQuery::new(&document, &resources), &geometry, mode);
+            let paginator = Paginator::new(DocQuery::from_view((&document).render_view(&resources)), &geometry, mode);
             for page in [
                 paginator.page_at(0.0, Vec::new()),
                 paginator.page_ending_at(lines.len() - 1, Vec::new()),
@@ -1291,7 +1291,7 @@ mod tests {
             PaginationMode::Book,
             PaginationMode::BookWithVerticalRhythm,
         ] {
-            let paginator = Paginator::new(DocQuery::new(&document, &resources), &geometry, mode);
+            let paginator = Paginator::new(DocQuery::from_view((&document).render_view(&resources)), &geometry, mode);
             let mut seen = HashSet::new();
             let mut offset = 0.0;
             for _ in 0..view.text().line_count() {
@@ -1351,7 +1351,7 @@ mod tests {
         );
         let geometry = columns(200.0, 40.0, 1.0);
         let page = Paginator::new(
-            DocQuery::new(&document, &resources),
+            DocQuery::from_view((&document).render_view(&resources)),
             &geometry,
             PaginationMode::Book,
         )
@@ -1399,7 +1399,7 @@ mod tests {
                 PaginationMode::Book,
                 PaginationMode::BookWithVerticalRhythm,
             ] {
-                let paginator = Paginator::new(DocQuery::new(&document, &resources), &geometry, mode);
+                let paginator = Paginator::new(DocQuery::from_view((&document).render_view(&resources)), &geometry, mode);
                 let mut seen = HashSet::new();
                 let mut offset = 0.0;
                 for _ in 0..view.text().line_count() {
@@ -1434,7 +1434,7 @@ mod tests {
         );
         let geometry = columns(200.0, 100.0, 1.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document, &resources),
+            DocQuery::from_view((&document).render_view(&resources)),
             &geometry,
             PaginationMode::Book,
         );
@@ -1464,7 +1464,7 @@ mod tests {
         );
         let geometry = columns(200.0, 200.0, 1.0);
         let page = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &geometry,
             PaginationMode::Book,
         )
@@ -1497,7 +1497,7 @@ mod tests {
         let document = layout(&content, 200.0, &mut document_resources);
         let geometry = columns(200.0, 100.0, 1.0);
         let page = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &geometry,
             PaginationMode::Book,
         )
@@ -1661,7 +1661,7 @@ mod tests {
         );
         let layout = columns(200.0, 200.0, 2.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &layout,
             PaginationMode::Web,
         );
@@ -1713,7 +1713,7 @@ mod tests {
         let document = layout(PARAGRAPHS, 200.0, &mut document_resources);
         let layout = columns(200.0, 40.0, 2.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &layout,
             PaginationMode::Book,
         );
@@ -1756,7 +1756,7 @@ mod tests {
 
         let candidate_count = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
             let paginator = Paginator::new(
-                DocQuery::new(document, resources),
+                DocQuery::from_view((document).render_view(resources)),
                 &geometry,
                 PaginationMode::Book,
             );
@@ -1793,7 +1793,7 @@ mod tests {
         );
         let geometry = columns(200.0, 60.0, 1.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &geometry,
             PaginationMode::Book,
         );
@@ -1827,7 +1827,7 @@ mod tests {
         );
         let geometry = columns(120.0, 80.0, 2.0);
         let paginator = Paginator::new(
-            DocQuery::new(&document, &document_resources),
+            DocQuery::from_view((&document).render_view(&document_resources)),
             &geometry,
             PaginationMode::BookWithVerticalRhythm,
         );

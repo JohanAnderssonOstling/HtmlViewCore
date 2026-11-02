@@ -17,10 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use html::layout::{
-    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-    ShapeError,
-};
+use html::text::{FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphShaper, ShapeError};
 
 /// A rasterized glyph: coverage, and where to put it relative to the baseline
 /// origin the renderer paints at.
@@ -228,30 +225,30 @@ impl GlyphShaper for FontShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         let key = GlyphKey {
             ch: request.character,
-            size_bits: request.font_size.to_bits(),
-            bold: request.font_weight >= 600,
-            italic: !matches!(request.font_slant, FontSlant::Normal),
+            size_bits: request.style.font_size.to_bits(),
+            bold: request.style.font_weight >= 600,
+            italic: !matches!(request.style.font_slant, FontSlant::Normal),
         };
         let document = self.active.get();
 
         let face = self.face(key);
         let advance = face
-            .metrics(request.character, request.font_size)
+            .metrics(request.character, request.style.font_size)
             .advance_width;
-        let line =
-            face.horizontal_line_metrics(request.font_size)
-                .unwrap_or(fontdue::LineMetrics {
-                    ascent: request.font_size * 0.8,
-                    descent: -request.font_size * 0.2,
-                    line_gap: 0.0,
-                    new_line_size: request.font_size,
-                });
-        let metric = GlyphMetric::try_new(
+        let line = face
+            .horizontal_line_metrics(request.style.font_size)
+            .unwrap_or(fontdue::LineMetrics {
+                ascent: request.style.font_size * 0.8,
+                descent: -request.style.font_size * 0.2,
+                line_gap: 0.0,
+                new_line_size: request.style.font_size,
+            });
+        let metric = GlyphMetric::new(
             request.character,
             advance.max(0.0),
             line.ascent.max(0.0),
             (-line.descent).max(0.0),
-        )?;
+        );
 
         let glyphs = self.documents.entry(document).or_default();
         if let Some(&glyph) = glyphs.ids.get(&key) {

@@ -7,11 +7,16 @@
 
 #[cfg(test)]
 use html::layout::LineId;
+#[cfg(test)]
+use html_pipeline::engine::LaidOutDocument;
 use kurbo::{Point, Rect, Vec2};
 use std::ops::Range;
 
-use html::geometry::{ContentHit, Geometry, LinePlacement, WordHit, WordHitPolicy};
-use html::layout::{CaretAffinity, LaidOutDocument, RenderLine, RenderView};
+use html::{
+    geometry::{ContentHit, Geometry, WordHit, WordHitPolicy},
+    render::LinePlacement,
+};
+use html::layout::{CaretAffinity, RenderLine, RenderView};
 use html::render::PaintFragment;
 use html::targets::LinkTarget;
 use html_view_types::{ColumnLayout, VisibleFrame};
@@ -22,15 +27,6 @@ pub struct DocQuery<'a> {
 }
 
 impl<'a> DocQuery<'a> {
-    pub fn new(
-        document: &'a LaidOutDocument<'_>,
-        resources: &'a html::text::GlyphResourceStore,
-    ) -> Self {
-        Self {
-            view: document.render_view(resources),
-        }
-    }
-
     pub fn from_view(view: RenderView<'a>) -> Self {
         Self { view }
     }
@@ -390,11 +386,14 @@ mod tests {
     use html::text::{GlyphRequest, ShapedGlyph};
 
     use super::*;
-    use html::layout::{
-        ContentRole, FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore,
-        GlyphShaper, LayoutConstraints,
-    };
-    use html::pipeline::DocumentFactory;
+    use html_pipeline::engine::LayoutConstraints;
+use html::{
+    layout::ContentRole,
+    text::{
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+    },
+};
+    use html_pipeline::DocumentFactory;
     use html::targets::Targets;
     use html::text::find_text_matches;
     use html_view_types::{SearchOptions as Opts, SearchScope};
@@ -417,7 +416,7 @@ mod tests {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), html::text::ShapeError> {
             assert!(self.append_checkpoint.is_none());
             self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
@@ -437,14 +436,14 @@ mod tests {
         fn shape_glyph(
             &mut self,
             request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, html::layout::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+        ) -> Result<ShapedGlyph, html::text::ShapeError> {
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
@@ -522,7 +521,7 @@ mod tests {
             size: kurbo::Size::new(210.0, 100.0),
             ..ColumnLayout::default()
         };
-        let geometry = TextGeometry::new(DocQuery::new(&document, &resources), &frame, &columns);
+        let geometry = TextGeometry::new(DocQuery::from_view((&document).render_view(&resources)), &frame, &columns);
         let source = Rect::new(5.0, 80.0, 25.0, 120.0);
         let mut fragments = Vec::new();
         geometry.project_rect(source, None, false, &mut |fragment| {
@@ -551,7 +550,7 @@ mod tests {
         use html_view_types::{LineScreen, VisibleLinePositions};
         let mut resources = GlyphResourceStore::default();
         let document = layout("<p>text</p>", &mut resources);
-        let doc = DocQuery::new(&document, &resources);
+        let doc = DocQuery::from_view((&document).render_view(&resources));
         let source = doc.text().line(0).unwrap().point();
         let destination = Point::new(125.0, 30.0);
         let mut positions = VisibleLinePositions::with_buffer(0, Vec::new());
@@ -575,7 +574,7 @@ mod tests {
     fn unavailable_line_addresses_remain_unavailable() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>Text</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert_eq!(
             Targets::new(doc.view()).source_location_on_line(usize::MAX, Some(0)),
             None
@@ -592,7 +591,7 @@ mod tests {
     fn selection_text_spans_block_boundaries_with_newlines() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p><p>beta</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let (plain, _) = doc
             .view()
             .export()
@@ -613,7 +612,7 @@ mod tests {
             "<h2>Title</h2><p><em>soft</em> and <strong>hard</strong></p>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let (_, markdown) = doc
             .view()
             .export()
@@ -645,7 +644,7 @@ mod tests {
             "<p>ca<em>fe\u{301}</em> can't 中文</p><p>next</p>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         for (character, expected) in [
             ('f', "cafe\u{301}"),
             ('\u{301}', "cafe\u{301}"),
@@ -664,7 +663,7 @@ mod tests {
         }
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p><p>beta</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert_eq!(
             doc.view()
                 .export()
@@ -683,7 +682,7 @@ mod tests {
         );
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>one two</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert!(doc.text().word_range_at(glyph_of(doc, ' ')).is_none());
     }
 
@@ -691,7 +690,7 @@ mod tests {
     fn an_empty_range_yields_no_text() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert_eq!(doc.view().export().selection_text(3..3), (None, None));
     }
 
@@ -699,7 +698,7 @@ mod tests {
     fn code_spans_use_delimiters_longer_than_their_contents() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p><code>a`b</code></p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let (_, markdown) = doc
             .view()
             .export()
@@ -716,7 +715,7 @@ mod tests {
             "<table><tr><td><p id='cell'>x</p></td></tr></table>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let boxes = doc.boxes();
         let paragraph = (0..boxes.len())
             .find(|&i| boxes.attribute(i, "id") == Some("cell"))
@@ -747,7 +746,7 @@ mod tests {
     fn a_box_descends_from_itself() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert!(doc.view().semantics().contains(0, 0));
     }
 
@@ -755,7 +754,7 @@ mod tests {
     fn heading_prefixes_cover_every_level() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<h1>a</h1><h3>b</h3><p>c</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let boxes = doc.boxes();
         let tagged = |want: &str| {
             (0..boxes.len())
@@ -789,7 +788,7 @@ mod tests {
     fn start_and_end_line_lookup_agree_on_a_single_line_document() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert_eq!(doc.view().geometry().start_line_at(0.0, 0.1), 0);
         assert_eq!(doc.text().line_index_for_glyph(0), Some(0));
     }
@@ -798,7 +797,7 @@ mod tests {
     fn line_lookup_on_an_empty_document_does_not_panic() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert_eq!(doc.view().geometry().start_line_at(0.0, 0.1), 0);
         assert_eq!(doc.view().geometry().end_line_at(0.0, 0.1), None);
         assert_eq!(doc.text().line_index_for_glyph(0), None);
@@ -811,7 +810,7 @@ mod tests {
             "<p>alpha</p><p>beta</p><p>gamma</p>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let last = doc.text().lines().len() - 1;
         let last_y = doc.text().line(last).expect("last line").point().y;
         assert_eq!(
@@ -877,7 +876,7 @@ mod tests {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha</p>", &mut document_resources);
         assert!(
-            DocQuery::new(&document, &document_resources)
+            DocQuery::from_view((&document).render_view(&document_resources))
                 .text()
                 .find_matches("", options().into())
                 .is_empty()
@@ -888,7 +887,7 @@ mod tests {
     fn document_matching_returns_glyph_ranges_covering_the_query() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p>alpha beta alpha</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let matches = doc.text().find_matches("alpha", options().into());
 
         assert_eq!(matches.len(), 2, "both occurrences are found");
@@ -913,7 +912,7 @@ mod tests {
         // Browsers exclude generated ::marker content from find-in-page.
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<ol><li>item</li></ol>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert!(
             doc.text().find_matches("1", options().into()).is_empty(),
             "the generated list marker must not be searchable"
@@ -929,7 +928,7 @@ mod tests {
             "<p id='first'>alpha</p><p id='second'>beta</p>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let beta = glyph_of(doc, 'b');
 
         let anchor = Targets::new(doc.view())
@@ -945,7 +944,7 @@ mod tests {
             "<p id='first'>alpha</p><p id='second'>beta</p>",
             &mut document_resources,
         );
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         let beta = glyph_of(doc, 'b');
         let only_first: HashSet<u16> = [doc.view().lookup_string("first").expect("id is interned")]
             .into_iter()
@@ -968,7 +967,7 @@ mod tests {
     fn glyph_range_for_a_missing_anchor_is_none() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout("<p id='here'>alpha</p>", &mut document_resources);
-        let doc = DocQuery::new(&document, &document_resources);
+        let doc = DocQuery::from_view((&document).render_view(&document_resources));
         assert!(
             doc.view()
                 .addressing()

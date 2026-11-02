@@ -2,17 +2,11 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
-use html::engine::{DocumentOptions, Engine};
-use html::layout::GlyphShaper;
-use html::pipeline::{ImageSizingPolicy, ReaderStyleOverrides};
+use html::engine::{DocumentOptions, Engine, Error, LoadTimings};
+use html::text::GlyphShaper;
+use html::{layout::ImageSizingPolicy, style::ReaderStyleOverrides};
 use html::resources::ResourceProvider;
 use html_view_types::NoteDisplay;
-
-/// Compatibility names for the engine's prepared and loaded session states.
-/// The engine owns both states; the reader adds only its loading preferences.
-pub type LoadedRenderDocument = Engine;
-pub type PreparedRenderDocument = Engine;
-pub use html::engine::LoadTimings as PipelineTimings;
 
 #[derive(Clone, PartialEq)]
 pub struct DocumentLoadSettings {
@@ -20,7 +14,7 @@ pub struct DocumentLoadSettings {
     pub column_width: f64,
     pub reader_overrides: ReaderStyleOverrides,
     pub image_sizing_policy: ImageSizingPolicy,
-    pub text_composition_policy: html::pipeline::TextCompositionPolicy,
+    pub text_composition_policy: html::layout::TextCompositionPolicy,
     pub note_display: NoteDisplay,
 }
 
@@ -31,31 +25,29 @@ impl DocumentLoadSettings {
             column_width,
             reader_overrides: ReaderStyleOverrides::default(),
             image_sizing_policy: ImageSizingPolicy::SmartStandalone,
-            text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
+            text_composition_policy: html::layout::TextCompositionPolicy::BookOptimized,
             note_display: NoteDisplay::default(),
         }
     }
 
-    fn into_options(self) -> DocumentOptions {
-        DocumentOptions {
-            width: self.column_width,
-            root_font_size: self.root_font_size,
-            reader_overrides: self.reader_overrides,
-            image_sizing_policy: self.image_sizing_policy,
-            text_composition_policy: self.text_composition_policy,
-            note_flow: note_flow_for(self.note_display),
-            ..DocumentOptions::new(self.column_width)
-        }
+    fn into_options(self) -> Result<DocumentOptions, Error> {
+        let mut options =
+            DocumentOptions::new(self.column_width)?.with_root_font_size(self.root_font_size)?;
+        options.reader_overrides = self.reader_overrides;
+        options.image_sizing_policy = self.image_sizing_policy;
+        options.text_composition_policy = self.text_composition_policy;
+        options.note_flow = note_flow_for(self.note_display);
+        Ok(options)
     }
 }
 
 /// How a presentation choice reaches the pipeline. Popup mode holds notes back
 /// from the flow so the reader can show them itself; as-authored leaves them
 /// where they were written.
-pub fn note_flow_for(note_display: NoteDisplay) -> html::pipeline::NoteFlow {
+pub fn note_flow_for(note_display: NoteDisplay) -> html::layout::NoteFlow {
     match note_display {
-        NoteDisplay::Popup => html::pipeline::NoteFlow::Excluded,
-        NoteDisplay::AsAuthored => html::pipeline::NoteFlow::InFlow,
+        NoteDisplay::Popup => html::layout::NoteFlow::Excluded,
+        NoteDisplay::AsAuthored => html::layout::NoteFlow::InFlow,
     }
 }
 
@@ -69,8 +61,11 @@ pub fn load_document_with_settings(
     uri: &str,
     settings: DocumentLoadSettings,
     glyph_shaper: &mut impl GlyphShaper,
-) -> LoadedRenderDocument {
-    Engine::load(provider, uri, settings.into_options(), glyph_shaper)
+) -> Engine {
+    let options = settings
+        .into_options()
+        .expect("document load settings must be valid");
+    Engine::load(provider, uri, options, glyph_shaper)
         .expect("initial pipeline update should succeed")
 }
 
@@ -80,11 +75,13 @@ pub fn load_document_timed(
     root_font_size: f32,
     col_width: f64,
     glyph_shaper: &mut impl GlyphShaper,
-) -> (LoadedRenderDocument, PipelineTimings) {
+) -> (Engine, LoadTimings) {
     Engine::load_timed(
         provider,
         uri,
-        DocumentLoadSettings::book(root_font_size, col_width).into_options(),
+        DocumentLoadSettings::book(root_font_size, col_width)
+            .into_options()
+            .expect("document load settings must be valid"),
         glyph_shaper,
     )
     .expect("initial pipeline update should succeed")
@@ -94,8 +91,9 @@ pub fn prepare_document_with_settings(
     provider: Arc<dyn ResourceProvider>,
     uri: &str,
     settings: DocumentLoadSettings,
-) -> Result<PreparedRenderDocument, String> {
-    Engine::prepare(provider, uri, settings.into_options()).map_err(|error| error.to_string())
+) -> Result<Engine, String> {
+    let options = settings.into_options().map_err(|error| error.to_string())?;
+    Engine::prepare(provider, uri, options).map_err(|error| error.to_string())
 }
 
 pub fn load_document(
@@ -104,7 +102,7 @@ pub fn load_document(
     root_font_size: f32,
     col_width: f64,
     glyph_shaper: &mut impl GlyphShaper,
-) -> LoadedRenderDocument {
+) -> Engine {
     load_document_with_settings(
         provider,
         uri,
@@ -117,13 +115,11 @@ pub fn load_document(
 mod tests {
     use html::text::{GlyphRequest, ShapedGlyph};
 
-    use html::document::NodeRef;
-    use html::layout::GlyphShaper;
-    use html::layout::LayoutConstraints;
-    use html::layout::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore,
-    };
-    use html::pipeline::DocumentFactory;
+    use html::document::{MarkupSyntax, NodeRef, parse_document};
+    use html::text::GlyphShaper;
+    use html_pipeline::engine::LayoutConstraints;
+    use html::text::{FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore};
+    use html_pipeline::DocumentFactory;
     use html::resources::{FileSystemProvider, ResourceMetadata, ResourceProvider};
     use std::collections::HashMap;
     use std::fs;
@@ -164,11 +160,9 @@ mod tests {
             media_type: Some("application/xhtml+xml"),
         };
         let syntax = super::markup_syntax_for_resource(&provider, "chapter.html");
-        assert_eq!(syntax, html::parse::MarkupSyntax::Xhtml);
+        assert_eq!(syntax, MarkupSyntax::Xhtml);
         let source = String::from_utf8(provider.read_bytes("chapter.html").unwrap()).unwrap();
-        let document = html::parse::parse_document(&source, syntax)
-            .unwrap()
-            .build_dom();
+        let document = parse_document(&source, syntax).unwrap().build_dom();
         let root = document.element_ref(document.dom_root().unwrap()).unwrap();
         let body = root
             .children()
@@ -201,14 +195,14 @@ mod tests {
                 },
                 "chapter.xhtml"
             ),
-            html::parse::MarkupSyntax::Html
+            MarkupSyntax::Html
         );
         assert_eq!(
             super::markup_syntax_for_resource(
                 &TypedChapterProvider { media_type: None },
                 "chapter.xhtml"
             ),
-            html::parse::MarkupSyntax::Xhtml
+            MarkupSyntax::Xhtml
         );
     }
 
@@ -217,12 +211,6 @@ mod tests {
         glyphs: HashMap<(char, u32), GlyphId>,
         generation: GlyphResourceGeneration,
         append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceGeneration)>,
-    }
-
-    struct DocumentMemoryProfile {
-        uri: String,
-        total: usize,
-        top_entries: Vec<(String, usize)>,
     }
 
     impl GlyphShaper for TestGlyphShaper {
@@ -235,7 +223,7 @@ mod tests {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), html::text::ShapeError> {
             assert!(self.append_checkpoint.is_none());
             self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
@@ -255,14 +243,14 @@ mod tests {
         fn shape_glyph(
             &mut self,
             request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, html::layout::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+        ) -> Result<ShapedGlyph, html::text::ShapeError> {
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
@@ -275,7 +263,7 @@ mod tests {
     fn layout_html(
         html: &str,
         resources: &mut GlyphResourceStore,
-    ) -> html::layout::LaidOutDocument<'static> {
+    ) -> html_pipeline::engine::LaidOutDocument<'static> {
         let mut factory = DocumentFactory::new();
         let mut glyph_shaper = TestGlyphShaper::default();
         factory
@@ -309,7 +297,7 @@ mod tests {
         let mut shaper = TestGlyphShaper::default();
         let mut loaded = prepared;
         loaded
-            .rehydrate_glyphs(&mut shaper)
+            .apply(html::configuration::DocumentUpdate::default(), &mut shaper)
             .expect("platform shaping should finish");
         assert!(
             loaded
@@ -323,7 +311,7 @@ mod tests {
     }
 
     fn li_boxes(
-        document: &html::layout::LaidOutDocument,
+        document: &html_pipeline::engine::LaidOutDocument,
         resources: &GlyphResourceStore,
     ) -> Vec<usize> {
         let boxes = document.render_view(resources).boxes();
@@ -338,7 +326,7 @@ mod tests {
 
     /// Reconstruct a list item's marker text from its marker box's shaped glyphs.
     fn marker_string(
-        document: &html::layout::LaidOutDocument,
+        document: &html_pipeline::engine::LaidOutDocument,
         li_box: usize,
         resources: &GlyphResourceStore,
     ) -> String {
@@ -553,7 +541,7 @@ mod tests {
         );
 
         let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-        let mut totals = super::PipelineTimings::default();
+        let mut totals = super::LoadTimings::default();
         let mut processed = 0usize;
         let mut failed = 0usize;
 
@@ -586,100 +574,6 @@ mod tests {
         println!("total: {:>8.3} ms", totals.total().as_secs_f64() * 1000.0);
         print_stage("resource read", totals.resource, processed);
         print_stage("pipeline", totals.pipeline, processed);
-
-        assert!(
-            processed > 0,
-            "expected at least one HTML file to be processed"
-        );
-    }
-
-    #[test]
-    #[ignore = "profiling output is noisy; run with --ignored --nocapture"]
-    fn profile_testdata_memory_usage() {
-        let testdata = profile_corpus();
-        let mut files = Vec::new();
-        collect_html_files(&testdata, &mut files);
-        files.sort();
-
-        let mut aggregate: HashMap<String, usize> = HashMap::new();
-        let mut heaviest: Option<DocumentMemoryProfile> = None;
-        let mut processed = 0usize;
-        let mut failed = 0usize;
-        let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-
-        for path in files {
-            let uri = path.to_string_lossy().into_owned();
-            let mut glyph_shaper = TestGlyphShaper::default();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::load_document(provider.clone(), &uri, 16.0, 600.0, &mut glyph_shaper)
-            }));
-            let document = match result {
-                Ok(document) => document,
-                Err(_) => {
-                    failed += 1;
-                    eprintln!("{uri}: renderer panicked");
-                    continue;
-                }
-            };
-
-            let mut report = document.document().unwrap().memory_usage_report();
-            report.sort_by_bytes_desc();
-            let total = report.total_bytes();
-            processed += 1;
-
-            for entry in &report.entries {
-                *aggregate.entry(entry.label.clone()).or_insert(0) += entry.bytes;
-            }
-
-            let top_entries: Vec<(String, usize)> = report
-                .entries
-                .iter()
-                .take(10)
-                .map(|entry| (entry.label.clone(), entry.bytes))
-                .collect();
-            if heaviest
-                .as_ref()
-                .is_none_or(|profile| total > profile.total)
-            {
-                heaviest = Some(DocumentMemoryProfile {
-                    uri: uri.clone(),
-                    total,
-                    top_entries,
-                });
-            }
-        }
-
-        let mut aggregate_entries: Vec<(String, usize)> = aggregate.into_iter().collect();
-        aggregate_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        println!("\n=== skrift-column-paginator memory summary ===");
-        println!("files processed: {processed}   failed: {failed}");
-        if let Some(DocumentMemoryProfile {
-            uri,
-            total,
-            top_entries,
-        }) = heaviest
-        {
-            println!(
-                "heaviest document: {uri} ({:.2} KiB)",
-                total as f64 / 1024.0
-            );
-            for (label, bytes) in top_entries {
-                println!(
-                    "  {:>12}  {}",
-                    format!("{:.2} KiB", bytes as f64 / 1024.0),
-                    label
-                );
-            }
-        }
-        println!("\nTop aggregate memory consumers:");
-        for (label, bytes) in aggregate_entries.into_iter().take(25) {
-            println!(
-                "{:>12}  {}",
-                format!("{:.2} KiB", bytes as f64 / 1024.0),
-                label
-            );
-        }
 
         assert!(
             processed > 0,

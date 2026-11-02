@@ -5,7 +5,7 @@
 
 use std::rc::Rc;
 
-use html::render::Painter;
+use html_render_core::Painter;
 use kurbo::{Point, Rect};
 use peniko::Color;
 
@@ -113,7 +113,7 @@ impl Painter for BufferPainter<'_> {
         self.fill(rect, color);
     }
 
-    fn draw_glyph(&mut self, glyph: html::layout::GlyphId, origin: Point, color: u32) {
+    fn draw_glyph(&mut self, glyph: html::text::GlyphId, origin: Point, color: u32) {
         let Some(raster) = self.shaper.raster(glyph) else { return };
         let [red, green, blue, alpha] = color.to_be_bytes();
         self.blit(&raster, origin + self.offset.to_vec2(), Color::rgba8(red, green, blue, alpha));

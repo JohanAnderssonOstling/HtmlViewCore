@@ -1,4 +1,4 @@
-//! Href resolution and transactional location-history navigation.
+//! Href resolution and validated document navigation.
 
 use super::*;
 
@@ -59,7 +59,6 @@ impl RendererCore {
     }
 
     pub fn navigate_to_href(&mut self, glyph_shaper: &mut impl GlyphShaper, href: &str) -> bool {
-        let from = self.nav.current_location(self.nav_view());
         let from_cfi = self.nav.current_cfi(self.nav_view());
         let Some((doc, anchor)) = self.resolve_href_target(href) else {
             return false;
@@ -67,57 +66,21 @@ impl RendererCore {
         if self.defer_document_read(doc, NavigationRequest::Href(href.to_owned())) {
             return true;
         }
-        let to = html_view_navigate::Location::new(doc, anchor);
-        if !self.navigate_to_location(glyph_shaper, to.clone()) {
+        if !self.navigate_to_href_target(glyph_shaper, doc, anchor) {
             return false;
         }
         if let Some(from) = from_cfi {
             self.nav.begin_jump(from);
         }
-        if from != to {
-            self.nav.history.push(from, self.host.as_ref());
-            self.nav.history.push(to, self.host.as_ref());
-        }
         true
     }
 
-    pub(super) fn navigate_history_step(
+    fn navigate_to_href_target(
         &mut self,
         glyph_shaper: &mut impl GlyphShaper,
-        step: isize,
+        doc_index: usize,
+        anchor: Option<String>,
     ) -> bool {
-        let Some(target) = self.nav.history.peek_step(step) else {
-            self.nav.history.emit_availability(self.host.as_ref());
-            return false;
-        };
-        if self.defer_document_read(target.doc, NavigationRequest::History(step)) {
-            return true;
-        }
-        if !self.navigate_to_location(glyph_shaper, target) {
-            return false;
-        }
-        let committed = self.nav.history.step(step, self.host.as_ref()).is_some();
-        self.nav.history.emit_availability(self.host.as_ref());
-        committed
-    }
-
-    pub fn navigate_history_back(&mut self, glyph_shaper: &mut impl GlyphShaper) -> bool {
-        self.navigate_history_step(glyph_shaper, -1)
-    }
-
-    pub fn navigate_history_forward(&mut self, glyph_shaper: &mut impl GlyphShaper) -> bool {
-        self.navigate_history_step(glyph_shaper, 1)
-    }
-
-    fn navigate_to_location(
-        &mut self,
-        glyph_shaper: &mut impl GlyphShaper,
-        target: html_view_navigate::Location,
-    ) -> bool {
-        let html_view_navigate::Location {
-            doc: doc_index,
-            anchor,
-        } = target;
         if doc_index >= self.nav.documents().uris().len()
             || anchor.as_deref().is_some_and(|anchor| {
                 !self.ensure_navigation_anchor(glyph_shaper, doc_index, anchor)
@@ -143,7 +106,7 @@ impl RendererCore {
     }
 
     /// Ensures a target anchor exists before navigation mutates the current
-    /// document or history cursor. Its preparation is consumed by the same
+    /// document. Its preparation is consumed by the same
     /// navigation after the anchor has been validated.
     fn ensure_navigation_anchor(
         &mut self,

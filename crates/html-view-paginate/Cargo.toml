@@ -11,3 +11,6 @@ html.workspace = true
 kurbo.workspace = true
 html-view-doc.workspace = true
 html-view-types.workspace = true
+
+[dev-dependencies]
+html-pipeline = { package = "skrift-pipeline", path = "../../../HtmlEngine/crates/html-pipeline" }

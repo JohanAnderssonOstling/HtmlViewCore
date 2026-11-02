@@ -15,6 +15,7 @@ name = "spine-harness"
 path = "src/main.rs"
 
 [dependencies]
+html-render-core = { package = "skrift-render-core", path = "../../../HtmlEngine/crates/05-html-render-core" }
 html.workspace = true
 skrift-column-paginator.workspace = true
 kurbo.workspace = true

@@ -16,17 +16,10 @@ use kurbo::{Point, Size};
 pub use peniko::Color;
 
 use html::layout::LineId;
-use html::pipeline::{EarliestStage, ReaderStyleOverrides};
+use html::style::ReaderStyleOverrides;
 use html::resources::ResourceProvider;
 use html::revisions::DocumentRevisions;
-use html::style::FontFace;
-/// A publication navigation entry supplied by the host application.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TocEntry {
-    pub title: String,
-    pub link: String,
-    pub children: Vec<TocEntry>,
-}
+use html::text::FontFace;
 use html::resources::{BlockingJobSpawner, InlineJobSpawner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,9 +120,9 @@ pub struct RendererInitialConfig {
     /// Optional presentation cap. `None` lets the viewport determine the
     /// number of columns from the requested column width.
     pub max_column_count: Option<u8>,
-    pub style_overrides: html::pipeline::ReaderStyleOverrides,
-    pub image_sizing_policy: html::pipeline::ImageSizingPolicy,
-    pub text_composition_policy: html::pipeline::TextCompositionPolicy,
+    pub style_overrides: html::style::ReaderStyleOverrides,
+    pub image_sizing_policy: html::layout::ImageSizingPolicy,
+    pub text_composition_policy: html::layout::TextCompositionPolicy,
     pub note_display: NoteDisplay,
     /// Opt-in pagination-only spacing refinement. This never changes DOM/CSS
     /// layout; it only distributes bounded page slack over existing block gaps.
@@ -149,8 +142,8 @@ impl Default for RendererInitialConfig {
             scale: 1.0,
             max_column_count: None,
             style_overrides: Default::default(),
-            image_sizing_policy: html::pipeline::ImageSizingPolicy::SmartStandalone,
-            text_composition_policy: html::pipeline::TextCompositionPolicy::BookOptimized,
+            image_sizing_policy: html::layout::ImageSizingPolicy::SmartStandalone,
+            text_composition_policy: html::layout::TextCompositionPolicy::BookOptimized,
             note_display: NoteDisplay::default(),
             vertical_rhythm: false,
             paint_palette: Default::default(),
@@ -217,7 +210,6 @@ pub enum RendererCommand {
     NavigateToHref(String),
     /// A user jump, unlike SetCfiPosition which restores without history.
     NavigateToCfi(String),
-    NavigateHistory(i8),
     NavigateDocument(i8),
     SetPosition {
         doc: usize,
@@ -237,12 +229,12 @@ pub enum RendererCommand {
     SetFontSize(f32),
     /// Rebuild text after the host registers newly available publication fonts.
     RefreshFonts,
-    SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides),
-    SetImageSizingPolicy(html::pipeline::ImageSizingPolicy),
+    SetReaderStyleOverrides(html::style::ReaderStyleOverrides),
+    SetImageSizingPolicy(html::layout::ImageSizingPolicy),
     /// Switches how notes are presented. This re-lays-out the document, since
     /// whether a note occupies the reading flow decides what boxes exist.
     SetNoteDisplay(NoteDisplay),
-    SetTextCompositionPolicy(html::pipeline::TextCompositionPolicy),
+    SetTextCompositionPolicy(html::layout::TextCompositionPolicy),
     SetReaderPaintPalette(ReaderPaintPalette),
     SetScale(f64),
     ActivateSearch,
@@ -269,7 +261,7 @@ pub enum RendererCommand {
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),
-    SetReadingTarget(Option<html::layout::ReadingTarget>),
+    SetReadingTarget(Option<html::reading::ReadingTarget>),
     RequestVisibleText,
     CopySelection,
     CopySelectionCitation {
@@ -309,36 +301,16 @@ pub enum RendererEvent {
     },
     /// One settled page location and its progress, emitted after pagination.
     ReadingPositionChanged(ReadingPosition),
-    PositionChanged {
-        doc: usize,
-        glyph: Option<u32>,
-    },
-    CfiChanged(Option<String>),
-    NavAnchorChanged {
-        doc: usize,
-        anchor: Option<String>,
-    },
     TitleChanged(Option<String>),
     MatchInfo {
         current: usize,
         total: usize,
     },
     SearchResults(Vec<BookSearchMatch>),
-    HistoryAvailability {
-        back: bool,
-        forward: bool,
-    },
     SearchActiveChanged(bool),
     ColumnWidthChanged(f64),
     FontSizeChanged(f32),
     ScaleChanged(f64),
-    ReadingProgress {
-        fraction: f32,
-        location: u64,
-        total_locations: u64,
-        doc: usize,
-        doc_count: usize,
-    },
     /// The selected source address; hosts request text only when an action needs it.
     SelectionFinished {
         doc: usize,
@@ -364,6 +336,7 @@ pub enum RendererOperation {
     CopySelection,
     CopyImage,
     CopyEquationLatex,
+    PreviewNote,
     UpdateDocument,
 }
 
@@ -373,6 +346,7 @@ impl fmt::Display for RendererOperation {
             Self::CopySelection => "copy selection",
             Self::CopyImage => "copy image",
             Self::CopyEquationLatex => "copy equation as LaTeX",
+            Self::PreviewNote => "preview footnote",
             Self::UpdateDocument => "update document rendering",
         })
     }
@@ -477,11 +451,29 @@ impl RendererRevisions {
     fn next(value: &mut u64) {
         *value = value.wrapping_add(1).max(1);
     }
-    pub fn invalidate_pipeline_from(&mut self, stage: EarliestStage) {
-        if stage == EarliestStage::None {
-            return;
+    /// Mirror changed engine products without knowing the engine's stages.
+    pub fn update_document(&mut self, before: DocumentRevisions, after: DocumentRevisions) {
+        if before == after { return; }
+        for (old, new, revision) in [
+            (before.document, after.document, &mut self.document_state.document),
+            (before.style, after.style, &mut self.document_state.style),
+            (before.shape, after.shape, &mut self.document_state.shape),
+            (before.layout, after.layout, &mut self.document_state.layout),
+            (before.paint, after.paint, &mut self.document_state.paint),
+            (before.resources, after.resources, &mut self.document_state.resources),
+        ] {
+            if old != new { Self::next(revision); }
         }
-        self.document_state.invalidate_from(stage);
+        Self::next(&mut self.base_display);
+        Self::next(&mut self.overlay);
+    }
+
+    pub fn replace_document(&mut self) {
+        Self::next(&mut self.document_state.document);
+        Self::next(&mut self.document_state.style);
+        Self::next(&mut self.document_state.shape);
+        Self::next(&mut self.document_state.layout);
+        Self::next(&mut self.document_state.paint);
         Self::next(&mut self.base_display);
         Self::next(&mut self.overlay);
     }
@@ -492,7 +484,8 @@ impl RendererRevisions {
         Self::next(&mut self.overlay);
     }
     pub fn invalidate_resources(&mut self) {
-        self.document_state.invalidate_resources();
+        Self::next(&mut self.document_state.resources);
+        Self::next(&mut self.document_state.paint);
         Self::next(&mut self.base_display);
     }
 }
@@ -1511,9 +1504,11 @@ mod renderer_revision_tests {
     }
 
     #[test]
-    fn pipeline_invalidation_expires_only_downstream_products() {
+    fn document_update_expires_only_changed_products() {
         let mut revisions = RendererRevisions::default();
-        revisions.invalidate_pipeline_from(EarliestStage::Shape);
+        let before = DocumentRevisions::default();
+        let after = DocumentRevisions { shape: 2, layout: 2, paint: 2, ..before };
+        revisions.update_document(before, after);
         assert_eq!(revisions.document, 1);
         assert_eq!(revisions.style, 1);
         assert_ne!(revisions.shape, 1);
@@ -1533,7 +1528,7 @@ mod renderer_revision_tests {
     }
 }
 
-impl From<SearchOptions> for html::layout::TextSearchOptions {
+impl From<SearchOptions> for html::text::TextSearchOptions {
     fn from(options: SearchOptions) -> Self {
         Self {
             match_case: options.match_case,

@@ -10,3 +10,6 @@ repository.workspace = true
 html.workspace = true
 html-view-types.workspace = true
 web-time = "1"
+
+[dev-dependencies]
+html-pipeline = { package = "skrift-pipeline", path = "../../../HtmlEngine/crates/html-pipeline" }

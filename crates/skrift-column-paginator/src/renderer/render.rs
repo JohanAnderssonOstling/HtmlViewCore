@@ -149,10 +149,7 @@ impl RendererCore {
 
     pub(crate) fn paginator(&self) -> Paginator<'_> {
         let mode = if self
-            .page
-            .inputs()
-            .layout
-            .text_composition_policy
+            .page.configuration().text_composition_policy()
             .is_book_optimized()
         {
             if self.vertical_rhythm {

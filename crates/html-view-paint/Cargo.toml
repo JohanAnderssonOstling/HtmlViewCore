@@ -7,6 +7,7 @@ publish = false
 repository.workspace = true
 
 [dependencies]
+html-render-core = { package = "skrift-render-core", path = "../../../HtmlEngine/crates/05-html-render-core" }
 html.workspace = true
 html-view-cfi.workspace = true
 html-view-doc.workspace = true

@@ -1069,32 +1069,12 @@ impl HtmlView {
         self.renderer.previous_document();
     }
 
-    /// Follows the document's link history, reporting whether it moved.
-    pub fn navigate_history_back(&mut self, _cx: &mut Context<Self>) -> bool {
-        self.renderer.navigate_history_back()
-    }
-
-    pub fn navigate_history_forward(&mut self, _cx: &mut Context<Self>) -> bool {
-        self.renderer.navigate_history_forward()
-    }
-
     pub fn change_root_font_size(&mut self, delta: f32, _cx: &mut Context<Self>) {
         self.renderer.change_root_font_size(delta);
     }
 
     pub fn resolve_href(&self, href: &str) -> Option<(usize, Option<String>)> {
         self.renderer.resolve_href(href)
-    }
-
-    /// Restricts position events to publisher TOC anchors and immediately
-    /// republishes the current position using the new filter.
-    pub fn set_toc_anchor_strings_by_doc(
-        &mut self,
-        anchors_by_doc: Vec<Vec<String>>,
-        _cx: &mut Context<Self>,
-    ) {
-        self.renderer.set_toc_anchor_strings_by_doc(anchors_by_doc);
-        self.renderer.emit_state_snapshot();
     }
 
     pub fn navigate_to_href(&mut self, href: &str, _cx: &mut Context<Self>) -> bool {

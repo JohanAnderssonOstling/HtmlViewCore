@@ -1,6 +1,7 @@
 //! Renderer navigation, pagination, and note regressions.
 
 use html::selection::Selection;
+use html_render_core::RecordingPainter;
 use html::text::{GlyphRequest, ShapedGlyph};
 #[path = "tests/chapter_start.rs"]
 mod chapter_start;
@@ -18,9 +19,10 @@ use kurbo::{Point, Size};
 
 use crate::text_backend::{
     FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+    ShapeError,
 };
 use crate::{
-    FileSystemProvider, RecordingPainter, RendererCore, RendererEvent, RendererHost,
+    FileSystemProvider, RendererCore, RendererEvent, RendererHost,
     RendererInitialConfig, RendererOperation, load,
 };
 
@@ -48,7 +50,7 @@ impl GlyphShaper for TestShaper {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), crate::layout::ShapeError> {
+    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
         assert!(self.append_checkpoint.is_none());
         self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
         Ok(())
@@ -66,23 +68,20 @@ impl GlyphShaper for TestShaper {
         }
     }
 
-    fn shape_glyph(
-        &mut self,
-        request: GlyphRequest<'_>,
-    ) -> Result<ShapedGlyph, crate::layout::ShapeError> {
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         if self.reject_glyphs {
-            return Err(crate::layout::ShapeError::unregistered_glyph_id(
+            return Err(ShapeError::unregistered_glyph_id(
                 u32::MAX,
                 self.glyphs.len(),
             ));
         }
-        let key = (request.character, request.font_size.to_bits());
-        let metric = GlyphMetric::try_new(
+        let key = (request.character, request.style.font_size.to_bits());
+        let metric = GlyphMetric::new(
             request.character,
-            request.font_size * 0.5,
-            request.font_size * 0.75,
-            request.font_size * 0.25,
-        )?;
+            request.style.font_size * 0.5,
+            request.style.font_size * 0.75,
+            request.style.font_size * 0.25,
+        );
         if let Some(&glyph) = self.glyphs.get(&key) {
             return Ok(ShapedGlyph::from_metric(glyph, metric));
         }
@@ -228,7 +227,7 @@ fn pagination_core(source: &str, viewport: Size, max_columns: u8) -> (RendererCo
         source,
         viewport,
         max_columns,
-        html::pipeline::TextCompositionPolicy::WebCompatible,
+        html::layout::TextCompositionPolicy::WebCompatible,
     )
 }
 
@@ -236,7 +235,7 @@ fn pagination_core_with_policy(
     source: &str,
     viewport: Size,
     max_columns: u8,
-    text_composition_policy: html::pipeline::TextCompositionPolicy,
+    text_composition_policy: html::layout::TextCompositionPolicy,
 ) -> (RendererCore, TestShaper) {
     pagination_core_with_policy_at_uri(
         "document.html",
@@ -252,7 +251,7 @@ fn pagination_core_with_policy_at_uri(
     source: &str,
     viewport: Size,
     max_columns: u8,
-    text_composition_policy: html::pipeline::TextCompositionPolicy,
+    text_composition_policy: html::layout::TextCompositionPolicy,
 ) -> (RendererCore, TestShaper) {
     let (provider, _) = CountingProvider::new(vec![(uri, source)]);
     let host = Rc::new(TestHost::default());
@@ -261,7 +260,7 @@ fn pagination_core_with_policy_at_uri(
         font_size: 16.0,
         column_width: 200.0,
         max_column_count: Some(max_columns),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
         text_composition_policy,
         ..RendererInitialConfig::default()
     };
@@ -431,7 +430,7 @@ fn optional_vertical_rhythm_only_stretches_existing_block_gaps() {
         html,
         Size::new(200.0, 75.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let natural_positions = visible_positions(&natural);
     let a = line_index_for_character(&natural, 'A');
@@ -492,7 +491,7 @@ fn vertical_rhythm_leaves_the_terminal_document_column_ragged() {
         html,
         Size::new(200.0, 75.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let before = visible_positions(&core);
 
@@ -525,7 +524,7 @@ fn book_paginator_keeps_a_compact_list_item_intact() {
         html,
         Size::new(420.0, 50.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first = line_index_for_character(&core, 'L');
     let second = line_index_for_character(&core, 'M');
@@ -557,7 +556,7 @@ fn book_paginator_keeps_a_term_with_the_first_two_definition_lines() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let term = line_index_for_character(&core, 'T');
     let definition = line_index_for_character(&core, 'D');
@@ -599,7 +598,7 @@ fn book_paginator_keeps_compact_preformatted_code_and_splits_oversized_code() {
         compact,
         Size::new(420.0, 50.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let compact_first = line_index_for_character(&compact_core, 'C');
     let compact_second = line_index_for_character(&compact_core, 'D');
@@ -631,7 +630,7 @@ fn book_paginator_keeps_compact_preformatted_code_and_splits_oversized_code() {
         oversized,
         Size::new(640.0, 50.0),
         3,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let oversized_first = line_index_for_character(&oversized_core, 'C');
     let oversized_last = line_index_for_character(&oversized_core, 'F');
@@ -958,7 +957,7 @@ fn book_paginator_distinguishes_column_breaks_from_page_breaks() {
         column_html,
         Size::new(700.0, 60.0),
         3,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let column_b = line_index_for_character(&column_core, 'B');
     assert_eq!(
@@ -985,7 +984,7 @@ fn book_paginator_distinguishes_column_breaks_from_page_breaks() {
             &html,
             Size::new(700.0, 60.0),
             3,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let b = line_index_for_character(&core, 'B');
 
@@ -1018,7 +1017,7 @@ fn book_paginator_anchors_forced_breaks_on_empty_boxes_to_following_content() {
             &html,
             Size::new(420.0, 60.0),
             2,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let a = line_index_for_character(&core, 'A');
         let b = line_index_for_character(&core, 'B');
@@ -1052,7 +1051,7 @@ fn forced_break_inside_an_avoided_container_takes_precedence() {
         html,
         Size::new(420.0, 50.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let b = line_index_for_character(&core, 'B');
     let c = line_index_for_character(&core, 'C');
@@ -1085,7 +1084,7 @@ fn forced_column_break_does_not_leave_a_margin_only_empty_column() {
         html,
         Size::new(700.0, 100.0),
         3,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let b = line_index_for_character(&core, 'B');
 
@@ -1125,7 +1124,7 @@ fn book_paginator_applies_break_after_without_fragmenting_continuous_layout() {
             &html,
             Size::new(700.0, 60.0),
             3,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let b = line_index_for_character(&core, 'B');
 
@@ -1276,7 +1275,7 @@ fn book_paginator_applies_break_inside_avoid_without_changing_continuous_geometr
         html,
         Size::new(200.0, 40.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let b = line_index_for_character(&core, 'B');
     let c = line_index_for_character(&core, 'C');
@@ -1393,7 +1392,7 @@ fn book_paginator_automatically_keeps_a_heading_with_two_following_lines() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let a = line_index_for_character(&core, 'A');
     let heading = line_index_for_character(&core, 'H');
@@ -1476,7 +1475,7 @@ fn book_paginator_moves_a_large_multiline_heading_to_a_fresh_column() {
         html,
         Size::new(200.0, 80.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let heading = line_index_for_character(&core, 'H');
     let second_heading_line = line_index_for_character(&core, 'I');
@@ -1518,7 +1517,7 @@ fn book_paginator_does_not_move_an_oversized_heading_group() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let heading = line_index_for_character(&core, 'H');
 
@@ -1550,7 +1549,7 @@ fn authored_forced_break_after_heading_overrides_automatic_keep() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let heading = line_index_for_character(&core, 'H');
     let b = line_index_for_character(&core, 'B');
@@ -1598,7 +1597,7 @@ fn automatic_heading_keep_roundtrips_through_backward_pagination() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_page = visible_positions(&core);
     let first_range = (
@@ -1645,7 +1644,7 @@ fn book_paginator_keeps_compact_semantic_sidebars_in_one_column() {
             html,
             Size::new(420.0, 50.0),
             2,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let sidebar = line_index_for_character(&core, 'S');
         let sidebar_end = line_index_for_character(&core, 'T');
@@ -1702,7 +1701,7 @@ fn book_paginator_keeps_bounded_compact_semantic_structures_in_one_column() {
             &html,
             Size::new(420.0, 50.0),
             2,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let start = line_index_for_character(&core, 'B');
         let end = line_index_for_character(&core, 'C');
@@ -1737,7 +1736,7 @@ fn book_paginator_splits_an_oversized_semantic_structure_normally() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let start = line_index_for_character(&core, 'B');
 
@@ -1760,7 +1759,7 @@ fn authored_break_inside_a_compact_semantic_structure_wins() {
         html,
         Size::new(420.0, 50.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let start = line_index_for_character(&core, 'B');
     let after_break = line_index_for_character(&core, 'C');
@@ -1792,7 +1791,7 @@ fn book_paginator_keeps_a_semantic_statement_label_with_two_content_lines() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let label = line_index_for_character(&core, 'L');
     let first = line_index_for_character(&core, 'B');
@@ -1877,7 +1876,7 @@ fn book_paginator_starts_major_epub_sections_on_a_fresh_reader_page() {
             &html,
             Size::new(420.0, 60.0),
             2,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let section = line_index_for_character(&core, 'B');
 
@@ -1931,7 +1930,7 @@ fn book_paginator_starts_major_dpub_sections_on_a_fresh_reader_page() {
             &html,
             Size::new(420.0, 60.0),
             2,
-            html::pipeline::TextCompositionPolicy::BookOptimized,
+            html::layout::TextCompositionPolicy::BookOptimized,
         );
         let section = line_index_for_character(&core, 'B');
 
@@ -1966,7 +1965,7 @@ fn generic_section_remains_in_normal_book_flow() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let section = line_index_for_character(&core, 'B');
 
@@ -1988,7 +1987,7 @@ fn authored_avoid_suppresses_a_semantic_page_start() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let section = line_index_for_character(&core, 'B');
 
@@ -2010,7 +2009,7 @@ fn semantic_page_start_at_document_origin_does_not_create_a_blank_page() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let section = line_index_for_character(&core, 'B');
 
@@ -2060,7 +2059,7 @@ fn authored_column_break_overrides_a_semantic_chapter_page_break() {
         html,
         Size::new(420.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let chapter = line_index_for_character(&core, 'B');
 
@@ -2099,7 +2098,7 @@ fn book_paginator_moves_a_compact_figure_and_caption_to_a_fresh_column() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let image_label = line_index_for_character(&core, 'I');
     let caption = line_index_for_character(&core, 'C');
@@ -2162,7 +2161,7 @@ fn book_paginator_keeps_an_image_only_figure_whole() {
         html,
         Size::new(200.0, 30.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let image_line = core
         .page
@@ -2203,7 +2202,7 @@ fn book_paginator_keeps_a_replaced_image_with_its_multiline_caption() {
         html,
         Size::new(200.0, 70.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let image_line = core
         .page
@@ -2308,7 +2307,7 @@ fn book_paginator_keeps_a_bottom_caption_with_oversized_figure_content() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let image_label = line_index_for_character(&core, 'I');
     let caption = line_index_for_character(&core, 'C');
@@ -2378,7 +2377,7 @@ fn book_paginator_keeps_a_top_caption_with_oversized_figure_content() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let caption = line_index_for_character(&core, 'C');
     let image_label = line_index_for_character(&core, 'I');
@@ -2448,7 +2447,7 @@ fn authored_forced_break_between_figure_content_and_caption_wins() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let image_label = line_index_for_character(&core, 'I');
     let caption = line_index_for_character(&core, 'C');
@@ -2492,7 +2491,7 @@ fn automatic_figure_placement_roundtrips_through_backward_pagination() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_page = visible_positions(&core);
     let first_range = (
@@ -2522,7 +2521,7 @@ fn book_paginator_prefers_a_compact_table_in_one_column() {
         html,
         Size::new(200.0, 70.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let caption = line_index_for_character(&core, 'C');
     let first_row = line_index_for_character(&core, 'B');
@@ -2612,7 +2611,7 @@ fn book_paginator_uses_remaining_space_for_a_table_taller_than_a_column() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let caption = line_index_for_character(&core, 'C');
     let first_row = line_index_for_character(&core, 'B');
@@ -2666,7 +2665,7 @@ fn book_paginator_breaks_an_oversized_table_between_rows() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_row = line_index_for_character(&core, 'B');
     let first_row_second_line = line_index_for_character(&core, 'C');
@@ -2729,7 +2728,7 @@ fn book_paginator_repeats_explicit_table_header_on_a_continuation_column() {
         html,
         Size::new(500.0, 70.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let continued_row = line_index_for_character(&core, 'C');
 
@@ -2756,7 +2755,7 @@ fn book_paginator_repeats_a_leading_all_th_row_without_thead() {
         html,
         Size::new(500.0, 70.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let continued_row = line_index_for_character(&core, 'C');
 
@@ -2779,7 +2778,7 @@ fn book_paginator_omits_a_repeated_header_when_no_body_row_would_fit() {
         html,
         Size::new(500.0, 60.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let body_row = line_index_for_character(&core, 'B');
 
@@ -2802,7 +2801,7 @@ fn table_row_boundary_does_not_move_the_previous_rows_last_line() {
         html,
         Size::new(500.0, 50.0),
         2,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first = line_index_for_character(&core, 'A');
     let first_last = line_index_for_character(&core, 'B');
@@ -2845,7 +2844,7 @@ fn book_paginator_does_not_break_through_a_rowspan_group() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_group_row = line_index_for_character(&core, 'T');
     let second_group_row = line_index_for_character(&core, 'U');
@@ -2891,7 +2890,7 @@ fn book_paginator_keeps_a_bottom_table_caption_with_the_last_row() {
         html,
         Size::new(200.0, 50.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let last_row = line_index_for_character(&core, 'B');
     let caption = line_index_for_character(&core, 'C');
@@ -2936,7 +2935,7 @@ fn authored_forced_break_between_table_rows_wins() {
         html,
         Size::new(200.0, 60.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_row = line_index_for_character(&core, 'A');
     let second_row = line_index_for_character(&core, 'B');
@@ -2994,7 +2993,7 @@ fn automatic_table_placement_roundtrips_through_backward_pagination() {
         html,
         Size::new(200.0, 70.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let first_page = visible_positions(&core);
     let first_range = (
@@ -3082,7 +3081,7 @@ fn book_paginator_applies_line_limits_without_changing_continuous_geometry() {
         html,
         Size::new(200.0, 40.0),
         1,
-        html::pipeline::TextCompositionPolicy::BookOptimized,
+        html::layout::TextCompositionPolicy::BookOptimized,
     );
     let b = line_index_for_character(&core, 'B');
     let c = line_index_for_character(&core, 'C');
@@ -3540,13 +3539,10 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
 
     assert!(activate_glyph(&mut core, &mut shaper, linked_glyph));
     assert_eq!(core.nav.location().document(), 1);
-    assert!(
-        core.nav.current_anchor_id(core.nav_view()).as_deref() == Some("target")
-            || core.nav.location().anchor().is_some()
-    );
-    assert!(core.navigate_history_back(&mut shaper));
+    assert!(core.nav.location().anchor().is_some());
+    assert!(core.navigate_to_href(&mut shaper, "one.html"));
     assert_eq!(core.nav.location().document(), 0);
-    assert!(core.navigate_history_forward(&mut shaper));
+    assert!(core.navigate_to_href(&mut shaper, "two.html#target"));
     assert_eq!(core.nav.location().document(), 1);
     assert!(
         host.events
@@ -3617,7 +3613,7 @@ fn href_resolution_rejects_an_ambiguous_resolved_spine_identifier() {
 }
 
 #[test]
-fn a_missing_cross_document_anchor_does_not_change_document_or_history() {
+fn a_missing_cross_document_anchor_does_not_change_document() {
     let (mut core, mut shaper) = spine_core(
         vec![
             ("current.html", "<html><body>Current</body></html>"),
@@ -3633,36 +3629,6 @@ fn a_missing_cross_document_anchor_does_not_change_document_or_history() {
 
     assert!(!core.navigate_to_href(&mut shaper, "target.html#missing"));
     assert_eq!(core.nav.location().document(), 0);
-    assert!(core.nav.history.current().is_none());
-}
-
-#[test]
-fn a_failed_history_target_does_not_advance_the_history_cursor() {
-    let (mut core, mut shaper) = spine_core(
-        vec![
-            ("current.html", "<html><body>Current</body></html>"),
-            (
-                "target.html",
-                "<html><body><h1 id='present'>Target</h1></body></html>",
-            ),
-        ],
-        Size::new(600.0, 800.0),
-        600.0,
-        1,
-    );
-    let host = core.host.clone();
-    let current = html_view_navigate::Location::new(0, None);
-    let invalid = html_view_navigate::Location::new(1, Some("missing".to_owned()));
-    core.nav.history.push(current.clone(), host.as_ref());
-    core.nav.history.push(invalid, host.as_ref());
-    assert_eq!(
-        core.nav.history.step(-1, host.as_ref()),
-        Some(current.clone())
-    );
-
-    assert!(!core.navigate_history_forward(&mut shaper));
-    assert_eq!(core.nav.location().document(), 0);
-    assert_eq!(core.nav.history.current(), Some(&current));
 }
 
 #[test]
@@ -3690,8 +3656,8 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         RendererInitialConfig::default(),
     );
     assert_eq!(
-        core.page.inputs().layout.image_sizing_policy,
-        html::pipeline::ImageSizingPolicy::SmartStandalone,
+        core.page.configuration().image_sizing_policy(),
+        html::layout::ImageSizingPolicy::SmartStandalone,
         "reader UI documents should enable smart standalone image sizing at initial layout"
     );
 
@@ -3701,7 +3667,7 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
     assert_eq!(core.page.layout.base_col_width, 480.0);
     assert_eq!(core.root_font_size, 18.0);
     assert_eq!(core.page.layout.scale, 1.5);
-    let reader_overrides_before_theme = core.page.inputs().reader_overrides.clone();
+    let reader_overrides_before_theme = core.page.configuration().reader_overrides().clone();
     let repaint_before_theme = host.repaint_requests.get();
     core.apply(
         &mut shaper,
@@ -3711,8 +3677,8 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
         }),
     );
     assert_eq!(
-        core.page.inputs().reader_overrides,
-        reader_overrides_before_theme,
+        core.page.configuration().reader_overrides(),
+        &reader_overrides_before_theme,
         "theme changes must not rerun the style pipeline"
     );
     assert!(host.repaint_requests.get() > repaint_before_theme);
@@ -3867,7 +3833,7 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
         RendererInitialConfig::default(),
     );
     let committed_size = core.root_font_size;
-    let committed_input_size = core.page.inputs().style_environment.root_font_size;
+    let committed_input_size = core.page.configuration().font_size();
     host.events.borrow_mut().clear();
 
     shaper.reject_glyphs = true;
@@ -3875,7 +3841,7 @@ fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
 
     assert_eq!(core.root_font_size, committed_size);
     assert_eq!(
-        core.page.inputs().style_environment.root_font_size,
+        core.page.configuration().font_size(),
         committed_input_size
     );
     let events = host.events.borrow();
@@ -4121,10 +4087,6 @@ fn navigation_reads_each_destination_when_traversing_back() {
     }
     assert_eq!(core.nav.location().document(), 0);
 
-    assert!(
-        core.nav.history.is_at_newest(),
-        "walking back to the first document should leave the history cursor at its newest entry"
-    );
     assert_eq!(read_count.load(Ordering::Relaxed), indexed_baseline + 8);
 }
 
@@ -4691,8 +4653,8 @@ fn as_authored_notes_read_inline_instead_of_being_held_for_a_popup() {
         font_size: 16.0,
         column_width: 200.0,
         max_column_count: Some(1),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-        text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
+        text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
         note_display: crate::NoteDisplay::AsAuthored,
         ..RendererInitialConfig::default()
     };
@@ -4818,8 +4780,8 @@ fn spine_core(
         font_size: 16.0,
         column_width,
         max_column_count: Some(max_columns),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-        text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
+        text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
         ..RendererInitialConfig::default()
     };
     let mut core = RendererCore::from_provider_with_nav(
@@ -4880,8 +4842,8 @@ fn a_page_turn_opens_the_next_document() {
         font_size: 16.0,
         column_width: 200.0,
         max_column_count: Some(2),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-        text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
+        text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
         ..RendererInitialConfig::default()
     };
     let uris = vec!["one.html".to_owned(), "two.html".to_owned()];
@@ -4914,8 +4876,8 @@ fn source_position_reader(source: &str) -> (RendererCore, TestShaper, Rc<TestHos
         font_size: 16.0,
         column_width: 340.0,
         max_column_count: Some(1),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-        text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
+        text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
         ..RendererInitialConfig::default()
     };
     let mut core = RendererCore::from_provider_with_nav(
@@ -5072,7 +5034,6 @@ fn reading_position_source_crosses_empty_chapter_markers() {
         .map(|node| parsed.get_element_step(node).unwrap())
         .collect::<Vec<_>>();
     let (mut core, mut shaper, host) = source_position_reader(&source);
-    core.set_toc_anchor_strings_by_doc(vec![vec!["first".into(), "second".into()]]);
     let viewport = Size::new(340.0, 600.0);
     core.prepare_frame(&mut shaper, viewport);
     assert!(reading_positions(&host).last().unwrap().source.path < boundary);
@@ -5315,8 +5276,8 @@ fn an_as_authored_note_reference_navigates_rather_than_opening_a_popup() {
         font_size: 16.0,
         column_width: 200.0,
         max_column_count: Some(1),
-        image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-        text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
+        image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
+        text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
         note_display: crate::NoteDisplay::AsAuthored,
         ..RendererInitialConfig::default()
     };
@@ -5563,7 +5524,7 @@ fn remote_file_navigation_waits_for_background_reads_and_preserves_failed_page()
     jobs.run();
     core.finish_pending_navigation(&mut shaper);
     assert_eq!(core.nav.location().document(), 1);
-    assert!(core.navigate_history_back(&mut shaper));
+    assert!(core.navigate_to_href(&mut shaper, "one.html"));
     assert_eq!(core.nav.location().document(), 1);
     jobs.run();
     core.finish_pending_navigation(&mut shaper);
@@ -5938,7 +5899,7 @@ fn reader_hyphenation_changes_apply_immediately_and_book_restores_publication_ru
             core.apply(
                 &mut shaper,
                 crate::RendererCommand::SetReaderStyleOverrides(
-                    html::pipeline::ReaderStyleOverrides {
+                    html::style::ReaderStyleOverrides {
                         hyphens: selection,
                         ..Default::default()
                     },
@@ -5964,7 +5925,7 @@ fn reader_word_spacing_keeps_carets_selection_and_hit_testing_aligned() {
     for factor in [1.5, 0.5, 1.0] {
         core.apply(
             &mut shaper,
-            crate::RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
+            crate::RendererCommand::SetReaderStyleOverrides(html::style::ReaderStyleOverrides {
                 word_spacing_factor: (factor != 1.0).then_some(factor),
                 ..Default::default()
             }),
@@ -6009,25 +5970,25 @@ fn reader_color_update_preserves_chapter_text_selection_and_geometry() {
         .selection
         .select_range(0, 8, crate::SelectionMode::Plain);
     let selected = core.page.selected_text();
-    let text = core.page.inputs().source.as_ptr();
+    let text = core.page.configuration().source.as_ptr();
     let layout_revision = core.revisions.layout;
     let display_revision = core.revisions.base_display;
     let line_count = core.page.doc().text().line_count();
     shaper.reject_glyphs = true;
     core.apply(
         &mut shaper,
-        crate::RendererCommand::SetReaderStyleOverrides(html::pipeline::ReaderStyleOverrides {
+        crate::RendererCommand::SetReaderStyleOverrides(html::style::ReaderStyleOverrides {
             link_foreground: Some(0x123456ff),
             ..Default::default()
         }),
     );
-    assert_eq!(text, core.page.inputs().source.as_ptr());
+    assert_eq!(text, core.page.configuration().source.as_ptr());
     assert_eq!(core.page.selected_text().as_deref(), selected.as_deref());
     assert_eq!(core.revisions.layout, layout_revision);
     assert!(core.revisions.base_display > display_revision);
     assert_eq!(core.page.doc().text().line_count(), line_count);
     assert_eq!(
-        core.page.inputs().reader_overrides.link_foreground,
+        core.page.configuration().reader_overrides().link_foreground,
         Some(0x123456ff)
     );
 }

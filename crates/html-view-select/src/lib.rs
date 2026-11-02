@@ -9,7 +9,7 @@
 use html::export::{DocumentExport, ExportFormat, ExportTarget};
 use html::geometry::{Geometry, WordHit};
 use html::layout::RenderTable;
-use html::render::Painter;
+use html_render_core::Painter;
 use html::selection::{Selection, SelectionGeometry, SelectionState as DocumentSelectionState};
 use html_view_doc::TextGeometry;
 use kurbo::{Point, Rect};
@@ -17,8 +17,8 @@ use peniko::Color;
 use std::ops::{Deref, DerefMut};
 
 pub use html::selection::{
-    SelectionInteraction, SelectionMode, TableCellRange, TableHit,
-    TableSelectionState, table_selection_markdown,
+    SelectionInteraction, SelectionMode, TableCellRange, TableHit, TableSelectionState,
+    table_selection_markdown,
 };
 
 #[derive(Clone, Default)]
@@ -236,11 +236,11 @@ mod tests {
     use html::text::{GlyphRequest, ShapedGlyph};
 
     use super::{SelectionMode, SelectionState, TableCellRange, table_selection_markdown};
-    use html::layout::LayoutConstraints;
-    use html::layout::{
+    use html_pipeline::engine::LayoutConstraints;
+    use html::text::{
         FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
     };
-    use html::pipeline::DocumentFactory;
+    use html_pipeline::DocumentFactory;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -260,7 +260,7 @@ mod tests {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), html::text::ShapeError> {
             assert!(self.append_checkpoint.is_none());
             self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
@@ -280,14 +280,14 @@ mod tests {
         fn shape_glyph(
             &mut self,
             request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, html::layout::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+        ) -> Result<ShapedGlyph, html::text::ShapeError> {
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }

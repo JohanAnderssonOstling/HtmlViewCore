@@ -9,8 +9,9 @@
 //! are the same concern.
 
 use html::annotations::{AnnotationAnchor, AnnotationIndex, DocumentAnnotation};
-use html::layout::ReadingTarget;
-use html::render::{DocumentPainter, FragmentImagePolicy, Painter};
+use html::reading::ReadingTarget;
+use html_render_core::{Painter};
+use html::render::{DocumentPainter, FragmentImagePolicy};
 use html::search::{DocumentSearch, Search};
 use html::selection::SelectionGeometry;
 use html::targets::TextQuote;

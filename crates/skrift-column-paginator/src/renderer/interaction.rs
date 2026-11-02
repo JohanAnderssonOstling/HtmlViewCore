@@ -3,7 +3,7 @@ use kurbo::{Point, Size};
 
 use crate::spine_item::SpineItem;
 
-use crate::{FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
+use crate::{DocumentUpdate, FrameGeometryCacheKey, GlyphShaper, PaintDirection, RendererCore};
 
 impl RendererCore {
     fn visible_view_for_doc(&self, doc: usize) -> Option<&SpineItem> {
@@ -88,8 +88,8 @@ impl RendererCore {
         if poll.decoded {
             self.revisions.invalidate_resources();
         }
-        if let Some(changes) = poll.changes {
-            if let Err(error) = self.apply_pipeline_changes_without_repaint(changes, glyph_shaper) {
+        if poll.layout_needed {
+            if let Err(error) = self.apply_document_update_without_repaint(DocumentUpdate::default(), glyph_shaper) {
                 self.emit_operation_failed(
                     crate::RendererOperation::UpdateDocument,
                     error.to_string(),
@@ -165,10 +165,8 @@ impl RendererCore {
                 frame: &self.page.frame,
             };
             self.nav.update_nav_anchor_from_layout(view);
-            self.update_nav_signal();
             self.nav.mark_anchor_clean();
         }
-        self.update_nav_signal();
         let (nav, mut cx) = self.nav_cx();
         nav.emit_reading_position(&mut cx);
     }
@@ -318,177 +316,4 @@ fn can_reproject_width_only(
         && previous.page_offset_bits == requested.page_offset_bits
         && previous.page_anchor_line == requested.page_anchor_line
         && previous.direction == requested.direction
-}
-
-#[cfg(test)]
-mod tests {
-    use html::resources::image_metric_changes as apply_image_poll_updates;
-
-    fn test_resources() -> Vec<(u32, u32, Option<u32>, Option<u32>)> {
-        vec![
-            (64, 32, None, None),
-            (12, 12, Some(12), Some(12)),
-            (40, 80, Some(40), None),
-        ]
-    }
-
-    fn base_inputs() -> html::pipeline::PipelineInputs {
-        html::pipeline::PipelineInputs {
-            source: "<html />".into(),
-            markup_syntax: html::pipeline::MarkupSyntax::Html,
-            user_styles: Vec::new(),
-            reader_overrides: Default::default(),
-            note_flow: Default::default(),
-            source_revision: html::pipeline::SourceRevision::INITIAL,
-            base_uri: "doc.html".to_string(),
-            resource_revision: html::pipeline::ResourceRevision::INITIAL,
-            stylesheet_revision: html::pipeline::StylesheetRevision::INITIAL,
-            style_environment: html::pipeline::StyleEnvironment::default(),
-            font_environment: html::pipeline::FontEnvironmentRevision::INITIAL,
-            image_metrics_revision: html::pipeline::ImageMetricsRevision::INITIAL,
-            layout: html::pipeline::LayoutConstraints {
-                viewport_width: 600.0,
-                viewport_height: None,
-                line_height: 16.0,
-                image_sizing_policy: html::pipeline::ImageSizingPolicy::WebCompatible,
-                text_composition_policy: html::pipeline::TextCompositionPolicy::WebCompatible,
-            },
-            image_metrics: html::layout::ImageMetrics::default(),
-            paint: html::pipeline::PaintSettingsRevision::INITIAL,
-        }
-    }
-
-    #[test]
-    fn image_poll_no_layout_needed_when_dimensions_do_not_change() {
-        let resources = test_resources();
-        let mut next_inputs = base_inputs();
-        next_inputs.image_metrics = html::layout::ImageMetrics::default();
-
-        let (updated, layout_needed) = apply_image_poll_updates(
-            &next_inputs,
-            &[0, 1, 2],
-            |idx| resources.get(idx as usize).copied(),
-            |idx| match idx {
-                0 => Some((64, 32)),
-                1 => Some((16, 16)),
-                2 => Some((40, 80)),
-                _ => None,
-            },
-        );
-
-        assert!(
-            !layout_needed,
-            "intrinsic-only image changes should not force layout if no intrinsic dimensions changed"
-        );
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(0),
-            Some((64, 32))
-        );
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(1),
-            Some((16, 16))
-        );
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(2),
-            Some((40, 80))
-        );
-    }
-
-    #[test]
-    fn image_poll_out_of_order_batch_has_stable_result_and_single_revision_bump() {
-        let resources = test_resources();
-        let mut base = base_inputs();
-        base.image_metrics.set(0, 10, 10);
-        base.image_metrics.set(1, 11, 12);
-        base.image_metrics.set(2, 13, 14);
-
-        let (updated_ab, layout_ab) = apply_image_poll_updates(
-            &base,
-            &[2, 0, 1],
-            |idx| resources.get(idx as usize).copied(),
-            |idx| match idx {
-                0 => Some((20, 10)),
-                1 => Some((11, 12)),
-                2 => Some((13, 99)),
-                _ => None,
-            },
-        );
-
-        let (updated_ba, layout_ba) = apply_image_poll_updates(
-            &base,
-            &[1, 2, 0],
-            |idx| resources.get(idx as usize).copied(),
-            |idx| match idx {
-                0 => Some((20, 10)),
-                1 => Some((11, 12)),
-                2 => Some((13, 99)),
-                _ => None,
-            },
-        );
-
-        assert!(layout_ab);
-        assert!(layout_ba);
-
-        assert_eq!(
-            updated_ab.image_metrics.as_ref().unwrap().get(0),
-            updated_ba.image_metrics.as_ref().unwrap().get(0)
-        );
-        assert_eq!(
-            updated_ab.image_metrics.as_ref().unwrap().get(1),
-            updated_ba.image_metrics.as_ref().unwrap().get(1)
-        );
-        assert_eq!(
-            updated_ab.image_metrics.as_ref().unwrap().get(2),
-            updated_ba.image_metrics.as_ref().unwrap().get(2)
-        );
-
-        // A caller applying this batch should only need one revision bump.
-        assert_eq!(
-            updated_ab.image_metrics_revision,
-            Some(base.image_metrics_revision.next())
-        );
-        assert_eq!(
-            updated_ba.image_metrics_revision,
-            Some(base.image_metrics_revision.next())
-        );
-    }
-
-    #[test]
-    fn image_poll_with_out_of_order_batch_applies_one_revision_bump() {
-        let resources = test_resources();
-        let mut base = base_inputs();
-        base.image_metrics.set(0, 10, 10);
-        base.image_metrics.set(1, 11, 12);
-        base.image_metrics.set(2, 13, 14);
-
-        let (updated, layout_needed) = apply_image_poll_updates(
-            &base,
-            &[2, 0, 1],
-            |idx| resources.get(idx as usize).copied(),
-            |idx| match idx {
-                0 => Some((20, 10)),
-                1 => Some((11, 12)),
-                2 => Some((13, 99)),
-                _ => None,
-            },
-        );
-
-        assert!(layout_needed);
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(0),
-            Some((20, 10))
-        );
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(1),
-            Some((11, 12))
-        );
-        assert_eq!(
-            updated.image_metrics.as_ref().unwrap().get(2),
-            Some((13, 99))
-        );
-        assert_eq!(
-            updated.image_metrics_revision,
-            Some(base.image_metrics_revision.next())
-        );
-    }
 }

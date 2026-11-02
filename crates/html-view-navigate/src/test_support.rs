@@ -13,10 +13,6 @@ pub(crate) struct RecordingHost {
 }
 
 impl RecordingHost {
-    pub(crate) fn events(&self) -> Vec<RendererEvent> {
-        self.events.borrow().clone()
-    }
-
     pub(crate) fn count(&self) -> usize {
         self.events.borrow().len()
     }
@@ -43,15 +39,4 @@ impl RendererHost for RecordingHost {
     fn emit(&self, event: RendererEvent) {
         self.events.borrow_mut().push(event);
     }
-}
-
-/// History availability pairs, in emission order.
-pub(crate) fn availability(host: &RecordingHost) -> Vec<(bool, bool)> {
-    host.events()
-        .into_iter()
-        .filter_map(|event| match event {
-            RendererEvent::HistoryAvailability { back, forward } => Some((back, forward)),
-            _ => None,
-        })
-        .collect()
 }

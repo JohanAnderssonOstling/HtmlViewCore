@@ -143,11 +143,18 @@ impl RendererCore {
         // The host decides how wide a note is shown, so it is laid out to that
         // width here rather than to the page's and stretched on arrival.
         let width = self.note_layout_width();
-        let constraints =
-            html::layout::LayoutConstraints::new(width, self.root_font_size as f64).ok()?;
         let note = match freshly_loaded.as_mut() {
-            Some(loaded) => loaded.scope(fragment, constraints, glyph_shaper),
-            None => self.page.session.scope(fragment, constraints, glyph_shaper),
+            Some(loaded) => loaded.scope(fragment, width, glyph_shaper),
+            None => self.page.session.scope(fragment, width, glyph_shaper),
+        };
+        // A preview is optional: a failed scoped layout follows the ordinary
+        // link path, reusing the loaded document just as a missing note does.
+        let note = match note {
+            Ok(note) => note,
+            Err(error) => {
+                self.emit_operation_failed(crate::RendererOperation::PreviewNote, error.to_string());
+                None
+            }
         };
         let Some(note) = note else {
             if let Some(loaded) = freshly_loaded {

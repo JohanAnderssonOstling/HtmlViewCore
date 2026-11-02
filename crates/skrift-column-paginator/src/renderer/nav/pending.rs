@@ -1,6 +1,7 @@
-//! Background file access for navigation. The active page and history remain
+//! Background file access for navigation. The active page remains
 //! intact until preparation succeeds; a later navigation replaces pending work.
 use super::*;
+use html::engine::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -17,7 +18,6 @@ pub(crate) enum NavigationRequest {
     Document(usize, DocAnchor),
     DocumentJump(i8),
     Href(String),
-    History(isize),
     Click(crate::DocumentGlyph, Option<kurbo::Point>),
     Preview(String),
     Search(String),
@@ -26,7 +26,7 @@ pub(crate) struct PendingNavigation {
     doc: usize,
     action: NavigationRequest,
     settings: load::DocumentLoadSettings,
-    receive: Receiver<Result<load::PreparedRenderDocument, String>>,
+    receive: Receiver<Result<Engine, String>>,
     _cancellation: PreparationCancellation,
 }
 
@@ -48,10 +48,10 @@ impl RendererCore {
     pub(super) fn document_settings(&self) -> load::DocumentLoadSettings {
         load::DocumentLoadSettings {
             root_font_size: self.root_font_size,
-            column_width: self.page.inputs().layout.viewport_width,
-            reader_overrides: self.page.inputs().reader_overrides.clone(),
-            image_sizing_policy: self.page.inputs().layout.image_sizing_policy,
-            text_composition_policy: self.page.inputs().layout.text_composition_policy,
+            column_width: self.page.configuration().width(),
+            reader_overrides: self.page.configuration().reader_overrides().clone(),
+            image_sizing_policy: self.page.configuration().image_sizing_policy(),
+            text_composition_policy: self.page.configuration().text_composition_policy(),
             note_display: self.note_display,
         }
     }
@@ -124,13 +124,13 @@ impl RendererCore {
         self.host.set_glyph_document(pending.doc);
         let loaded = match result.and_then(|mut prepared| {
             self.host
-                .set_font_overrides(&prepared.inputs().expect("prepared inputs").reader_overrides);
+                .set_font_overrides(prepared.configuration().reader_overrides());
             self.host
                 .prepare_font_faces(prepared.font_faces(), self.provider.clone());
             prepared
-                .rehydrate_glyphs(shaper)
+                .apply(DocumentUpdate::default(), shaper)
                 .map_err(|error| error.to_string())
-                .map(|()| prepared)
+                .map(|_| prepared)
         }) {
             Ok(loaded) => loaded,
             Err(message) => {
@@ -148,9 +148,6 @@ impl RendererCore {
             NavigationRequest::DocumentJump(step) => self.navigate_document_jump(shaper, step),
             NavigationRequest::Href(href) => {
                 self.navigate_to_href(shaper, &href);
-            }
-            NavigationRequest::History(step) => {
-                self.navigate_history_step(shaper, step);
             }
             NavigationRequest::Click(hit, point) => {
                 self.handle_document_click(shaper, hit, point);

@@ -19,9 +19,8 @@ paginator consumes document facts while retaining fitting, repetition, and book
 composition preferences. Notes use intrinsic engine geometry without constructing
 a page or a column frame.
 
-Loading helpers return `Engine` directly (`LoadedRenderDocument` and
-`PreparedRenderDocument` are compatibility aliases). Timing reports use the engine's
-measured `LoadTimings` resource/pipeline phases. Document revision invalidation is
+Loading helpers return `Engine` directly. Timing reports use the engine's
+`LoadTimings` resource/pipeline phases. Document revision invalidation is
 shared with the engine; reader display and overlay counters remain local. Each
 spine item owns its engine and page state directly. Shaping and glyph resources
 remain engine-owned; cached pages retain only placement geometry.
@@ -46,6 +45,15 @@ content and interaction overlays form two independently cached paint layers.
 The engine applies the same CSS drawing stream
 used by continuous fragments. Document geometry likewise accepts caller-placed
 lines, leaving column selection and screen-coordinate conversion in the reader.
+
+Position reporting uses one `ReadingPositionChanged` snapshot after composition
+settles. It carries a source address and reading progress; hosts derive CFI,
+table-of-contents selection and persistence from that snapshot. Deliberate jumps
+emit `NavigationJump` before their settled position. The host owns back/forward
+history and restores its saved source positions through CFI navigation. The
+renderer retains no separate anchor-based history or TOC filter. An explicit
+state snapshot replays the last settled position without calculating a position
+from pending geometry.
 
 Consumers should depend on the `skrift-column-paginator` package:
 

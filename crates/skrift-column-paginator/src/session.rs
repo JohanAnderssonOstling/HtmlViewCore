@@ -1,5 +1,5 @@
 use html::export::{ExportFormat, ExportTarget};
-use html::geometry::{LinePlacement, WordHitPolicy};
+use html::{geometry::WordHitPolicy, render::LinePlacement};
 use html::reading::Reading;
 use html::selection::{Selection, SelectionAnchor};
 use html::text::GlyphResourceGeneration;
@@ -14,8 +14,8 @@ use html_view_paginate::PaginationScratch;
 use kurbo::{Point, Rect, Size};
 
 use crate::{
-    FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, LaidOutDocument, Painter,
-    ReadingFragment, ReadingTarget, RendererCommand, RendererCore, RendererHost, RendererOperation,
+    FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, Painter, ReadingFragment,
+    ReadingTarget, RendererCommand, RendererCore, RendererHost, RendererOperation,
     RendererRevisions, ResourceProvider,
 };
 
@@ -116,7 +116,7 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// A note as a paintable scene: `paint` it through any [`Painter`], and
     /// size the surface from its `content_height`.
     ///
-    /// [`Painter`]: crate::Painter
+    /// [`Painter`]: html_render_core::Painter
     pub fn note_scene(&self) -> Option<html::render::RenderScene> {
         self.core.note_scene()
     }
@@ -157,7 +157,7 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     /// Paints the note's selection highlight. The note's own content comes
     /// from [`Self::note_scene`]; this goes over it.
-    pub fn paint_note_selection(&self, painter: &mut impl crate::Painter) {
+    pub fn paint_note_selection(&self, painter: &mut impl Painter) {
         self.core.paint_note_selection(painter);
     }
 
@@ -339,14 +339,10 @@ impl<S: GlyphShaper> RendererSession<S> {
         crate::cfi::generate_cfi_range(self.render_view(), self.reading_document()?, range.start, range.end)
     }
 
-    pub fn document(&self) -> &LaidOutDocument<'static> {
-        &self.core.page
-    }
-
     /// The reader palette for hosts adapting image paint. This is separate
     /// from text foreground overrides and never changes image resources.
-    pub fn image_theme(&self) -> Option<html::pipeline::ThemeAdaptation> {
-        self.core.page.inputs().reader_overrides.theme
+    pub fn image_theme(&self) -> Option<html::style::ThemeAdaptation> {
+        self.core.page.configuration().reader_overrides().theme
     }
 
     pub fn glyph_shaper(&self) -> &S {
@@ -354,13 +350,13 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn document_resource_generation(&self) -> GlyphResourceGeneration {
-        self.core.page.session.glyph_resources().generation()
+        self.core.page.session.glyph_resource_generation()
     }
 
     pub fn note_resource_generation(&self) -> Option<GlyphResourceGeneration> {
         self.core
             .note_parts()
-            .map(|(_, owner)| owner.glyph_resources().generation())
+            .map(|(_, owner)| owner.glyph_resource_generation())
     }
 
     pub fn revisions(&self) -> RendererRevisions {
@@ -381,7 +377,6 @@ impl<S: GlyphShaper> RendererSession<S> {
             &command,
             RendererCommand::NavigateToHref(_)
                 | RendererCommand::NavigateToCfi(_)
-                | RendererCommand::NavigateHistory(_)
                 | RendererCommand::NavigateDocument(_)
                 | RendererCommand::SetPosition { .. }
                 | RendererCommand::SetCfiPosition(_)
@@ -400,10 +395,6 @@ impl<S: GlyphShaper> RendererSession<S> {
 
     pub fn advance_reading_document(&mut self) {
         self.core.next_document(&mut self.glyph_shaper);
-    }
-
-    pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
-        self.core.set_toc_anchor_strings_by_doc(anchors_by_doc);
     }
 
     pub fn current_cfi(&self) -> Option<String> {
@@ -611,16 +602,6 @@ impl<S: GlyphShaper> RendererSession<S> {
     pub fn navigate_to_href(&mut self, href: &str) -> bool {
         self.navigation_revision = self.navigation_revision.wrapping_add(1);
         self.core.navigate_to_href(&mut self.glyph_shaper, href)
-    }
-
-    pub fn navigate_history_back(&mut self) -> bool {
-        self.navigation_revision = self.navigation_revision.wrapping_add(1);
-        self.core.navigate_history_back(&mut self.glyph_shaper)
-    }
-
-    pub fn navigate_history_forward(&mut self) -> bool {
-        self.navigation_revision = self.navigation_revision.wrapping_add(1);
-        self.core.navigate_history_forward(&mut self.glyph_shaper)
     }
 
     pub fn set_position(&mut self, document: usize, glyph: Option<u32>) {
@@ -1185,14 +1166,14 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use html::document::ImageSource;
-    use html::pipeline::{ReaderStyleOverrides, ThemeAdaptation};
+    use html::style::{ReaderStyleOverrides, ThemeAdaptation};
     use html::resources::DecodedImage;
 
     use crate::text_backend::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, ShapedLine,
-        TextShapeRequest,
+        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, ShapeError,
     };
-    use crate::{FileSystemProvider, Painter, RecordingPainter, RendererEvent};
+    use crate::{FileSystemProvider, Painter, RendererEvent};
+    use html_render_core::RecordingPainter;
     use kurbo::Rect;
     use peniko::{Color, Image};
 
@@ -1202,15 +1183,8 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(
-            HashMap<(char, u32), GlyphId>,
-            GlyphResourceGeneration,
-            HashMap<u32, usize>,
-        )>,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceGeneration)>,
         glyph_shape_calls: usize,
-        line_shape_calls: usize,
-        reject_lines: bool,
-        active_line_runs: HashMap<u32, usize>,
     }
 
     impl GlyphShaper for TestShaper {
@@ -1223,13 +1197,9 @@ mod tests {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
             assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((
-                self.glyphs.clone(),
-                self.generation.clone(),
-                self.active_line_runs.clone(),
-            ));
+            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
             Ok(())
         }
 
@@ -1238,90 +1208,27 @@ mod tests {
         }
 
         fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store, active_line_runs)) = self.append_checkpoint.take() {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
                 self.glyphs = glyphs;
                 self.generation = glyph_store;
-                self.active_line_runs = active_line_runs;
             }
         }
 
-        fn shape_glyph(
-            &mut self,
-            request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, crate::layout::ShapeError> {
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
             self.glyph_shape_calls += 1;
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
             let glyph = self.glyphs.len() as GlyphId;
             self.glyphs.insert(key, glyph);
             Ok(ShapedGlyph::from_metric(glyph, metric))
-        }
-
-        fn shape_line(
-            &mut self,
-            request: TextShapeRequest<'_>,
-        ) -> Result<Option<ShapedLine>, crate::layout::ShapeError> {
-            self.line_shape_calls += 1;
-            if self.reject_lines {
-                return Ok(None);
-            }
-            let raw_caret_stops = (0..=request.text().chars().count())
-                .map(|index| index as f32 * 8.0)
-                .collect::<Vec<_>>();
-            let caret_stops = request
-                .adjusted_caret_stops(&raw_caret_stops)
-                .expect("test placements are valid");
-            let cluster_boundaries = vec![true; caret_stops.len()].into();
-            let run = self.active_line_runs.len() as u32;
-            self.active_line_runs.insert(run, request.line_index());
-            Ok(Some(ShapedLine {
-                line_index: request.line_index(),
-                text_range: request.text_range(),
-                run,
-                ascent: 12.0,
-                caret_stops,
-                cluster_boundaries,
-            }))
-        }
-
-        fn begin_line_shaping(&mut self) {
-            self.active_line_runs.clear();
-        }
-    }
-
-    #[derive(Default)]
-    struct NativeFallbackPainter {
-        recording: RecordingPainter,
-        text_runs: usize,
-    }
-
-    impl Painter for NativeFallbackPainter {
-        fn fill_rect(&mut self, rect: Rect, color: Color) {
-            self.recording.fill_rect(rect, color);
-        }
-
-        fn draw_glyph(&mut self, glyph: GlyphId, origin: Point, color: u32) {
-            self.recording.draw_glyph(glyph, origin, color);
-        }
-
-        fn supports_text_runs(&self) -> bool {
-            true
-        }
-
-        fn draw_text_run(&mut self, _run: u32, _origin: Point, _color: Option<u32>) {
-            self.text_runs += 1;
-        }
-
-        fn draw_image(&mut self, image: &Image, hash: &[u8], rect: Rect) {
-            self.recording.draw_image(image, hash, rect);
         }
     }
 
@@ -1345,6 +1252,8 @@ mod tests {
     }
 
     impl Painter for SvgThemePainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
         fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point, _color: u32) {}
         fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {
@@ -1356,6 +1265,8 @@ mod tests {
     }
 
     impl Painter for EquationPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
         fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point, _color: u32) {}
         fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
@@ -1459,7 +1370,7 @@ mod tests {
         let old_source = renderer.core.page.render_view().images()[0].source.clone();
         let old_width = renderer.core.page.render_view().images()[0].width;
         renderer.apply(RendererCommand::SetReaderStyleOverrides(
-            html::pipeline::ReaderStyleOverrides {
+            html::style::ReaderStyleOverrides {
                 foreground: Some(0xeeeeeeff),
                 ..Default::default()
             },
@@ -1964,10 +1875,10 @@ mod tests {
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
         renderer.apply(RendererCommand::SetImageSizingPolicy(
-            html::pipeline::ImageSizingPolicy::WebCompatible,
+            html::layout::ImageSizingPolicy::WebCompatible,
         ));
         renderer.apply(RendererCommand::SetTextCompositionPolicy(
-            html::pipeline::TextCompositionPolicy::WebCompatible,
+            html::layout::TextCompositionPolicy::WebCompatible,
         ));
         let layout_revision = renderer.revisions().layout;
         renderer.prepare_frame(Size::new(800.0, 600.0));
@@ -2013,10 +1924,10 @@ mod tests {
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
         renderer.apply(RendererCommand::SetImageSizingPolicy(
-            html::pipeline::ImageSizingPolicy::WebCompatible,
+            html::layout::ImageSizingPolicy::WebCompatible,
         ));
         renderer.apply(RendererCommand::SetTextCompositionPolicy(
-            html::pipeline::TextCompositionPolicy::WebCompatible,
+            html::layout::TextCompositionPolicy::WebCompatible,
         ));
         let mut painter = RecordingPainter::default();
         renderer
@@ -2094,11 +2005,6 @@ mod tests {
             "a layout-changing resize must not invoke a second shaping owner"
         );
 
-        assert_eq!(
-            renderer.glyph_shaper().line_shape_calls,
-            0,
-            "view preparation must not introduce another shaping owner"
-        );
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
@@ -2139,11 +2045,7 @@ mod tests {
             "the fixture must span multiple pages"
         );
         let first_page_start = renderer.core.page.frame.page().start_line();
-        let active_shape_calls = renderer.glyph_shaper.line_shape_calls;
-        assert_eq!(
-            active_shape_calls, 0,
-            "visible pages consume document-authoritative shaping"
-        );
+
         let glyph_shape_calls = renderer.glyph_shaper.glyph_shape_calls;
         assert!(
             glyph_shape_calls > 0,
@@ -2174,10 +2076,7 @@ mod tests {
             renderer.core.page.frame.page().start_line(),
             first_page_start
         );
-        assert_eq!(
-            renderer.glyph_shaper.line_shape_calls, active_shape_calls,
-            "paginating the requested page must not invoke view-owned shaping"
-        );
+
         assert_eq!(
             renderer.glyph_shaper.glyph_shape_calls, glyph_shape_calls,
             "pagination must reuse the document's glyph resources"
@@ -2436,99 +2335,6 @@ mod tests {
             renderer.core.visible_text(),
             "AINNERB",
             "speakable text must merge nested atomic lines back into source reading order"
-        );
-
-        std::fs::remove_dir_all(fixture).unwrap();
-    }
-
-    #[test]
-    fn native_line_rejection_uses_the_emergency_glyph_path_instead_of_hiding_text() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let fixture = std::env::temp_dir().join(format!("html-view-native-rejection-{nonce}"));
-        std::fs::create_dir_all(&fixture).unwrap();
-        let document = fixture.join("document.html");
-        std::fs::write(&document, "<html><body><p>Still visible</p></body></html>").unwrap();
-
-        let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-        let host = Rc::new(TestHost::default());
-        let shaper = TestShaper {
-            reject_lines: true,
-            ..TestShaper::default()
-        };
-        let mut renderer = RendererSession::from_provider_with_nav(
-            host,
-            shaper,
-            provider,
-            vec![document.to_string_lossy().into_owned()],
-            0,
-            Some("0:0"),
-            crate::RendererInitialConfig::default(),
-        );
-        let mut painter = NativeFallbackPainter::default();
-        renderer
-            .prepare_frame(Size::new(600.0, 800.0))
-            .paint(&mut painter);
-
-        assert_eq!(painter.text_runs, 0);
-        assert!(
-            !painter.recording.glyphs.is_empty(),
-            "a rejected native line must retain visible emergency glyph output"
-        );
-        std::fs::remove_dir_all(fixture).unwrap();
-    }
-
-    #[test]
-    fn view_does_not_reissue_document_shaping_requests() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let fixture = std::env::temp_dir().join(format!("html-view-native-line-features-{nonce}"));
-        std::fs::create_dir_all(&fixture).unwrap();
-        let document = fixture.join("document.html");
-        std::fs::write(
-            &document,
-            r#"<html><head><style>
-                body { margin: 0; }
-                .justified { width: 150px; text-align: justify; }
-                .tracked { letter-spacing: 3px; }
-                .large { font-size: 30px; }
-                .tabs { white-space: pre; }
-                .raised { vertical-align: super; }
-                .ellipsis { width: 55px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-            </style></head><body>
-                <p class="justified">JUSTIFY alpha beta gamma delta epsilon zeta eta theta.</p>
-                <p class="tracked">TRACKED</p>
-                <p>MIXED <span class="large">LARGE</span> SMALL</p>
-                <p>OFFSET <span class="raised">UP</span></p>
-                <p class="tabs">TAB	STOP</p>
-                <p class="ellipsis">ELLIPSIS OVERFLOW</p>
-                <p>BEFORE<img src="missing.png" width="20" height="10">AFTER</p>
-            </body></html>"#,
-        )
-        .unwrap();
-
-        let provider: Arc<dyn ResourceProvider> = Arc::new(FileSystemProvider::new());
-        let host = Rc::new(TestHost::default());
-        let mut renderer = RendererSession::from_provider_with_nav(
-            host,
-            TestShaper::default(),
-            provider,
-            vec![document.to_string_lossy().into_owned()],
-            0,
-            Some("0:0"),
-            crate::RendererInitialConfig::default(),
-        );
-        renderer
-            .prepare_frame(Size::new(600.0, 1000.0))
-            .paint(&mut RecordingPainter::default());
-        assert_eq!(
-            renderer.glyph_shaper().line_shape_calls,
-            0,
-            "view preparation must not create a second document-shaping pipeline"
         );
 
         std::fs::remove_dir_all(fixture).unwrap();

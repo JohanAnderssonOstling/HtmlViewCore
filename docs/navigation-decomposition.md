@@ -1,5 +1,16 @@
 # Navigation decomposition
 
+## Current contract
+
+The renderer publishes one settled `ReadingPositionChanged` source/progress
+snapshot and a `NavigationJump` origin for deliberate jumps. Hosts own history
+and TOC selection. The separate position events, renderer history, and TOC
+filter described in the historical notes below have been removed, together
+with their forwarding APIs and tests. Loader results use `Engine` and
+`LoadTimings` directly.
+
+## Historical decomposition notes
+
 Follow-on to the `RendererCore` decomposition (commits `45f970b`..`4011bc1`),
 which took the struct from 30 fields to 24 by extracting `DocQuery`,
 `DocumentCache`, `PreparedPageCache`, and by moving behavior onto

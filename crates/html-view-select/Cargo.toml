@@ -7,8 +7,12 @@ publish = false
 repository.workspace = true
 
 [dependencies]
+html-render-core = { package = "skrift-render-core", path = "../../../HtmlEngine/crates/05-html-render-core" }
 html.workspace = true
 html-view-doc.workspace = true
 html-view-types.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
+
+[dev-dependencies]
+html-pipeline = { package = "skrift-pipeline", path = "../../../HtmlEngine/crates/html-pipeline" }

@@ -9,11 +9,11 @@
 //! for a target, then performs the swap.
 
 use crate::NavigationState;
-use crate::{Location, NavContext, NavView, SpineAnchor};
+use crate::{NavContext, NavView, SpineAnchor};
 use html::layout::SourceLocation;
 use html::targets::Targets;
 use html_view_cfi::parse_cfi;
-use html_view_types::{DocAnchor, ReadingPosition, RendererEvent, SourcePosition};
+use html_view_types::{DocAnchor, ReadingPosition, RendererEvent, RendererHost, SourcePosition};
 
 /// Characters per reported reading location. Fixed-size spans keep location
 /// numbers stable as font size and column width change.
@@ -46,37 +46,11 @@ impl NavigationState {
             .page()
             .start_line()
             .unwrap_or_else(|| self.find_start_line(cx));
-        cx.doc.view().pagination_lines().source_line(line_idx).map(|line| line.start())
-    }
-
-    /// The nearest preceding anchor id, restricted to table-of-contents anchors
-    /// when a filter is active. With a filter, no match means no anchor rather
-    /// than falling back to an arbitrary id in the markup.
-    pub fn current_anchor_id(&self, cx: NavView<'_>) -> Option<String> {
-        let current_y = cx.viewport.composition().start_offset_y();
-        let filter = self.toc_anchors.filter();
-
-        let view = cx.doc.view();
-        let targets = Targets::new(view);
-        let allowed = |id: &str| {
-            filter.is_none_or(|ids| view.lookup_string(id).is_some_and(|key| ids.contains(&key)))
-        };
-        if let Some(id) = self
-            .current_glyph_position(cx)
-            .and_then(|glyph| targets.preceding_anchor_where(glyph, allowed))
-        {
-            return Some(id.to_owned());
-        }
-        if let Some(id) = targets.anchor_at_or_before_y_where(current_y + 0.1, allowed) {
-            return Some(id.to_owned());
-        }
-        if filter.is_some() {
-            return None;
-        }
-        let glyph = self
-            .anchor_glyph_here()
-            .or_else(|| self.current_glyph_position(cx))?;
-        targets.preceding_anchor(glyph).map(str::to_owned)
+        cx.doc
+            .view()
+            .pagination_lines()
+            .source_line(line_idx)
+            .map(|line| line.start())
     }
 
     pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
@@ -114,6 +88,14 @@ impl NavigationState {
         })
     }
 
+    /// Replay the last settled position to a newly attached host. Pending
+    /// layout changes are published only after composition settles again.
+    pub fn emit_reading_position_snapshot(&self, host: &dyn RendererHost) {
+        if let Some(position) = &self.reading_position.last {
+            host.emit(RendererEvent::ReadingPositionChanged(position.clone()));
+        }
+    }
+
     /// Preserve the displayed origin until the requested jump has paginated.
     pub fn begin_jump(&mut self, from: String) {
         self.pending_jump_origin.get_or_insert(from);
@@ -124,7 +106,7 @@ impl NavigationState {
     }
 
     /// Publish only after the viewport's page has settled. All host projections
-    /// consume this value together, independently of legacy navigation signals.
+    /// consume this value together.
     pub fn emit_reading_position(&mut self, cx: &mut NavContext<'_>) {
         let view = cx.view();
         let Some(source) = self.current_source_position(view) else {
@@ -161,17 +143,13 @@ impl NavigationState {
             && Some(&from) != self.cfi.source_position_cfi(&position.source).as_ref()
         {
             cx.host.emit(RendererEvent::NavigationJump { from });
-            self.signals.reading_position.invalidate();
+            self.reading_position.invalidate();
         }
-        self.signals.reading_position.emit_if_changed(
+        self.reading_position.emit_if_changed(
             position,
             cx.host,
             RendererEvent::ReadingPositionChanged,
         );
-    }
-
-    pub fn current_location(&self, cx: NavView<'_>) -> Location {
-        Location::new(self.current_doc_index, self.current_anchor_id(cx))
     }
 
     // -- moving within the document -----------------------------------------
@@ -356,9 +334,7 @@ impl NavigationState {
         }
 
         cx.host.request_repaint();
-        if matches!(anchor, DocAnchor::Glyph(_)) {
-            self.update_nav_signal(cx);
-        } else {
+        if !matches!(anchor, DocAnchor::Glyph(_)) {
             // The anchor is only knowable once the page has been laid out.
             self.pending_nav_anchor_update = true;
         }
@@ -387,69 +363,8 @@ impl NavigationState {
         });
     }
 
-    pub fn update_toc_anchor_filter(&mut self, cx: NavView<'_>) {
-        let current_doc = self.current_doc_index;
-        self.toc_anchors.rebuild(cx.doc, current_doc);
-    }
-
-    /// Emits every signal derived from the reading position. Each is
-    /// deduplicated independently, so an unchanged one stays silent.
-    pub fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
-        let host = cx.host;
-        let view = cx.view();
-        let glyph = self
-            .anchor_glyph_here()
-            .or_else(|| self.current_glyph_position(view));
-        let current_doc = self.current_doc_index;
-
-        self.signals
-            .position
-            .emit_if_changed((current_doc, glyph), host, |(doc, glyph)| {
-                RendererEvent::PositionChanged { doc, glyph }
-            });
-
-        let cfi_string = glyph
-            .and_then(|glyph_idx| {
-                html_view_cfi::generate_cfi(view.doc.view(), current_doc, glyph_idx)
-            })
-            .and_then(|cfi| self.cfi.to_publication(&cfi));
-        self.signals
-            .cfi
-            .emit_if_changed(cfi_string, host, RendererEvent::CfiChanged);
-
-        let (fraction, location, total_locations) = self.reading_progress(view, glyph);
-        let doc_count = self.document_uris.len();
-        self.signals.progress.emit_if_changed(
-            (fraction, location, total_locations, current_doc),
-            host,
-            |(fraction, location, total_locations, doc)| RendererEvent::ReadingProgress {
-                fraction,
-                location,
-                total_locations,
-                doc,
-                doc_count,
-            },
-        );
-
-        let anchor = self.current_anchor_id(view);
-        self.signals
-            .anchor
-            .emit_if_changed((current_doc, anchor), host, |(doc, anchor)| {
-                RendererEvent::NavAnchorChanged { doc, anchor }
-            });
-    }
-
-    /// Maps the reading position to a publication-wide fraction and location
-    /// number. Locations are fixed-size character spans, so they stay stable as
-    /// font size and column width change.
-    fn reading_progress(&self, cx: NavView<'_>, glyph: Option<u32>) -> (f32, u64, u64) {
-        let glyph_count = cx.doc.text().glyph_count().max(1) as f64;
-        self.progress_at(glyph.unwrap_or(0) as f64 / glyph_count)
-    }
-
     /// The publication-wide position of `in_document_fraction` through the
-    /// current document. Split from [`Self::reading_progress`] so the mapping
-    /// can be exercised without a laid-out document.
+    /// current document, using the publication's retained text lengths.
     pub fn progress_at(&self, in_document_fraction: f64) -> (f32, u64, u64) {
         let current_doc = self.current_doc_index;
         let total_chars = self.document_text_lengths.iter().sum::<u64>().max(1);
@@ -521,10 +436,8 @@ mod tests {
             current_doc_index: current_doc,
             nav_anchor: None,
             pending_nav_anchor_update: false,
-            signals: Default::default(),
-            history: Default::default(),
+            reading_position: Default::default(),
             pending_jump_origin: None,
-            toc_anchors: Default::default(),
         }
     }
 

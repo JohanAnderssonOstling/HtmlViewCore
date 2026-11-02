@@ -1,15 +1,14 @@
 //! A loaded spine document and the reader state for displaying it.
 
-use crate::{ColumnLayout, LaidOutDocument, VisibleFrame};
+use crate::{ColumnLayout, VisibleFrame};
 use html::engine::Engine;
 use html::geometry::WordHitPolicy;
 use html::layout::RenderView;
-use html::pipeline::PipelineInputs;
+use html::configuration::DocumentConfiguration;
 use html::resources::ImageService;
 use html_view_doc::{DocQuery, TextGeometry};
 use html_view_select::{SelectionMode, SelectionState, SelectionView, TableSelectionState};
 use kurbo::Point;
-use std::ops::Deref;
 
 pub(crate) struct SpineItem {
     pub(crate) session: Engine,
@@ -86,24 +85,14 @@ impl SpineItem {
             .expect("spine session owns matching glyph resources")
     }
 
-    pub(crate) fn inputs(&self) -> &PipelineInputs {
-        self.session
-            .inputs()
-            .expect("spine session owns its inputs")
+    pub(crate) fn configuration(&self) -> DocumentConfiguration<'_> {
+        self.session.configuration()
     }
 
     pub(crate) fn root_font_size(&self) -> f32 {
-        self.inputs().style_environment.root_font_size as f32
+        self.configuration().font_size().get()
     }
-}
 
-impl Deref for SpineItem {
-    type Target = LaidOutDocument<'static>;
-    fn deref(&self) -> &Self::Target {
-        self.session
-            .document()
-            .expect("spine session owns a document")
-    }
 }
 
 impl<'a> From<&'a SpineItem> for RenderView<'a> {

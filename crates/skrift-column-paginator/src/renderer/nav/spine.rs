@@ -1,9 +1,10 @@
 //! Spine-document acquisition and activation.
 
 use super::*;
+use html::engine::Engine;
 
 impl RendererCore {
-    pub(super) fn spine_item(&self, loaded: load::LoadedRenderDocument) -> SpineItem {
+    pub(super) fn spine_item(&self, loaded: Engine) -> SpineItem {
         SpineItem::new(loaded, self.page.layout.clone(), self.image_service.clone())
     }
 
@@ -17,19 +18,12 @@ impl RendererCore {
         self.page = item;
         self.nav.activate_document(doc_index);
         self.root_font_size = self.page.root_font_size();
-        self.revisions
-            .invalidate_pipeline_from(html::pipeline::EarliestStage::Parse);
+        self.revisions.replace_document();
         self.revisions.invalidate_resources();
         self.reset_view_state();
         self.host.emit(RendererEvent::TitleChanged(
             self.page.render_view().title().map(str::to_owned),
         ));
-        let view = NavView {
-            doc: DocQuery::from_view(self.page.render_view()),
-            viewport: &self.viewport,
-            frame: &self.page.frame,
-        };
-        self.nav.update_toc_anchor_filter(view);
         self.resolve_visible_annotations();
         self.resolve_media_overlay_highlight();
     }
@@ -38,7 +32,7 @@ impl RendererCore {
         &mut self,
         glyph_shaper: &mut impl GlyphShaper,
         doc_index: usize,
-    ) -> load::LoadedRenderDocument {
+    ) -> Engine {
         if self
             .prepared_navigation
             .as_ref()
@@ -57,11 +51,11 @@ impl RendererCore {
         )
         .expect("document preparation should succeed");
         self.host
-            .set_font_overrides(&prepared.inputs().expect("prepared inputs").reader_overrides);
+            .set_font_overrides(prepared.configuration().reader_overrides());
         self.host
             .prepare_font_faces(prepared.font_faces(), self.provider.clone());
         prepared
-            .rehydrate_glyphs(glyph_shaper)
+            .apply(DocumentUpdate::default(), glyph_shaper)
             .expect("document shaping should succeed");
         prepared
     }

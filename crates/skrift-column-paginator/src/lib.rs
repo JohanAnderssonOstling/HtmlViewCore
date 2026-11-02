@@ -1,6 +1,6 @@
 #[cfg(test)]
 use html::layout::LineId;
-use html::configuration::DocumentUpdate;
+use html::configuration::{DocumentUpdate, Update};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,11 +12,14 @@ pub use html_view_types::*;
 use kurbo::Point;
 
 use crate::spine_item::SpineItem;
-use html::layout::GlyphShaper;
-pub use html::layout::{TextDecorationLines, UsedBorderRadii};
-use html::pipeline::{EarliestStage, PipelineChanges};
-pub use html::pipeline::{
-    ImageSizingPolicy, ReaderStyleOverrides, RootFontSize, TextCompositionPolicy,
+use html::engine::Engine;
+use html::text::GlyphShaper;
+pub use html::render::TextDecorationLines;
+use html::engine::Error;
+pub use html::{
+    document::RootFontSize,
+    layout::{ImageSizingPolicy, TextCompositionPolicy},
+    style::ReaderStyleOverrides,
 };
 pub use html::resources::{
     BlockingJob, BlockingJobSpawner, FileSystemProvider, InlineJobSpawner, ResourceMetadata,
@@ -24,45 +27,30 @@ pub use html::resources::{
 };
 use html::resources::{ImageLoader, ImageService};
 use html::search::SearchIndex;
-pub use html::style::FontFace;
+pub use html::text::FontFace;
 
 pub use html_view_cfi as cfi;
 
 mod document_view;
 mod spine_item;
 
-pub mod layout {
-    pub use html::layout::{
-        LaidOutDocument, LayoutConstraintError, LayoutConstraints, LayoutTimings, PreparedDocument,
-        ShapeError, ShapedDocument,
-    };
-}
-
-pub mod parser {
-    pub use html::pipeline::{DocumentFactory, ParsedHtml, parse_html_document};
-}
-
-pub mod resources {
-    pub use html::resources::{
-        FileSystemProvider, ImagePipelinePoll, ResourceMetadata, ResourceProvider,
-    };
-}
-
 /// Renderer-neutral text backend contract. UI adapters should use this module
 /// rather than importing layout or CSS model types.
 pub mod text_backend {
-    pub use html::layout::{
-        CharacterPlacement, FontMetrics, FontMetricsRequest, FontRelativeMetrics, FontSlant,
-        GlyphHandle, GlyphId, GlyphMetric, GlyphRequest, GlyphResourceGeneration,
-        GlyphResourceStore, GlyphResources, GlyphShaper, OpenTypeFeature, ResourceShaper,
-        ShapeError, ShapedGlyph, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest,
-        TextShapeRequest, TextStyleSpan,
+    pub use html::{
+        text::{OpenTypeFeature, OpenTypeFeatureKind},
+        text::{
+            FontFeatures, FontMetrics, FontRelativeMetrics, FontSlant, ObliqueAngle, GlyphHandle,
+            GlyphId, GlyphMetric, GlyphRequest, GlyphResourceGeneration, GlyphResourceStore,
+            GlyphResources, GlyphShaper, ResourceShaper, RunFontMetrics, ShapeError, ShapedGlyph,
+            ShapedLine, ShapedRun, ShapedTextRun, ShapingStyle, TextRunId, TextRunShapeRequest,
+            TextStyleSpan,
+        },
     };
 }
 
-pub use html::layout::LaidOutDocument;
-pub use html::layout::{ReadingFragment, ReadingTarget};
-pub use html::render::{Painter, RecordingPainter, TextRunFragment};
+pub use html::reading::{ReadingFragment, ReadingTarget};
+use html_render_core::Painter;
 
 mod session;
 pub use session::{
@@ -236,7 +224,7 @@ mod frame_cache_tests {
 /// It contains no UI framework objects or platform text-system handles and can
 /// therefore be built on a host worker before a renderer entity is installed.
 pub struct RendererPreparation {
-    loaded: load::PreparedRenderDocument,
+    loaded: Engine,
     provider: Arc<dyn ResourceProvider>,
     image_loader: Option<Arc<dyn ImageLoader>>,
     document_uris: Vec<String>,
@@ -264,7 +252,7 @@ pub(crate) struct RendererCore {
     pending_navigation: Option<nav::PendingNavigation>,
     pending_file_events:
         std::cell::RefCell<Vec<std::sync::mpsc::Receiver<Result<RendererEvent, String>>>>,
-    prepared_navigation: Option<(usize, load::LoadedRenderDocument)>,
+    prepared_navigation: Option<(usize, Engine)>,
     frame_scratch: FrameScratch,
     revisions: RendererRevisions,
     highlight: HighlightState,
@@ -379,7 +367,7 @@ impl RendererCore {
     #[cfg(test)]
     pub fn new(
         host: Rc<dyn RendererHost>,
-        loaded: load::LoadedRenderDocument,
+        loaded: Engine,
         provider: Arc<dyn ResourceProvider>,
         document_uris: Vec<String>,
         current_doc_index: usize,
@@ -398,18 +386,15 @@ impl RendererCore {
 
     fn new_with_image_loader(
         host: Rc<dyn RendererHost>,
-        loaded: load::LoadedRenderDocument,
+        loaded: Engine,
         provider: Arc<dyn ResourceProvider>,
         document_uris: Vec<String>,
         current_doc_index: usize,
         config: RendererInitialConfig,
         image_loader: Option<Arc<dyn ImageLoader>>,
     ) -> Self {
-        let root_font_size = loaded
-            .inputs()
-            .expect("loaded document has pipeline inputs")
-            .style_environment
-            .root_font_size as f32;
+        let root_font_size = loaded.configuration().font_size()
+            .get();
         let jobs = host.blocking_job_spawner();
         let image_service = match image_loader {
             Some(loader) => {
@@ -465,47 +450,39 @@ impl RendererCore {
         }
     }
 
-    fn pipeline_changes_for_layout(&self, viewport_width: f64) -> PipelineChanges {
+    fn document_update_for_layout(&self, viewport_width: f64) -> DocumentUpdate {
         let height = self.page.layout.size.height;
-        self.page
-            .session
-            .configuration_changes(
-                DocumentUpdate::default()
-                    .width(viewport_width)
-                    .height((height.is_finite() && height >= 0.0).then_some(height)),
-            )
-            .expect("effective column dimensions must be finite and positive")
+        DocumentUpdate::default()
+            .width(viewport_width)
+            .height((height.is_finite() && height >= 0.0).then_some(height))
     }
 
-    fn pipeline_changes_for_style(&self, root_font_size: f32) -> PipelineChanges {
-        self.page
-            .session
-            .configuration_changes(DocumentUpdate::default().font_size(root_font_size.max(1.0)))
-            .expect("reader font size must be finite and positive")
+    fn document_update_for_typography(&self, root_font_size: f32) -> DocumentUpdate {
+        DocumentUpdate::default().font_size(root_font_size.max(1.0))
     }
 
-    fn apply_pipeline_changes(
+    fn apply_document_update(
         &mut self,
-        requested_inputs: PipelineChanges,
+        requested_inputs: DocumentUpdate,
         glyph_shaper: &mut impl GlyphShaper,
-    ) -> Result<(), html::pipeline::PipelineError> {
-        self.apply_pipeline_changes_impl(requested_inputs, glyph_shaper, true)
+    ) -> Result<(), Error> {
+        self.apply_document_update_impl(requested_inputs, glyph_shaper, true)
     }
 
-    fn apply_pipeline_changes_without_repaint(
+    fn apply_document_update_without_repaint(
         &mut self,
-        requested_inputs: PipelineChanges,
+        requested_inputs: DocumentUpdate,
         glyph_shaper: &mut impl GlyphShaper,
-    ) -> Result<(), html::pipeline::PipelineError> {
-        self.apply_pipeline_changes_impl(requested_inputs, glyph_shaper, false)
+    ) -> Result<(), Error> {
+        self.apply_document_update_impl(requested_inputs, glyph_shaper, false)
     }
 
-    fn apply_pipeline_changes_impl(
+    fn apply_document_update_impl(
         &mut self,
-        requested_inputs: PipelineChanges,
+        requested_inputs: DocumentUpdate,
         glyph_shaper: &mut impl GlyphShaper,
         request_repaint: bool,
-    ) -> Result<(), html::pipeline::PipelineError> {
+    ) -> Result<(), Error> {
         // Before the first frame, `current_glyph_position` resolves to the
         // document's first glyph even when decoration or replaced content
         // precedes it. Relayout at the true document start must preserve the
@@ -551,47 +528,44 @@ impl RendererCore {
                 .is_some_and(|source| source.utf16_offset.is_none());
 
         self.host.set_font_overrides(
-            requested_inputs
-                .reader_overrides
-                .as_ref()
-                .unwrap_or(&self.page.inputs().reader_overrides),
+            requested_inputs.overrides()
+                .unwrap_or(self.page.configuration().reader_overrides()),
         );
         self.host.set_glyph_document(self.nav.location().document());
-        let update = self
-            .page
-            .session
-            .apply_changes(requested_inputs, glyph_shaper)?;
+        let before = self.page.session.revisions();
+        let update = match self.page.session.apply(requested_inputs, glyph_shaper) {
+            Ok(update) => update,
+            Err(error) => {
+                self.host.set_font_overrides(self.page.configuration().reader_overrides());
+                return Err(error);
+            }
+        };
+        let after = self.page.session.revisions();
         self.host
             .prepare_font_faces(self.page.session.font_faces(), self.provider.clone());
 
-        self.page.session.document().ok_or_else(|| {
-            html::pipeline::PipelineError(
-                "pipeline update completed without a laid-out document".to_owned(),
-            )
+        self.page.session.render_view().ok_or_else(|| {
+            Error::message("pipeline update completed without a laid-out document")
         })?;
         self.root_font_size = self.page.root_font_size();
-        if update.stage == EarliestStage::Paint {
+        if update == Update::Paint {
             // Paint changes preserve pagination, selection and reading position.
             // Revisions invalidate the displayed colors without discarding geometry.
-            self.revisions
-                .invalidate_pipeline_from(EarliestStage::Paint);
+            self.revisions.update_document(before, after);
             if request_repaint {
                 self.host.request_repaint();
             }
             return Ok(());
         }
-        if update.stage == EarliestStage::None {
-            // reset_view_state also clears selection even when all pipeline
-            // products were reusable.
-            self.revisions.invalidate_overlay();
-        } else {
-            self.revisions.invalidate_pipeline_from(update.stage);
+        if update == Update::Unchanged {
+            return Ok(());
         }
+        self.revisions.update_document(before, after);
         self.reset_view_state();
         self.resolve_media_overlay_highlight();
         if anchor_is_element && let Some(cfi) = anchor_cfi.as_deref() {
             self.restore_position_from_cfi(cfi);
-        } else if update.anchors_preserved {
+        } else if matches!(update, Update::Layout { anchors_preserved: true }) {
             if let Some(glyph_idx) = anchor_glyph {
                 self.restore_glyph_position(glyph_idx);
             }
@@ -612,7 +586,6 @@ impl RendererCore {
         self.host.emit(RendererEvent::TitleChanged(
             self.page.render_view().title().map(str::to_owned),
         ));
-        self.nav.history.emit_availability(self.host.as_ref());
         self.host.emit(RendererEvent::SearchActiveChanged(
             self.highlight.is_active(),
         ));
@@ -624,7 +597,7 @@ impl RendererCore {
             .emit(RendererEvent::FontSizeChanged(self.root_font_size));
         self.host
             .emit(RendererEvent::ScaleChanged(self.page.layout.scale));
-        self.update_nav_signal();
+        self.nav.emit_reading_position_snapshot(self.host.as_ref());
     }
 
     pub fn apply(&mut self, glyph_shaper: &mut impl GlyphShaper, command: RendererCommand) {
@@ -633,13 +606,6 @@ impl RendererCore {
                 self.navigate_to_href(glyph_shaper, &href);
             }
             RendererCommand::NavigateToHref(_) => {}
-            RendererCommand::NavigateHistory(step) if step < 0 => {
-                self.navigate_history_back(glyph_shaper);
-            }
-            RendererCommand::NavigateHistory(step) if step > 0 => {
-                self.navigate_history_forward(glyph_shaper);
-            }
-            RendererCommand::NavigateHistory(_) => {}
             RendererCommand::NavigateDocument(step) => {
                 self.navigate_document_jump(glyph_shaper, step)
             }
@@ -661,7 +627,6 @@ impl RendererCore {
             }
             RendererCommand::SetDocumentTextLengths(lengths) => {
                 if self.nav.install_document_text_lengths(lengths) {
-                    self.update_nav_signal();
                     self.host.request_repaint();
                 }
             }
@@ -687,11 +652,8 @@ impl RendererCore {
                 }
             }
             RendererCommand::RefreshFonts => {
-                let inputs = PipelineChanges {
-                    font_environment: Some(self.page.inputs().font_environment.next()),
-                    ..Default::default()
-                };
-                if let Err(error) = self.apply_pipeline_changes(inputs, glyph_shaper) {
+                let inputs = DocumentUpdate::default().fonts_changed();
+                if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                     self.emit_operation_failed(
                         RendererOperation::UpdateDocument,
                         error.to_string(),
@@ -700,12 +662,9 @@ impl RendererCore {
             }
             RendererCommand::SetFontSize(size) => self.set_root_font_size(glyph_shaper, size),
             RendererCommand::SetReaderStyleOverrides(overrides) => {
-                if self.page.inputs().reader_overrides != overrides {
-                    let inputs = PipelineChanges {
-                        reader_overrides: Some(overrides),
-                        ..Default::default()
-                    };
-                    if let Err(error) = self.apply_pipeline_changes(inputs, glyph_shaper) {
+                if self.page.configuration().reader_overrides() != &overrides {
+                    let inputs = DocumentUpdate::default().reader_overrides(overrides);
+                    if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
                             error.to_string(),
@@ -716,15 +675,12 @@ impl RendererCore {
             RendererCommand::SetNoteDisplay(display) => {
                 if self.note_display != display {
                     self.note_display = display;
-                    let inputs = PipelineChanges {
-                        note_flow: Some(load::note_flow_for(display)),
-                        ..Default::default()
-                    };
+                    let inputs = DocumentUpdate::default().note_flow(load::note_flow_for(display));
                     // Note bodies are held back by suppressing their boxes, so
                     // a switch has to rebuild the box tree, not just repaint.
                     self.note = None;
                     self.prepared_navigation = None;
-                    if let Err(error) = self.apply_pipeline_changes(inputs, glyph_shaper) {
+                    if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
                             error.to_string(),
@@ -733,14 +689,9 @@ impl RendererCore {
                 }
             }
             RendererCommand::SetImageSizingPolicy(policy) => {
-                let mut layout = self.page.inputs().layout;
-                if layout.image_sizing_policy != policy {
-                    layout.image_sizing_policy = policy;
-                    let inputs = PipelineChanges {
-                        layout: Some(layout),
-                        ..Default::default()
-                    };
-                    if let Err(error) = self.apply_pipeline_changes(inputs, glyph_shaper) {
+                if self.page.configuration().image_sizing_policy() != policy {
+                    let inputs = DocumentUpdate::default().image_sizing_policy(policy);
+                    if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
                             error.to_string(),
@@ -749,14 +700,9 @@ impl RendererCore {
                 }
             }
             RendererCommand::SetTextCompositionPolicy(policy) => {
-                let mut layout = self.page.inputs().layout;
-                if layout.text_composition_policy != policy {
-                    layout.text_composition_policy = policy;
-                    let inputs = PipelineChanges {
-                        layout: Some(layout),
-                        ..Default::default()
-                    };
-                    if let Err(error) = self.apply_pipeline_changes(inputs, glyph_shaper) {
+                if self.page.configuration().text_composition_policy() != policy {
+                    let inputs = DocumentUpdate::default().text_composition_policy(policy);
+                    if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
                             error.to_string(),
@@ -875,19 +821,6 @@ impl RendererCore {
         }
         self.host.emit(RendererEvent::SearchActiveChanged(false));
         self.set_search_query("");
-    }
-
-    pub fn set_toc_anchor_strings_by_doc(&mut self, anchors_by_doc: Vec<Vec<String>>) {
-        let document_count = self.nav.documents().uris().len();
-        self.nav
-            .toc_anchors
-            .set_strings_by_doc(anchors_by_doc, document_count);
-        let view = html_view_navigate::NavView {
-            doc: DocQuery::from_view(self.page.render_view()),
-            viewport: &self.viewport,
-            frame: &self.page.frame,
-        };
-        self.nav.update_toc_anchor_filter(view);
     }
 
     pub fn set_search_query(&mut self, query: &str) {

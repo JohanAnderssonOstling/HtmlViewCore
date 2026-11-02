@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use skrift_column_paginator::{
     FileSystemProvider, FootnotePopupAnchor, NoteDisplay, PointerDownOptions, RendererEvent,
-    RendererHost, RendererInitialConfig, RendererSession, ResourceProvider, SelectionMode,
+    ReadingPosition, RendererHost, RendererInitialConfig, RendererSession, ResourceProvider,
+    SelectionMode,
 };
 use kurbo::{Point, Size};
 use peniko::Color;
@@ -60,7 +61,7 @@ impl PopupGeometry {
 #[derive(Default)]
 struct HostState {
     repaint: bool,
-    position: Option<(usize, Option<u32>)>,
+    position: Option<ReadingPosition>,
     footnote_anchor: Option<FootnotePopupAnchor>,
 }
 
@@ -120,8 +121,8 @@ impl RendererHost for HarnessHost {
 
     fn emit(&self, event: RendererEvent) {
         match event {
-            RendererEvent::PositionChanged { doc, glyph } => {
-                self.state.borrow_mut().position = Some((doc, glyph));
+            RendererEvent::ReadingPositionChanged(position) => {
+                self.state.borrow_mut().position = Some(position);
             }
             RendererEvent::FootnoteOpened(preview) => {
                 let mut state = self.state.borrow_mut();
@@ -193,9 +194,21 @@ struct Harness {
 
 impl Harness {
     fn status(&self) -> String {
-        let (doc, glyph) = self.reader.host.state.borrow().position.unwrap_or((0, None));
+        let state = self.reader.host.state.borrow();
+        let doc = state
+            .position
+            .as_ref()
+            .map_or(0, |position| position.source.document);
         let uri = self.reader.uris.get(doc).map(String::as_str).unwrap_or("?");
-        format!("{} of {}   {uri}   glyph {}", doc + 1, self.reader.uris.len(), glyph.map_or_else(|| "-".to_owned(), |glyph| glyph.to_string()))
+        let location = state
+            .position
+            .as_ref()
+            .map_or(1, |position| position.location);
+        format!(
+            "{} of {}   {uri}   location {location}",
+            doc + 1,
+            self.reader.uris.len()
+        )
     }
 
     fn draw(&mut self) {

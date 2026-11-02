@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::spine_item::SpineItem;
 use crate::{
-    DocAnchor, GlyphShaper, NavigationState, RendererCore, RendererEvent, RendererHost,
+    DocAnchor, DocumentUpdate, GlyphShaper, NavigationState, RendererCore, RendererEvent, RendererHost,
     RendererInitialConfig, RendererPreparation, ResourceProvider, ViewportState, load,
 };
 use html::resources::ImageLoader;
@@ -226,11 +226,6 @@ impl RendererCore {
         }
     }
 
-    pub(crate) fn update_nav_signal(&mut self) {
-        let (nav, mut cx) = self.nav_cx();
-        nav.update_nav_signal(&mut cx);
-    }
-
     pub(crate) fn set_progress_fraction(
         &mut self,
         glyph_shaper: &mut impl GlyphShaper,
@@ -241,7 +236,6 @@ impl RendererCore {
         let glyph_count = self.page.render_view().text().glyph_count();
         let glyph = (in_doc_fraction * glyph_count as f64) as u32;
         self.restore_glyph_position(glyph.min(glyph_count.saturating_sub(1) as u32));
-        self.update_nav_signal();
         self.host.request_repaint();
     }
 
@@ -283,12 +277,12 @@ impl RendererCore {
             config,
         } = prepared;
         let restoring_position = nav_state.is_some();
-        host.set_font_overrides(&loaded.inputs().expect("prepared inputs").reader_overrides);
+        host.set_font_overrides(loaded.configuration().reader_overrides());
         host.set_glyph_document(doc_index);
         host.prepare_font_faces(loaded.font_faces(), provider.clone());
         let mut loaded = loaded;
         loaded
-            .rehydrate_glyphs(glyph_shaper)
+            .apply(DocumentUpdate::default(), glyph_shaper)
             .map_err(|error| error.to_string())?;
         let mut renderer = Self::new_with_image_loader(
             host,
@@ -302,14 +296,12 @@ impl RendererCore {
 
         if let Some(anchor) = initial_anchor {
             renderer.navigate_to_href(glyph_shaper, &format!("#{anchor}"));
-            renderer.update_nav_signal();
             return Ok(renderer);
         }
 
         if nav_state.as_deref().is_some_and(|state| {
             state.trim().starts_with("epubcfi(") && renderer.restore_position_from_cfi(state.trim())
         }) {
-            renderer.update_nav_signal();
             return Ok(renderer);
         }
         if glyph_index > 0 {
@@ -319,7 +311,6 @@ impl RendererCore {
             let glyph = renderer.nav.current_glyph_position(renderer.nav_view());
             renderer.nav.anchor_at(glyph);
         }
-        renderer.update_nav_signal();
         Ok(renderer)
     }
 
@@ -455,9 +446,9 @@ impl RendererCore {
         &mut self,
         glyph_shaper: &mut impl GlyphShaper,
         column_width: f64,
-    ) -> Result<(), html::pipeline::PipelineError> {
-        let next = self.pipeline_changes_for_layout(column_width);
-        self.apply_pipeline_changes(next, glyph_shaper)
+    ) -> Result<(), html::engine::Error> {
+        let next = self.document_update_for_layout(column_width);
+        self.apply_document_update(next, glyph_shaper)
     }
 
     pub fn set_root_font_size(&mut self, glyph_shaper: &mut impl GlyphShaper, new_size: f32) {
@@ -466,8 +457,8 @@ impl RendererCore {
         if (rounded - self.root_font_size).abs() < f32::EPSILON {
             return;
         }
-        let next = self.pipeline_changes_for_style(rounded);
-        match self.apply_pipeline_changes(next, glyph_shaper) {
+        let next = self.document_update_for_typography(rounded);
+        match self.apply_document_update(next, glyph_shaper) {
             Ok(()) => self
                 .host
                 .emit(RendererEvent::FontSizeChanged(self.root_font_size)),
