@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use html_view_core::{
+use skrift_column_paginator::{
     FileSystemProvider, FootnotePopupAnchor, NoteDisplay, PointerDownOptions, RendererEvent,
     RendererHost, RendererInitialConfig, RendererSession, ResourceProvider, SelectionMode,
 };
@@ -361,10 +361,12 @@ impl ApplicationHandler for Harness {
                     ElementState::Released => {
                         if self.selecting_note {
                             self.selecting_note = false;
-                            self.reader.session.note_pointer_up();
+                            if let Some(geometry) = self.popup_geometry {
+                                self.reader.session.note_pointer_up(geometry.local_point(self.pointer), SelectionMode::Plain);
+                            }
                         } else {
                             self.selecting = false;
-                            self.reader.session.pointer_up();
+                            self.reader.session.pointer_up(self.pointer, SelectionMode::Plain);
                         }
                     }
                 }

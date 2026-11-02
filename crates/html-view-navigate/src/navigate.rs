@@ -8,9 +8,11 @@
 //! Crossing a document boundary stays on `RendererCore`: it asks these methods
 //! for a target, then performs the swap.
 
-use crate::{SpineAnchor, Location, NavContext, NavView};
 use crate::NavigationState;
-use html_view_cfi::{parse_cfi, parse_source_position, source_position_cfi};
+use crate::{Location, NavContext, NavView, SpineAnchor};
+use html::layout::SourceLocation;
+use html::targets::Targets;
+use html_view_cfi::parse_cfi;
 use html_view_types::{DocAnchor, ReadingPosition, RendererEvent, SourcePosition};
 
 /// Characters per reported reading location. Fixed-size spans keep location
@@ -25,7 +27,12 @@ impl NavigationState {
     // -- position queries ---------------------------------------------------
 
     pub fn find_start_line(&self, cx: NavView<'_>) -> usize {
-        cx.doc.start_line_at(cx.viewport.composition().start_offset_y(), 0.1)
+        cx.viewport.composition().start_line().unwrap_or_else(|| {
+            cx.doc
+                .view()
+                .pagination_lines()
+                .start_at(cx.viewport.composition().start_offset_y(), 0.1)
+        })
     }
 
     /// The glyph at the top of the page on screen, or at the scroll offset when
@@ -34,8 +41,12 @@ impl NavigationState {
         if cx.doc.text().lines().is_empty() {
             return None;
         }
-        let line_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx));
-        cx.doc.text().line(line_idx).map(|line| line.start())
+        let line_idx = cx
+            .frame
+            .page()
+            .start_line()
+            .unwrap_or_else(|| self.find_start_line(cx));
+        cx.doc.view().pagination_lines().source_line(line_idx).map(|line| line.start())
     }
 
     /// The nearest preceding anchor id, restricted to table-of-contents anchors
@@ -45,52 +56,118 @@ impl NavigationState {
         let current_y = cx.viewport.composition().start_offset_y();
         let filter = self.toc_anchors.filter();
 
-        if let Some(current_glyph) = self.current_glyph_position(cx)
-            && let Some(id_idx) = cx.doc.best_anchor_from_glyphs(current_glyph, filter)
+        let view = cx.doc.view();
+        let targets = Targets::new(view);
+        let allowed = |id: &str| {
+            filter.is_none_or(|ids| view.lookup_string(id).is_some_and(|key| ids.contains(&key)))
+        };
+        if let Some(id) = self
+            .current_glyph_position(cx)
+            .and_then(|glyph| targets.preceding_anchor_where(glyph, allowed))
         {
-            return Some(cx.doc.view().string(id_idx).to_string());
+            return Some(id.to_owned());
         }
-
-        if let Some(id_idx) = cx.doc.best_anchor_from_positions(current_y, filter) {
-            return Some(cx.doc.view().string(id_idx).to_string());
+        if let Some(id) = targets.anchor_at_or_before_y_where(current_y + 0.1, allowed) {
+            return Some(id.to_owned());
         }
-
         if filter.is_some() {
             return None;
         }
-
-        let glyph_idx = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx))?;
-        cx.doc.best_anchor_from_glyphs(glyph_idx, None).map(|id_idx| cx.doc.view().string(id_idx).to_string())
+        let glyph = self
+            .anchor_glyph_here()
+            .or_else(|| self.current_glyph_position(cx))?;
+        targets.preceding_anchor(glyph).map(str::to_owned)
     }
 
     pub fn current_cfi(&self, cx: NavView<'_>) -> Option<String> {
-        Some(source_position_cfi(&self.current_source_position(cx)))
+        self.cfi
+            .source_position_cfi(&self.current_source_position(cx)?)
     }
 
-    pub fn current_source_position(&self, cx: NavView<'_>) -> SourcePosition {
-        let line = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx));
-        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(cx));
+    pub fn current_source_position(&self, cx: NavView<'_>) -> Option<SourcePosition> {
+        // A document with no layout lines still has an intentional start
+        // address. Missing addresses on actual lines remain unavailable.
+        if cx.doc.text().line_count() == 0 && cx.viewport.composition().start_offset_y() <= 0.1 {
+            return Some(SourcePosition {
+                document: self.current_doc_index,
+                path: Vec::new(),
+                utf16_offset: None,
+            });
+        }
+        let line = cx
+            .frame
+            .page()
+            .start_line()
+            .unwrap_or_else(|| self.find_start_line(cx));
+        let line = cx.doc.view().pagination_lines().source_line(line)?;
+        let glyph = self
+            .anchor_glyph_here()
+            .or_else(|| self.current_glyph_position(cx));
         // An image-only line can share a glyph boundary with following text.
         // Do not borrow that text's source address for the image's page.
-        let glyph = glyph.filter(|_| cx.doc.text().line(line).is_some_and(|line| line.start() < line.end()));
-        cx.doc.source_position_on_line(self.current_doc_index, line, glyph, cx.source)
+        let glyph = glyph.filter(|_| line.start() < line.end());
+        let source = Targets::new(cx.doc.view()).source_location_on_line(line.index(), glyph)?;
+        Some(SourcePosition {
+            document: self.current_doc_index,
+            path: source.path,
+            utf16_offset: source.utf16_offset,
+        })
+    }
+
+    /// Preserve the displayed origin until the requested jump has paginated.
+    pub fn begin_jump(&mut self, from: String) {
+        self.pending_jump_origin.get_or_insert(from);
+    }
+
+    pub fn cancel_jump(&mut self) {
+        self.pending_jump_origin = None;
     }
 
     /// Publish only after the viewport's page has settled. All host projections
     /// consume this value together, independently of legacy navigation signals.
     pub fn emit_reading_position(&mut self, cx: &mut NavContext<'_>) {
         let view = cx.view();
-        let source = self.current_source_position(view);
-        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(view));
-        let document_fraction = if let Some(glyph) = glyph.filter(|_| view.doc.text().glyph_count() > 0) {
-            glyph as f64 / view.doc.text().glyph_count().max(1) as f64
-        } else {
-            view.viewport.composition().start_offset_y() / view.doc.text().lines().last().map(|line| line.point().y + line.height()).unwrap_or(1.0).max(1.0)
-        }
-        .clamp(0.0, 1.0);
+        let Some(source) = self.current_source_position(view) else {
+            return;
+        };
+        let glyph = self
+            .anchor_glyph_here()
+            .or_else(|| self.current_glyph_position(view));
+        let document_fraction =
+            if let Some(glyph) = glyph.filter(|_| view.doc.text().glyph_count() > 0) {
+                glyph as f64 / view.doc.text().glyph_count().max(1) as f64
+            } else {
+                view.viewport.composition().start_offset_y()
+                    / view
+                        .doc
+                        .text()
+                        .lines()
+                        .last()
+                        .map(|line| line.point().y + line.height())
+                        .unwrap_or(1.0)
+                        .max(1.0)
+            }
+            .clamp(0.0, 1.0);
         let (fraction, location, total_locations) = self.progress_at(document_fraction);
-        let position = ReadingPosition { source, fraction, document_fraction: document_fraction as f32, location, total_locations, document_count: self.document_uris.len() };
-        self.signals.reading_position.emit_if_changed(position, cx.host, RendererEvent::ReadingPositionChanged);
+        let position = ReadingPosition {
+            source,
+            fraction,
+            document_fraction: document_fraction as f32,
+            location,
+            total_locations,
+            document_count: self.document_uris.len(),
+        };
+        if let Some(from) = self.pending_jump_origin.take()
+            && Some(&from) != self.cfi.source_position_cfi(&position.source).as_ref()
+        {
+            cx.host.emit(RendererEvent::NavigationJump { from });
+            self.signals.reading_position.invalidate();
+        }
+        self.signals.reading_position.emit_if_changed(
+            position,
+            cx.host,
+            RendererEvent::ReadingPositionChanged,
+        );
     }
 
     pub fn current_location(&self, cx: NavView<'_>) -> Location {
@@ -114,15 +191,29 @@ impl NavigationState {
         self.pending_nav_anchor_update = true;
     }
 
+    /// Advances to a known pagination group without reducing its identity to y.
+    pub fn advance_to_forward_line(&mut self, cx: &mut NavContext<'_>, cursor: usize) {
+        let Some(group) = cx.doc.view().pagination_lines().group(cursor) else {
+            return;
+        };
+        cx.viewport
+            .begin_forward_at_line(group.point().y, group.cursors().start);
+        cx.host.request_repaint();
+        self.pending_nav_anchor_update = true;
+    }
+
     pub fn restore_glyph_position(&mut self, cx: &mut NavContext<'_>, glyph_idx: u32) {
-        let Some(line_idx) = cx.doc.find_line_for_glyph(glyph_idx) else {
+        let Some(line_idx) = cx.doc.text().line_index_for_glyph(glyph_idx) else {
             return;
         };
         let Some(line) = cx.doc.text().line(line_idx) else {
             return;
         };
-        let y = line.point().y;
-        self.restore_forward_offset(cx, y);
+        let Some(cursor) = cx.doc.view().pagination_lines().cursor(line.id()) else {
+            return;
+        };
+        self.advance_to_forward_line(cx, cursor);
+        self.pending_nav_anchor_update = false;
         self.anchor_at(Some(glyph_idx));
     }
 
@@ -132,8 +223,8 @@ impl NavigationState {
         if cx.doc.text().lines().is_empty() {
             return false;
         }
-        let line_idx = cx.doc.start_line_at(target_y, 0.1);
-        let Some(line) = cx.doc.text().line(line_idx) else {
+        let line_idx = cx.doc.view().pagination_lines().start_at(target_y, 0.1);
+        let Some(line) = cx.doc.view().pagination_lines().source_line(line_idx) else {
             return false;
         };
         let line_y = line.point().y;
@@ -145,15 +236,38 @@ impl NavigationState {
     }
 
     pub fn restore_position_from_cfi(&mut self, cx: &mut NavContext<'_>, cfi: &str) -> bool {
-        if let Some(position) = parse_source_position(cfi)
-            && position.document == self.current_doc_index
-            && let Some(y) = cx.doc.source_element_y(&position, cx.source)
-        {
-            self.restore_forward_offset(cx, y);
+        let Some(internal) = self.cfi.to_internal(cfi) else {
+            return false;
+        };
+        if !internal.contains('!') && self.cfi.document_index(cfi) == Some(self.current_doc_index) {
+            self.restore_forward_offset(cx, 0.0);
             self.anchor_at(None);
             return true;
         }
-        let Some((doc_idx, glyph_idx)) = parse_cfi(cx.doc.document(), cfi) else {
+        if let Some(position) = html_view_cfi::parse_source_position(&internal)
+            && position.document == self.current_doc_index
+        {
+            let source = SourceLocation {
+                path: position.path,
+                utf16_offset: position.utf16_offset,
+            };
+            let targets = Targets::new(cx.doc.view());
+            if let Some(cursor) = targets
+                .source_element_line(&source)
+                .and_then(|line| cx.doc.view().pagination_lines().cursor(line))
+            {
+                self.advance_to_forward_line(cx, cursor);
+                self.pending_nav_anchor_update = false;
+                self.anchor_at(None);
+                return true;
+            }
+            if let Some(y) = targets.source_element_y(&source) {
+                self.restore_forward_offset(cx, y);
+                self.anchor_at(None);
+                return true;
+            }
+        }
+        let Some((doc_idx, glyph_idx)) = parse_cfi(cx.doc.view(), &internal) else {
             return false;
         };
         if doc_idx != self.current_doc_index {
@@ -164,18 +278,16 @@ impl NavigationState {
     }
 
     pub fn jump_to_id(&mut self, cx: &mut NavContext<'_>, id: &str) -> bool {
-        let Some(id_idx) = cx.doc.view().lookup_string(id) else {
+        let Some(target) = Targets::new(cx.doc.view()).element(id) else {
             return false;
         };
-        let addressing = cx.doc.view().addressing();
-        let Some(glyph_idx) = addressing.anchor_glyph(id_idx) else {
-            if let Some(pos) = addressing.anchor_position(id_idx) {
-                let y = pos.y();
-                return self.restore_anchor_position(cx, y);
-            }
+        if let Some(range) = target.glyphs {
+            self.restore_glyph_position(cx, range.start);
+        } else if let Some(y) = target.y {
+            return self.restore_anchor_position(cx, y);
+        } else {
             return false;
-        };
-        self.restore_glyph_position(cx, glyph_idx);
+        }
         self.pending_nav_anchor_update = false;
         true
     }
@@ -184,51 +296,46 @@ impl NavigationState {
     /// was one. A caller that reads more than one document at a time takes
     /// over when there was not.
     pub fn next_line(&mut self, cx: &mut NavContext<'_>) -> bool {
-        let lines = cx.doc.text().lines();
+        let lines = cx.doc.view().pagination_lines();
         if lines.is_empty() {
             return false;
         }
-        let current_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx.view()));
-        let Some(current_line) = lines.get(current_idx) else {
+        let current_idx = cx
+            .frame
+            .page()
+            .start_line()
+            .unwrap_or_else(|| self.find_start_line(cx.view()));
+        let Some(current) = lines.group(current_idx) else {
             return false;
         };
-        let search_y = current_line.point().y + current_line.height() + 0.1;
-        let target_idx = cx.doc.start_line_at(search_y, 0.0);
-        if target_idx >= lines.len() {
+        let target = current.cursors().end;
+        if target >= lines.len() {
             return false;
         }
-        let Some(target_line) = lines.get(target_idx) else {
-            return false;
-        };
-        let y = target_line.point().y;
-        self.advance_to_forward_offset(cx, y);
+        self.advance_to_forward_line(cx, target);
         true
     }
 
     /// Scrolls one line toward the beginning of this document, reporting
     /// whether there was one.
     pub fn prev_line(&mut self, cx: &mut NavContext<'_>) -> bool {
-        let lines = cx.doc.text().lines();
+        let lines = cx.doc.view().pagination_lines();
         if lines.is_empty() {
             return false;
         }
-        let current_idx = cx.frame.page().start_line().unwrap_or_else(|| self.find_start_line(cx.view()));
-        let Some(current_line) = lines.get(current_idx) else {
+        let current_idx = cx
+            .frame
+            .page()
+            .start_line()
+            .unwrap_or_else(|| self.find_start_line(cx.view()));
+        let Some(previous) = lines
+            .group_start(current_idx)
+            .and_then(|cursor| cursor.checked_sub(1))
+        else {
             return false;
         };
-        if current_line.point().y <= 0.0 && current_idx == 0 {
-            return false;
-        }
-        let search_y = current_line.point().y.max(0.0);
-        let Some(target_idx) = cx.doc.end_line_at(search_y, 0.1) else {
-            return false;
-        };
-        if let Some(target_line) = lines.get(target_idx) {
-            let y = target_line.point().y;
-            self.advance_to_forward_offset(cx, y);
-            return true;
-        }
-        false
+        self.advance_to_forward_line(cx, previous);
+        true
     }
 
     /// Settles the viewport after arriving in a document.
@@ -238,14 +345,10 @@ impl NavigationState {
                 cx.viewport.begin_forward_at(0.0);
             }
             DocAnchor::End => {
-                let (end_offset_y, anchor_end_line) =
-                    cx.doc.text().lines().last().map_or((0.0, None), |last| {
-                        (
-                            last.point().y + last.height(),
-                            Some(cx.doc.text().line_count().saturating_sub(1)),
-                        )
-                    });
-                cx.viewport.begin_backward_at(end_offset_y, anchor_end_line);
+                let lines = cx.doc.view().pagination_lines();
+                let end = lines.len().checked_sub(1);
+                let offset = end.and_then(|cursor| lines.group(cursor)).map_or(0.0, |group| group.point().y + group.height());
+                cx.viewport.begin_backward_at(offset, end);
             }
             DocAnchor::Glyph(glyph_idx) => {
                 self.restore_glyph_position(cx, glyph_idx);
@@ -271,12 +374,17 @@ impl NavigationState {
     /// The anchor, if it belongs to the document being read. One from a
     /// document the reader has left indexes glyphs that are not on screen.
     pub fn anchor_glyph_here(&self) -> Option<u32> {
-        self.nav_anchor.filter(|anchor| anchor.doc == self.current_doc_index).map(|anchor| anchor.glyph)
+        self.nav_anchor
+            .filter(|anchor| anchor.doc == self.current_doc_index)
+            .map(|anchor| anchor.glyph)
     }
 
     /// Records where the reader is in the document being read.
     pub fn anchor_at(&mut self, glyph: Option<u32>) {
-        self.nav_anchor = glyph.map(|glyph| SpineAnchor { doc: self.current_doc_index, glyph });
+        self.nav_anchor = glyph.map(|glyph| SpineAnchor {
+            doc: self.current_doc_index,
+            glyph,
+        });
     }
 
     pub fn update_toc_anchor_filter(&mut self, cx: NavView<'_>) {
@@ -289,26 +397,46 @@ impl NavigationState {
     pub fn update_nav_signal(&mut self, cx: &mut NavContext<'_>) {
         let host = cx.host;
         let view = cx.view();
-        let glyph = self.anchor_glyph_here().or_else(|| self.current_glyph_position(view));
+        let glyph = self
+            .anchor_glyph_here()
+            .or_else(|| self.current_glyph_position(view));
         let current_doc = self.current_doc_index;
 
-        self.signals.position.emit_if_changed((current_doc, glyph), host, |(doc, glyph)| RendererEvent::PositionChanged { doc, glyph });
+        self.signals
+            .position
+            .emit_if_changed((current_doc, glyph), host, |(doc, glyph)| {
+                RendererEvent::PositionChanged { doc, glyph }
+            });
 
-        let cfi_string = glyph.and_then(|glyph_idx| html_view_cfi::generate_cfi(view.doc.document(), current_doc, glyph_idx));
-        self.signals.cfi.emit_if_changed(cfi_string, host, RendererEvent::CfiChanged);
+        let cfi_string = glyph
+            .and_then(|glyph_idx| {
+                html_view_cfi::generate_cfi(view.doc.view(), current_doc, glyph_idx)
+            })
+            .and_then(|cfi| self.cfi.to_publication(&cfi));
+        self.signals
+            .cfi
+            .emit_if_changed(cfi_string, host, RendererEvent::CfiChanged);
 
         let (fraction, location, total_locations) = self.reading_progress(view, glyph);
         let doc_count = self.document_uris.len();
-        self.signals.progress.emit_if_changed((fraction, location, total_locations, current_doc), host, |(fraction, location, total_locations, doc)| RendererEvent::ReadingProgress {
-            fraction,
-            location,
-            total_locations,
-            doc,
-            doc_count,
-        });
+        self.signals.progress.emit_if_changed(
+            (fraction, location, total_locations, current_doc),
+            host,
+            |(fraction, location, total_locations, doc)| RendererEvent::ReadingProgress {
+                fraction,
+                location,
+                total_locations,
+                doc,
+                doc_count,
+            },
+        );
 
         let anchor = self.current_anchor_id(view);
-        self.signals.anchor.emit_if_changed((current_doc, anchor), host, |(doc, anchor)| RendererEvent::NavAnchorChanged { doc, anchor });
+        self.signals
+            .anchor
+            .emit_if_changed((current_doc, anchor), host, |(doc, anchor)| {
+                RendererEvent::NavAnchorChanged { doc, anchor }
+            });
     }
 
     /// Maps the reading position to a publication-wide fraction and location
@@ -325,13 +453,25 @@ impl NavigationState {
     pub fn progress_at(&self, in_document_fraction: f64) -> (f32, u64, u64) {
         let current_doc = self.current_doc_index;
         let total_chars = self.document_text_lengths.iter().sum::<u64>().max(1);
-        let preceding_chars = self.document_text_lengths.iter().take(current_doc).sum::<u64>();
-        let current_length = self.document_text_lengths.get(current_doc).copied().unwrap_or(1);
+        let preceding_chars = self
+            .document_text_lengths
+            .iter()
+            .take(current_doc)
+            .sum::<u64>();
+        let current_length = self
+            .document_text_lengths
+            .get(current_doc)
+            .copied()
+            .unwrap_or(1);
         let in_document = (in_document_fraction.clamp(0.0, 1.0) * current_length as f64) as u64;
         let current_chars = (preceding_chars + in_document).min(total_chars);
         let location = (current_chars / LOCATION_CHARS + 1).max(1);
         let total_locations = total_chars.div_ceil(LOCATION_CHARS).max(1);
-        (current_chars as f32 / total_chars as f32, location, total_locations)
+        (
+            current_chars as f32 / total_chars as f32,
+            location,
+            total_locations,
+        )
     }
 
     /// Inverse of [`Self::reading_progress`]: maps a publication-wide fraction
@@ -352,8 +492,16 @@ impl NavigationState {
             })
             .unwrap_or_else(|| self.document_text_lengths.len().saturating_sub(1));
         let preceding: u64 = self.document_text_lengths.iter().take(doc).sum();
-        let doc_length = self.document_text_lengths.get(doc).copied().unwrap_or(1).max(1);
-        (doc, (target.saturating_sub(preceding) as f64 / doc_length as f64).min(1.0))
+        let doc_length = self
+            .document_text_lengths
+            .get(doc)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        (
+            doc,
+            (target.saturating_sub(preceding) as f64 / doc_length as f64).min(1.0),
+        )
     }
 }
 
@@ -363,13 +511,19 @@ mod tests {
 
     fn nav(lengths: Vec<u64>, current_doc: usize) -> NavigationState {
         NavigationState {
-            document_uris: lengths.iter().enumerate().map(|(index, _)| format!("doc{index}.html")).collect(),
+            cfi: Default::default(),
+            document_uris: lengths
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("doc{index}.html"))
+                .collect(),
             document_text_lengths: lengths,
             current_doc_index: current_doc,
             nav_anchor: None,
             pending_nav_anchor_update: false,
             signals: Default::default(),
             history: Default::default(),
+            pending_jump_origin: None,
             toc_anchors: Default::default(),
         }
     }
@@ -380,7 +534,10 @@ mod tests {
 
         let (start, _, _) = state.progress_at(0.0);
         let (end, _, _) = state.progress_at(1.0);
-        assert!((start - 1.0 / 3.0).abs() < 1e-6, "the second of three equal documents starts a third of the way in");
+        assert!(
+            (start - 1.0 / 3.0).abs() < 1e-6,
+            "the second of three equal documents starts a third of the way in"
+        );
         assert!((end - 2.0 / 3.0).abs() < 1e-6);
     }
 
@@ -388,9 +545,21 @@ mod tests {
     fn location_numbers_are_one_based_and_span_fixed_character_counts() {
         let state = nav(vec![LOCATION_CHARS * 4], 0);
 
-        assert_eq!(state.progress_at(0.0).1, 1, "locations are numbered from one");
-        assert_eq!(state.progress_at(1.0).2, 4, "four locations of LOCATION_CHARS each");
-        assert_eq!(state.progress_at(0.5).1, 3, "halfway through is the third location");
+        assert_eq!(
+            state.progress_at(0.0).1,
+            1,
+            "locations are numbered from one"
+        );
+        assert_eq!(
+            state.progress_at(1.0).2,
+            4,
+            "four locations of LOCATION_CHARS each"
+        );
+        assert_eq!(
+            state.progress_at(0.5).1,
+            3,
+            "halfway through is the third location"
+        );
     }
 
     #[test]
@@ -409,15 +578,25 @@ mod tests {
             for step in 0..=10 {
                 let within = step as f64 / 10.0;
                 let (fraction, _, _) = state.progress_at(within);
-                let (round_tripped_doc, round_tripped_within) = state.document_at_fraction(fraction);
+                let (round_tripped_doc, round_tripped_within) =
+                    state.document_at_fraction(fraction);
 
                 // The forward mapping truncates to whole characters, so a
                 // position at the very end of a document can land on the start
                 // of the next one. Both readings are the same place.
-                let same_place = round_tripped_doc == doc || (round_tripped_doc == doc + 1 && within > 0.99 && round_tripped_within < 0.01);
-                assert!(same_place, "doc {doc} at {within} round-tripped to doc {round_tripped_doc} at {round_tripped_within}");
+                let same_place = round_tripped_doc == doc
+                    || (round_tripped_doc == doc + 1
+                        && within > 0.99
+                        && round_tripped_within < 0.01);
+                assert!(
+                    same_place,
+                    "doc {doc} at {within} round-tripped to doc {round_tripped_doc} at {round_tripped_within}"
+                );
                 if round_tripped_doc == doc {
-                    assert!((round_tripped_within - within).abs() < 0.01, "doc {doc} at {within} round-tripped to {round_tripped_within}");
+                    assert!(
+                        (round_tripped_within - within).abs() < 0.01,
+                        "doc {doc} at {within} round-tripped to {round_tripped_within}"
+                    );
                 }
             }
         }
@@ -427,7 +606,11 @@ mod tests {
     fn document_at_fraction_clamps_out_of_range_input() {
         let state = nav(vec![100, 100], 0);
         assert_eq!(state.document_at_fraction(-5.0).0, 0);
-        assert_eq!(state.document_at_fraction(5.0).0, 1, "past the end lands in the last document");
+        assert_eq!(
+            state.document_at_fraction(5.0).0,
+            1,
+            "past the end lands in the last document"
+        );
     }
 
     #[test]
@@ -441,7 +624,9 @@ mod tests {
     #[test]
     fn fragment_part_treats_an_empty_fragment_as_absent() {
         assert_eq!(NavigationState::fragment_part(""), None);
-        assert_eq!(NavigationState::fragment_part("section-1"), Some("section-1".to_owned()));
+        assert_eq!(
+            NavigationState::fragment_part("section-1"),
+            Some("section-1".to_owned())
+        );
     }
-
 }

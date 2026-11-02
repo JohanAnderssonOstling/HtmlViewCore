@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use html_view_doc::{DocQuery, SourceIndex};
+use html_view_doc::DocQuery;
 
 mod navigate;
 #[cfg(test)]
@@ -22,7 +22,6 @@ use html_view_types::{ReadingPosition, RendererEvent, RendererHost, ViewportStat
 #[derive(Clone, Copy)]
 pub struct NavView<'a> {
     pub doc: DocQuery<'a>,
-    pub source: &'a SourceIndex,
     pub viewport: &'a ViewportState,
     pub frame: &'a VisibleFrame,
 }
@@ -30,7 +29,6 @@ pub struct NavView<'a> {
 /// [`NavView`] plus the ability to move the viewport and notify the host.
 pub struct NavContext<'a> {
     pub doc: DocQuery<'a>,
-    pub source: &'a SourceIndex,
     pub viewport: &'a mut ViewportState,
     pub frame: &'a VisibleFrame,
     pub host: &'a dyn RendererHost,
@@ -38,7 +36,11 @@ pub struct NavContext<'a> {
 
 impl<'a> NavContext<'a> {
     pub fn view(&self) -> NavView<'_> {
-        NavView { doc: self.doc, source: self.source, viewport: self.viewport, frame: self.frame }
+        NavView {
+            doc: self.doc,
+            viewport: self.viewport,
+            frame: self.frame,
+        }
     }
 }
 
@@ -61,7 +63,12 @@ impl<T> Default for Debounced<T> {
 impl<T: Clone + PartialEq> Debounced<T> {
     /// Emits `event(value)` if `value` differs from the last emitted one.
     /// Returns whether anything was sent.
-    pub fn emit_if_changed(&mut self, value: T, host: &dyn RendererHost, event: impl FnOnce(T) -> RendererEvent) -> bool {
+    pub fn emit_if_changed(
+        &mut self,
+        value: T,
+        host: &dyn RendererHost,
+        event: impl FnOnce(T) -> RendererEvent,
+    ) -> bool {
         if self.last.as_ref() == Some(&value) {
             return false;
         }
@@ -119,7 +126,10 @@ impl LocationHistory {
 
     pub fn emit_availability(&mut self, host: &dyn RendererHost) {
         let (back, forward) = self.availability();
-        self.availability.emit_if_changed((back, forward), host, |(back, forward)| RendererEvent::HistoryAvailability { back, forward });
+        self.availability
+            .emit_if_changed((back, forward), host, |(back, forward)| {
+                RendererEvent::HistoryAvailability { back, forward }
+            });
     }
 
     pub fn current(&self) -> Option<&Location> {
@@ -191,11 +201,18 @@ impl TocAnchors {
     /// that do not occur in the document drop out; an empty result disables the
     /// filter rather than matching nothing.
     pub fn rebuild(&mut self, doc: DocQuery<'_>, current_doc: usize) {
-        let Some(anchor_ids) = self.strings_by_doc.get(current_doc).filter(|ids| !ids.is_empty()) else {
+        let Some(anchor_ids) = self
+            .strings_by_doc
+            .get(current_doc)
+            .filter(|ids| !ids.is_empty())
+        else {
             self.filter = None;
             return;
         };
-        let filter: HashSet<u16> = anchor_ids.iter().filter_map(|id| doc.view().lookup_string(id)).collect();
+        let filter: HashSet<u16> = anchor_ids
+            .iter()
+            .filter_map(|id| doc.view().lookup_string(id))
+            .collect();
         self.filter = (!filter.is_empty()).then_some(filter);
     }
 }
@@ -216,8 +233,14 @@ mod tests {
         let host = RecordingHost::default();
         let mut signal = Debounced::default();
 
-        assert!(signal.emit_if_changed(7, &host, event), "the first value has nothing to match");
-        assert!(!signal.emit_if_changed(7, &host, event), "an unchanged value stays silent");
+        assert!(
+            signal.emit_if_changed(7, &host, event),
+            "the first value has nothing to match"
+        );
+        assert!(
+            !signal.emit_if_changed(7, &host, event),
+            "an unchanged value stays silent"
+        );
         assert!(signal.emit_if_changed(8, &host, event));
         assert_eq!(host.count(), 2);
     }
@@ -241,19 +264,21 @@ mod tests {
     fn progress_deduplication_includes_the_fraction() {
         let host = RecordingHost::default();
         let mut signal = Debounced::default();
-        let event = |(fraction, _, _, _): (f32, u64, u64, usize)| {
-            RendererEvent::ReadingProgress {
-                fraction,
-                location: 1,
-                total_locations: 2,
-                doc: 0,
-                doc_count: 1,
-            }
+        let event = |(fraction, _, _, _): (f32, u64, u64, usize)| RendererEvent::ReadingProgress {
+            fraction,
+            location: 1,
+            total_locations: 2,
+            doc: 0,
+            doc_count: 1,
         };
 
         assert!(signal.emit_if_changed((0.1, 1, 2, 0), &host, event));
         assert!(signal.emit_if_changed((0.2, 1, 2, 0), &host, event));
-        assert_eq!(host.count(), 2, "fraction changes inside one location must be reported");
+        assert_eq!(
+            host.count(),
+            2,
+            "fraction changes inside one location must be reported"
+        );
     }
 
     fn location(doc: usize) -> Location {
@@ -266,15 +291,27 @@ mod tests {
         let mut history = LocationHistory::default();
 
         history.emit_availability(&host);
-        assert_eq!(availability(&host), vec![(false, false)], "an empty stack goes nowhere");
+        assert_eq!(
+            availability(&host),
+            vec![(false, false)],
+            "an empty stack goes nowhere"
+        );
 
         history.push(location(0), &host);
         history.push(location(1), &host);
-        assert_eq!(availability(&host).last().copied(), Some((true, false)), "at the newest entry, only back is available");
+        assert_eq!(
+            availability(&host).last().copied(),
+            Some((true, false)),
+            "at the newest entry, only back is available"
+        );
 
         history.step(-1, &host);
         history.emit_availability(&host);
-        assert_eq!(availability(&host).last().copied(), Some((false, true)), "at the oldest entry, only forward is available");
+        assert_eq!(
+            availability(&host).last().copied(),
+            Some((false, true)),
+            "at the oldest entry, only forward is available"
+        );
     }
 
     #[test]
@@ -286,7 +323,10 @@ mod tests {
         history.push(location(0), &host);
 
         assert!(history.is_at_newest());
-        assert!(history.step(-1, &host).is_none(), "repeated pushes of one location must not build a stack to walk back through");
+        assert!(
+            history.step(-1, &host).is_none(),
+            "repeated pushes of one location must not build a stack to walk back through"
+        );
     }
 
     #[test]
@@ -301,7 +341,11 @@ mod tests {
         history.push(location(9), &host);
 
         assert!(history.is_at_newest(), "the new branch is the newest entry");
-        assert_eq!(history.step(-1, &host), Some(location(1)), "the discarded branch is unreachable");
+        assert_eq!(
+            history.step(-1, &host),
+            Some(location(1)),
+            "the discarded branch is unreachable"
+        );
         assert_eq!(history.step(-1, &host), Some(location(0)));
     }
 
@@ -312,11 +356,21 @@ mod tests {
         history.push(location(0), &host);
         history.push(location(1), &host);
 
-        assert!(history.step(1, &host).is_none(), "already at the newest entry");
-        assert_eq!(history.current(), Some(&location(1)), "a refused step must not move the cursor");
+        assert!(
+            history.step(1, &host).is_none(),
+            "already at the newest entry"
+        );
+        assert_eq!(
+            history.current(),
+            Some(&location(1)),
+            "a refused step must not move the cursor"
+        );
 
         history.step(-1, &host);
-        assert!(history.step(-1, &host).is_none(), "already at the oldest entry");
+        assert!(
+            history.step(-1, &host).is_none(),
+            "already at the oldest entry"
+        );
         assert_eq!(history.current(), Some(&location(0)));
     }
 
@@ -341,15 +395,25 @@ mod tests {
         history.emit_availability(&host);
         history.emit_availability(&host);
         history.emit_availability(&host);
-        assert!(availability(&host).is_empty(), "an unchanged availability pair must not be re-emitted");
+        assert!(
+            availability(&host).is_empty(),
+            "an unchanged availability pair must not be re-emitted"
+        );
     }
 
     #[test]
     fn toc_anchor_strings_are_padded_to_the_spine_length() {
         let mut anchors = TocAnchors::default();
         anchors.set_strings_by_doc(vec![vec!["a".to_owned()]], 3);
-        assert_eq!(anchors.strings_by_doc.len(), 3, "documents without listed anchors still need a slot to index");
-        assert!(anchors.filter().is_none(), "no filter exists until it is rebuilt against a document");
+        assert_eq!(
+            anchors.strings_by_doc.len(),
+            3,
+            "documents without listed anchors still need a slot to index"
+        );
+        assert!(
+            anchors.filter().is_none(),
+            "no filter exists until it is rebuilt against a document"
+        );
     }
 
     #[test]
@@ -371,6 +435,7 @@ pub struct SpineAnchor {
 }
 
 pub struct NavigationState {
+    pub cfi: html_view_cfi::PublicationCfi,
     document_uris: Vec<String>,
     document_text_lengths: Vec<u64>,
     current_doc_index: usize,
@@ -384,6 +449,7 @@ pub struct NavigationState {
     pending_nav_anchor_update: bool,
     pub signals: NavSignals,
     pub history: LocationHistory,
+    pending_jump_origin: Option<String>,
     pub toc_anchors: TocAnchors,
 }
 
@@ -440,6 +506,7 @@ impl NavigationState {
     pub fn new(document_uris: Vec<String>, current_document: usize) -> Self {
         let document_text_lengths = vec![1; document_uris.len()];
         Self {
+            cfi: Default::default(),
             document_uris,
             document_text_lengths,
             current_doc_index: current_document,
@@ -447,6 +514,7 @@ impl NavigationState {
             pending_nav_anchor_update: false,
             signals: NavSignals::default(),
             history: LocationHistory::default(),
+            pending_jump_origin: None,
             toc_anchors: TocAnchors::default(),
         }
     }

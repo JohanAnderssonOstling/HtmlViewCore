@@ -1,0 +1,17 @@
+HtmlViewCore
+Copyright (C) 2026 Johan <johan@bokheim.se> and HtmlViewCore contributors
+
+HtmlViewCore is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+HtmlViewCore is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+The full license text is in LICENSE. The SPDX identifier is GPL-3.0-or-later.
+
+This notice applies to original HtmlViewCore source code unless a file specifies
+different terms. Third-party code, data, fixtures, and other assets retain their
+own copyrights and licenses. Existing third-party notices continue to apply.

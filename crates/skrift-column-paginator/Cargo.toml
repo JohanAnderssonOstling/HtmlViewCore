@@ -1,0 +1,22 @@
+[package]
+license.workspace = true
+name = "skrift-column-paginator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository.workspace = true
+
+[dependencies]
+html.workspace = true
+html-view-cfi.workspace = true
+html-view-doc.workspace = true
+html-view-load.workspace = true
+html-view-navigate.workspace = true
+html-view-paginate.workspace = true
+html-view-paint.workspace = true
+html-view-select.workspace = true
+html-view-types.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+smallvec = "1"
+web-time = "1"
