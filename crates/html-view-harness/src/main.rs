@@ -14,14 +14,13 @@ mod fixture;
 mod paint;
 mod text;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
-use html_view_core::{
+use skrift_column_paginator::{
     FileSystemProvider, FootnotePopupAnchor, NoteDisplay, PointerDownOptions, RendererEvent,
-    RendererHost, RendererInitialConfig, RendererSession, ResourceProvider, SelectionMode,
+    ReadingPosition, RendererServices, RendererEffects, ClipboardWrite, RendererInitialConfig,
+    RendererSession, RendererCommand, ResourceProvider, SelectionMode,
 };
 use kurbo::{Point, Size};
 use peniko::Color;
@@ -32,7 +31,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use paint::BufferPainter;
-use text::{ActiveDocument, FontShaper};
+use text::{FontShaper, RasterCache};
 
 const STATUS_HEIGHT: f64 = 28.0;
 const POPUP_PADDING: f64 = 12.0;
@@ -60,82 +59,16 @@ impl PopupGeometry {
 #[derive(Default)]
 struct HostState {
     repaint: bool,
-    position: Option<(usize, Option<u32>)>,
+    position: Option<ReadingPosition>,
     footnote_anchor: Option<FootnotePopupAnchor>,
-}
-
-struct HarnessHost {
-    state: RefCell<HostState>,
-    clipboard: RefCell<arboard::Clipboard>,
-    /// The renderer says which document it is about to shape or paint, and the
-    /// shaper reads its table for that one. Popup notes can come from another
-    /// spine item, and a glyph id only means something alongside the document
-    /// it was shaped from.
-    active_document: ActiveDocument,
-}
-
-impl RendererHost for HarnessHost {
-    fn note_popup_width(&self) -> Option<f64> {
-        Some(336.0)
-    }
-
-    fn request_repaint(&self) {
-        self.state.borrow_mut().repaint = true;
-    }
-
-    fn request_style(&self) {}
-
-    fn schedule(&self, _delay: Duration, work: Box<dyn FnOnce() + Send>) {
-        work();
-        self.state.borrow_mut().repaint = true;
-    }
-
-    fn schedule_repaint(&self, _delay: Duration) {
-        self.state.borrow_mut().repaint = true;
-    }
-
-    fn resource_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        None
-    }
-
-    fn set_clipboard(&self, text: &str) -> Result<(), String> {
-        self.clipboard
-            .borrow_mut()
-            .set_text(text.to_owned())
-            .map_err(|error| error.to_string())
-    }
-
-    fn set_clipboard_image(
-        &self,
-        _width: usize,
-        _height: usize,
-        _rgba: Vec<u8>,
-    ) -> Result<(), String> {
-        Err("the harness does not copy images".to_owned())
-    }
-
-    fn set_glyph_document(&self, doc: usize) {
-        self.active_document.set(doc);
-    }
-
-    fn emit(&self, event: RendererEvent) {
-        match event {
-            RendererEvent::PositionChanged { doc, glyph } => {
-                self.state.borrow_mut().position = Some((doc, glyph));
-            }
-            RendererEvent::FootnoteOpened(preview) => {
-                let mut state = self.state.borrow_mut();
-                state.footnote_anchor = preview.anchor;
-                state.repaint = true;
-            }
-            _ => {}
-        }
-    }
 }
 
 struct Reader {
     session: RendererSession<FontShaper>,
-    host: Rc<HarnessHost>,
+    rasters: RasterCache,
+    state: HostState,
+    clipboard: arboard::Clipboard,
+    effects: RendererEffects,
     uris: Vec<String>,
 }
 
@@ -145,15 +78,8 @@ impl Reader {
         uris: Vec<String>,
         start: Option<(usize, f32, f64)>,
     ) -> Result<Self, String> {
-        let active_document = ActiveDocument::default();
-        let host = Rc::new(HarnessHost {
-            state: RefCell::new(HostState::default()),
-            clipboard: RefCell::new(
-                arboard::Clipboard::new().map_err(|error| error.to_string())?,
-            ),
-            active_document: active_document.clone(),
-        });
-        let shaper = FontShaper::from_system_fonts(active_document)?;
+        let clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+        let shaper = FontShaper::from_system_fonts()?;
         let (doc_index, font_size, column_width) = start.unwrap_or((0, 17.0, 340.0));
         let config = RendererInitialConfig {
             font_size,
@@ -162,20 +88,60 @@ impl Reader {
             note_display: NoteDisplay::default(),
             ..RendererInitialConfig::default()
         };
-        let session = RendererSession::from_provider_with_nav(
-            host.clone(),
+        let mut session = RendererSession::from_provider_with_nav(
+            RendererServices::default(),
             shaper,
             provider.clone(),
             uris.clone(),
             doc_index,
             None,
             config,
-        );
+        )?;
+        session.set_note_popup_width(Some(336.0));
         Ok(Self {
             session,
-            host,
+            rasters: RasterCache::default(),
+            state: HostState::default(),
+            clipboard,
+            effects: RendererEffects::default(),
             uris,
         })
+    }
+    fn flush_effects(&mut self) {
+        self.session.drain_effects(&mut self.effects);
+        self.state.repaint |= std::mem::take(&mut self.effects.repaint);
+        self.effects.restyle = false;
+        for event in self.effects.events.drain(..) {
+            match event {
+                RendererEvent::ReadingPositionChanged(position) => {
+                    self.state.position = Some(position)
+                }
+                RendererEvent::FootnoteOpened(preview) => {
+                    self.state.footnote_anchor = preview.anchor;
+                    self.state.repaint = true;
+                }
+                RendererEvent::OperationFailed { operation, message } => {
+                    eprintln!("{operation}: {message}")
+                }
+                _ => {}
+            }
+        }
+        for write in self.effects.clipboard.drain(..) {
+            let result = match write {
+                ClipboardWrite::Text(text) => self
+                    .clipboard
+                    .set_text(text)
+                    .map_err(|error| error.to_string()),
+                ClipboardWrite::Image { .. } | ClipboardWrite::Svg(_) => {
+                    Err("the harness does not copy images".to_owned())
+                }
+            };
+            if let Err(message) = result {
+                eprintln!("clipboard: {message}");
+            }
+        }
+        // The harness shapes with system fonts only.
+        self.effects.font_loads.clear();
     }
 }
 
@@ -193,12 +159,25 @@ struct Harness {
 
 impl Harness {
     fn status(&self) -> String {
-        let (doc, glyph) = self.reader.host.state.borrow().position.unwrap_or((0, None));
+        let state = &self.reader.state;
+        let doc = state
+            .position
+            .as_ref()
+            .map_or(0, |position| position.source.document);
         let uri = self.reader.uris.get(doc).map(String::as_str).unwrap_or("?");
-        format!("{} of {}   {uri}   glyph {}", doc + 1, self.reader.uris.len(), glyph.map_or_else(|| "-".to_owned(), |glyph| glyph.to_string()))
+        let location = state
+            .position
+            .as_ref()
+            .map_or(1, |position| position.location);
+        format!(
+            "{} of {}   {uri}   location {location}",
+            doc + 1,
+            self.reader.uris.len()
+        )
     }
 
     fn draw(&mut self) {
+        self.reader.flush_effects();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -210,7 +189,7 @@ impl Harness {
             self.reader.session.column_width(),
             self.status(),
             self.rules,
-            self.reader.host.state.borrow().footnote_anchor,
+            self.reader.state.footnote_anchor,
             self.reader.session.note_scene(),
         );
         let Some(surface) = self.surface.as_mut() else {
@@ -242,7 +221,8 @@ impl Harness {
         // A prepared frame hands out the shaper beside the painting half,
         // which is exactly what a painter drawing glyphs by id needs.
         let (shaper, frame) = self.reader.session.prepare_frame(page).into_parts();
-        let mut painter = BufferPainter::new(&mut buffer, width, height, shaper);
+        let mut painter =
+            BufferPainter::new(&mut buffer, width, height, shaper, &mut self.reader.rasters);
         painter.clear(Color::rgba8(0xff, 0xff, 0xff, 0xff));
         frame.paint_with_note_selection(&mut painter, |painter| {
             if rules {
@@ -361,10 +341,12 @@ impl ApplicationHandler for Harness {
                     ElementState::Released => {
                         if self.selecting_note {
                             self.selecting_note = false;
-                            self.reader.session.note_pointer_up();
+                            if let Some(geometry) = self.popup_geometry {
+                                self.reader.session.note_pointer_up(geometry.local_point(self.pointer), SelectionMode::Plain);
+                            }
                         } else {
                             self.selecting = false;
-                            self.reader.session.pointer_up();
+                            self.reader.session.pointer_up(self.pointer, SelectionMode::Plain);
                         }
                     }
                 }
@@ -375,7 +357,15 @@ impl ApplicationHandler for Harness {
                     winit::event::MouseScrollDelta::LineDelta(_, lines) => -f64::from(lines),
                     winit::event::MouseScrollDelta::PixelDelta(position) => -position.y,
                 };
-                if self.reader.session.scroll_vertical(scroll) {
+                let step = if scroll < 0.0 {
+                    -1
+                } else if scroll > 0.0 {
+                    1
+                } else {
+                    0
+                };
+                if step != 0 {
+                    self.reader.session.apply(RendererCommand::NavigateLine(step));
                     self.request_redraw();
                 }
             }
@@ -385,12 +375,16 @@ impl ApplicationHandler for Harness {
             }
             _ => {}
         }
+        self.reader.flush_effects();
+        if std::mem::take(&mut self.reader.state.repaint) {
+            self.request_redraw();
+        }
     }
 }
 
 impl Harness {
     fn close_popup(&mut self) {
-        self.reader.host.state.borrow_mut().footnote_anchor = None;
+        self.reader.state.footnote_anchor = None;
         self.reader.session.close_note();
         self.popup_geometry = None;
         self.selecting_note = false;
@@ -407,27 +401,35 @@ impl Harness {
         match key.as_ref() {
             Key::Named(NamedKey::ArrowRight)
             | Key::Named(NamedKey::Space)
-            | Key::Named(NamedKey::PageDown) => session.next_page(),
+            | Key::Named(NamedKey::PageDown) => session.apply(RendererCommand::NavigatePage(1)),
             Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => {
-                session.previous_page()
+                session.apply(RendererCommand::NavigatePage(-1))
             }
-            Key::Named(NamedKey::ArrowDown) => session.next_line(),
-            Key::Named(NamedKey::ArrowUp) => session.previous_line(),
+            Key::Named(NamedKey::ArrowDown) => session.apply(RendererCommand::NavigateLine(1)),
+            Key::Named(NamedKey::ArrowUp) => session.apply(RendererCommand::NavigateLine(-1)),
             Key::Named(NamedKey::Escape) => {
-                if self.reader.host.state.borrow().footnote_anchor.is_some() {
+                if self.reader.state.footnote_anchor.is_some() {
                     self.close_popup();
                 } else {
                     event_loop.exit();
                 }
             }
-            Key::Character("n") => session.next_document(),
-            Key::Character("p") => session.previous_document(),
+            Key::Character("n") => session.apply(RendererCommand::NavigateDocument(1)),
+            Key::Character("p") => session.apply(RendererCommand::NavigateDocument(-1)),
             Key::Character("q") => event_loop.exit(),
             Key::Character("g") => self.rules = !self.rules,
-            Key::Character("+") | Key::Character("=") => session.change_root_font_size(1.0),
-            Key::Character("-") => session.change_root_font_size(-1.0),
-            Key::Character("]") => session.change_column_width(20.0),
-            Key::Character("[") => session.change_column_width(-20.0),
+            Key::Character("+") | Key::Character("=") => session.apply(RendererCommand::SetFontSize(
+                session.render_view().root_font_size() + 1.0,
+            )),
+            Key::Character("-") => session.apply(RendererCommand::SetFontSize(
+                session.render_view().root_font_size() - 1.0,
+            )),
+            Key::Character("]") => session.apply(RendererCommand::SetColumnWidth(
+                session.column_width() + 20.0,
+            )),
+            Key::Character("[") => session.apply(RendererCommand::SetColumnWidth(
+                session.column_width() - 20.0,
+            )),
             Key::Character("c")
                 if self.modifiers.control_key() || self.modifiers.super_key() =>
             {

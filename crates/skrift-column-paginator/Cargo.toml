@@ -1,0 +1,27 @@
+[package]
+license.workspace = true
+name = "skrift-column-paginator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository.workspace = true
+
+[dependencies]
+html.workspace = true
+html-view-cfi.workspace = true
+html-view-navigate.workspace = true
+html-view-paint.workspace = true
+html-view-types.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+smallvec = "1"
+web-time = "1"
+
+[dev-dependencies]
+html-parse = { package = "skrift-parse", path = "../../../HtmlEngine/crates/02-html-parse" }
+html-resources = { package = "skrift-resources", path = "../../../HtmlEngine/crates/html-resources" }
+html-style-model = { package = "skrift-style-model", path = "../../../HtmlEngine/crates/html-style-model" }
+html-engine-model = { package = "skrift-engine-model", path = "../../../HtmlEngine/crates/html-engine-model" }
+html-dom = { package = "skrift-dom", path = "../../../HtmlEngine/crates/html-dom" }
+html-render-core = { package = "skrift-render-core", path = "../../../HtmlEngine/crates/05-html-render-core" }
+html-pipeline = { package = "skrift-pipeline", path = "../../../HtmlEngine/crates/html-pipeline" }

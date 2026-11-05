@@ -1,0 +1,161 @@
+//! Background file access for navigation. The active page remains
+//! intact until preparation succeeds; a later navigation replaces pending work.
+use super::*;
+use html::PreparedDocument;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+struct PreparationCancellation(Arc<AtomicBool>);
+
+impl Drop for PreparationCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) enum NavigationRequest {
+    Cfi(String, bool),
+    Document(usize, DocAnchor),
+    DocumentJump(i8),
+    Href(String),
+    Click(crate::DocumentGlyph, Option<kurbo::Point>),
+    Preview(String),
+    Search(String),
+    Progress(f32),
+}
+pub(crate) struct PendingNavigation {
+    doc: usize,
+    action: NavigationRequest,
+    settings: load::DocumentLoadSettings,
+    receive: Receiver<Result<PreparedDocument, String>>,
+    _cancellation: PreparationCancellation,
+}
+
+impl PendingNavigation {
+    pub(crate) fn is_click(&self) -> bool {
+        matches!(self.action, NavigationRequest::Click(..))
+    }
+}
+
+impl RendererCore {
+    /// Local navigation supersedes a chapter read without waiting for its I/O.
+    /// Dropping the receiver discards the stale result when that read finishes.
+    pub(crate) fn cancel_pending_navigation(&mut self) {
+        if self.pending_navigation.take().is_some() {
+            self.effects.request_repaint();
+        }
+    }
+
+    pub(super) fn document_settings(&self) -> load::DocumentLoadSettings {
+        load::DocumentLoadSettings {
+            root_font_size: self.page.root_font_size(),
+            column_width: self.page.configuration().width(),
+            reader_overrides: self.page.configuration().reader_overrides().clone(),
+            image_sizing_policy: self.page.configuration().image_sizing_policy(),
+            text_composition_policy: self.page.configuration().text_composition_policy(),
+            note_display: self.note_display,
+        }
+    }
+
+    pub(crate) fn defer_document_read(&mut self, doc: usize, action: NavigationRequest) -> bool {
+        let Some(wake) = self.services.resource_waker.clone() else {
+            return false;
+        };
+        if self
+            .prepared_navigation
+            .as_ref()
+            .is_some_and(|(index, _)| *index == doc)
+        {
+            return false;
+        }
+        if doc == self.nav.current_document() {
+            self.pending_navigation = None;
+            return false;
+        }
+        let Some(uri) = self.nav.document_uris().get(doc).cloned() else {
+            return false;
+        };
+        if let Some(pending) = &mut self.pending_navigation {
+            if pending.doc == doc {
+                pending.action = action;
+                return true;
+            }
+        }
+        let settings = self.document_settings();
+        let work_settings = settings.clone();
+        let provider = self.provider.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.pending_navigation = Some(PendingNavigation {
+            doc,
+            action,
+            settings,
+            receive,
+            _cancellation: PreparationCancellation(cancelled.clone()),
+        });
+        self.services.chapter_preparation.spawn(Box::new(move || {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = load::prepare_document_with_settings(provider, &uri, work_settings);
+            if send.send(result).is_ok() {
+                wake();
+            }
+        }));
+        true
+    }
+
+    pub(crate) fn finish_pending_navigation(&mut self, shaper: &mut impl GlyphShaper) {
+        let Some(pending) = &self.pending_navigation else {
+            return;
+        };
+        let result = match pending.receive.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("document preparation worker stopped".into()),
+        };
+        let pending = self.pending_navigation.take().unwrap();
+        let settings = self.document_settings();
+        if settings != pending.settings {
+            self.defer_document_read(pending.doc, pending.action);
+            return;
+        }
+
+        let loaded =
+            match result.and_then(|prepared| self.finish_prepared_document(shaper, prepared)) {
+                Ok(loaded) => loaded,
+                Err(message) => {
+                    self.emit_operation_failed(crate::RendererOperation::UpdateDocument, message);
+                    return;
+                }
+            };
+        self.prepared_navigation = Some((pending.doc, loaded));
+        match pending.action {
+            NavigationRequest::Cfi(cfi, record_jump) => {
+                self.navigate_cfi(shaper, &cfi, record_jump);
+            }
+            NavigationRequest::Document(doc, anchor) => self.load_document_at(shaper, doc, anchor),
+            NavigationRequest::DocumentJump(step) => self.navigate_document_jump(shaper, step),
+            NavigationRequest::Href(href) => {
+                self.navigate_to_href(shaper, &href);
+            }
+            NavigationRequest::Click(hit, point) => {
+                self.handle_document_click(shaper, hit, point);
+            }
+            NavigationRequest::Progress(fraction) => self.set_progress_fraction(shaper, fraction),
+            NavigationRequest::Search(query) => {
+                if self.highlight.query() == query {
+                    self.navigate_to_book_match(shaper);
+                }
+            }
+            NavigationRequest::Preview(href) => {
+                if let Some(preview) = self.footnote_preview(shaper, &href) {
+                    self.effects.emit(RendererEvent::FootnoteOpened(preview));
+                }
+            }
+        }
+        self.prepared_navigation = None;
+
+        self.effects.request_repaint();
+    }
+}

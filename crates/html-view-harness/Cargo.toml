@@ -1,4 +1,5 @@
 [package]
+license.workspace = true
 name = "html-view-harness"
 version = "0.1.0"
 edition = "2024"
@@ -15,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 html.workspace = true
-html-view-core.workspace = true
+skrift-column-paginator.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 fontdue = "0.9"

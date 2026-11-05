@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["html-view-gpui"]
+
+[workspace.dependencies]
+skrift-column-paginator = { path = "../crates/skrift-column-paginator" }
+html-gpui = { path = "../../HtmlEngine/adapters/html-gpui" }
+kurbo = "0.11.3"
+gpui = { path = "../../GPUI-Fork/crates/gpui", version = "=0.2.2", default-features = false }
+gpui_platform = { path = "../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }

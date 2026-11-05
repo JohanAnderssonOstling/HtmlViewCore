@@ -5,24 +5,40 @@
 
 use std::rc::Rc;
 
+use html::document::ImageId;
 use html::render::Painter;
 use kurbo::{Point, Rect};
 use peniko::Color;
 
-use crate::text::{FontShaper, GlyphRaster};
+use crate::text::{FontShaper, GlyphRaster, RasterCache};
 
 pub struct BufferPainter<'a> {
     buffer: &'a mut [u32],
     width: usize,
     height: usize,
     shaper: &'a FontShaper,
+    rasters: &'a mut RasterCache,
     clips: Vec<Rect>,
     offset: Point,
 }
 
 impl<'a> BufferPainter<'a> {
-    pub fn new(buffer: &'a mut [u32], width: usize, height: usize, shaper: &'a FontShaper) -> Self {
-        Self { buffer, width, height, shaper, clips: Vec::new(), offset: Point::ZERO }
+    pub fn new(
+        buffer: &'a mut [u32],
+        width: usize,
+        height: usize,
+        shaper: &'a FontShaper,
+        rasters: &'a mut RasterCache,
+    ) -> Self {
+        Self {
+            buffer,
+            width,
+            height,
+            shaper,
+            rasters,
+            clips: Vec::new(),
+            offset: Point::ZERO,
+        }
     }
 
     pub fn set_offset(&mut self, offset: Point) {
@@ -87,7 +103,7 @@ impl<'a> BufferPainter<'a> {
     pub fn label(&mut self, text: &str, x: f64, baseline: f64, size: f32, color: Color) {
         let mut pen = x;
         for ch in text.chars() {
-            let (advance, raster) = self.shaper.label_glyph(ch, size);
+            let (advance, raster) = self.shaper.label_glyph(ch, size, self.rasters);
             self.blit(&raster, Point::new(pen, baseline), color);
             pen += f64::from(advance);
         }
@@ -113,12 +129,10 @@ impl Painter for BufferPainter<'_> {
         self.fill(rect, color);
     }
 
-    fn draw_glyph(&mut self, glyph: html::layout::GlyphId, origin: Point) {
-        self.draw_glyph_with_color(glyph, origin, 0x1a1a1aff);
-    }
-
-    fn draw_glyph_with_color(&mut self, glyph: html::layout::GlyphId, origin: Point, color: u32) {
-        let Some(raster) = self.shaper.raster(glyph) else { return };
+    fn draw_glyph(&mut self, glyph: html::text::GlyphHandle, origin: Point, color: u32) {
+        let Some(raster) = self.shaper.raster(glyph, self.rasters) else {
+            return;
+        };
         let [red, green, blue, alpha] = color.to_be_bytes();
         self.blit(&raster, origin + self.offset.to_vec2(), Color::rgba8(red, green, blue, alpha));
     }
@@ -127,7 +141,7 @@ impl Painter for BufferPainter<'_> {
         self.fill(rect, Color::rgba8(0x99, 0x99, 0x99, 0x40));
     }
 
-    fn draw_resource_image(&mut self, _image_idx: u32, _uri: Option<&str>, rect: Rect) {
+    fn draw_resource_image(&mut self, _image: ImageId, _uri: Option<&str>, rect: Rect) {
         self.fill(rect, Color::rgba8(0x99, 0x99, 0x99, 0x40));
     }
 }

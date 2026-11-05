@@ -20,7 +20,7 @@ parsing.
 | declaration | |
 | --- | --- |
 | `Cargo.toml:20` | `scraper = "0.27"` (workspace dependency) |
-| `crates/html-view-core/Cargo.toml:21` | `scraper.workspace = true` |
+| `crates/skrift-column-paginator/Cargo.toml:21` | `scraper.workspace = true` |
 
 No other crate depends on it. `html-view-doc`, `-paginate`, `-paint`,
 `-select`, `-navigate`, `-types`, `-cfi` and `-load` are already clean.
