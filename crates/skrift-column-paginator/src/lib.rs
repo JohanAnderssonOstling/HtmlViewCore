@@ -58,7 +58,7 @@ pub mod text_backend {
         GlyphResourceGeneration, GlyphShaper, ShapeError, ShapedGlyph};
 }
 
-pub use html::reading::ReadingTarget;
+pub use html::reading::{ReadingFragment, ReadingTarget};
 use html::render::Painter;
 
 mod session;
