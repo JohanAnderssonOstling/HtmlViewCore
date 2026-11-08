@@ -5,7 +5,7 @@ use html::configuration::{DocumentUpdate, Update};
 use html::layout::LineId;
 use html::layout::RenderView;
 use html::pagination::PageRequest;
-use std::mem::{discriminant, replace};
+use std::mem::discriminant;
 use std::sync::Arc;
 
 use html_view_navigate::NavigationState;
@@ -18,11 +18,11 @@ use html_view_types::{
 };
 pub use html_view_types::{
     AnnotationStyle, BookSearchMatch, BookSearchResults, BookSearchTarget, ClipboardWrite, Color,
-    DisplayCacheKey, FontLoadRequest, FootnotePopupAnchor,
-    FootnotePreview, FrameDisplayCacheKeys, FrameGeometryCacheKey, InteractionPalette,
-    NoteDisplay, PopupAnchorCorner, ReaderPaintPalette, ReadingPosition, RendererAnnotation,
-    RendererCommand, RendererEffects, RendererEvent, RendererInitialConfig, RendererOperation,
-    RendererRevisions, RendererServices, SearchOptions, SearchScope, SourcePosition,
+    DisplayCacheKey, FontLoadRequest, FootnotePopupAnchor, FootnotePreview, FrameDisplayCacheKeys,
+    FrameGeometryCacheKey, InteractionPalette, NoteDisplay, PopupAnchorCorner, ReaderPaintPalette,
+    ReadingPosition, RendererAnnotation, RendererCommand, RendererEffects, RendererEvent,
+    RendererInitialConfig, RendererOperation, RendererRevisions, RendererServices, SearchOptions,
+    SearchScope, SourcePosition,
 };
 use kurbo::Point;
 #[cfg(test)]
@@ -54,8 +54,10 @@ mod spine_item;
 /// Renderer-neutral text backend contract. UI adapters should use this module
 /// rather than importing layout or CSS model types.
 pub mod text_backend {
-    pub use html::text::{FontMetrics, FontSlant, GlyphHandle, GlyphRequest,
-        GlyphResourceGeneration, GlyphShaper, ShapeError, ShapedGlyph};
+    pub use html::text::{
+        FontMetrics, FontSlant, GlyphHandle, ShapedRun, TextRunShapeRequest,
+        GlyphResourceGeneration, GlyphShaper, ShapedGlyph,
+    };
 }
 
 pub use html::reading::{ReadingFragment, ReadingTarget};
@@ -252,7 +254,9 @@ impl RendererCore {
             page_request: (
                 discriminant(&request),
                 match request {
-                    PageRequest::StartingAt(cursor) | PageRequest::EndingAt(cursor) => cursor as u64,
+                    PageRequest::StartingAt(cursor) | PageRequest::EndingAt(cursor) => {
+                        cursor as u64
+                    }
                     PageRequest::StartingAtOffset(offset) | PageRequest::EndingAtOffset(offset) => {
                         offset.to_bits()
                     }
@@ -287,18 +291,6 @@ impl RendererCore {
     fn from_layout_point(&self, position: Point) -> Point {
         let scale = self.page.layout.scale;
         Point::new(position.x * scale, position.y * scale)
-    }
-
-    pub fn activate_link_cursor(&mut self) {
-        if !replace(&mut self.page.link_hovered, true) {
-            self.effects.request_restyle();
-        }
-    }
-
-    pub fn deactivate_link_cursor(&mut self) {
-        if replace(&mut self.page.link_hovered, false) {
-            self.effects.request_restyle();
-        }
     }
 
     pub(crate) fn emit_operation_failed(&mut self, operation: RendererOperation, message: String) {
@@ -424,18 +416,30 @@ impl RendererCore {
         request_repaint: bool,
     ) -> Result<(), Error> {
         let anchor = self.nav.reflow_anchor(self.nav_view());
+        let previous_font_faces = self.page.session.font_faces();
+        let previously_used_publication_fonts = self
+            .page
+            .configuration()
+            .reader_overrides()
+            .uses_publication_fonts();
         let before = self.page.session.revisions();
         let update = self.page.session.apply(requested_inputs, glyph_shaper)?;
         let after = self.page.session.revisions();
-        self.effects.font_loads.push(FontLoadRequest {
-            faces: self.page.session.font_faces(),
-            use_publication_fonts: self
-                .page
-                .configuration()
-                .reader_overrides()
-                .uses_publication_fonts(),
-            provider: self.provider.clone(),
-        });
+        let faces = self.page.session.font_faces();
+        let use_publication_fonts = self
+            .page
+            .configuration()
+            .reader_overrides()
+            .uses_publication_fonts();
+        if use_publication_fonts != previously_used_publication_fonts
+            || (!Arc::ptr_eq(&faces, &previous_font_faces) && faces != previous_font_faces)
+        {
+            self.effects.font_loads.push(FontLoadRequest {
+                faces,
+                use_publication_fonts,
+                provider: self.provider.clone(),
+            });
+        }
 
         self.page.session.render_view().ok_or_else(|| {
             Error::message("pipeline update completed without a laid-out document")
@@ -649,6 +653,9 @@ impl RendererCore {
                 if self.reader_palette != palette {
                     self.reader_palette = palette;
                     self.request_base_repaint();
+                    if self.page.selection.link_hovered() {
+                        self.request_overlay_repaint();
+                    }
                 }
             }
             RendererCommand::SetScale(scale) => self.set_scale(scale),
@@ -672,6 +679,10 @@ impl RendererCore {
             RendererCommand::SetAnnotations(annotations) => {
                 self.annotations.replace(annotations);
                 self.resolve_visible_annotations();
+                self.request_overlay_repaint();
+            }
+            RendererCommand::SetActiveAnnotation(id) => {
+                self.annotations.set_active(id);
                 self.request_overlay_repaint();
             }
             RendererCommand::UpsertAnnotation(annotation) => {
@@ -863,10 +874,8 @@ impl RendererCore {
     /// Projects search results onto the loaded document without reading another
     /// file or changing the viewport. Navigation uses the same source mapping.
     fn refresh_visible_search_matches(&mut self) {
-        self.highlight.refresh_visible_matches(
-            self.nav.current_document(),
-            self.page.render_view(),
-        );
+        self.highlight
+            .refresh_visible_matches(self.nav.current_document(), self.page.render_view());
         self.focus_current_search_match();
         if self.highlight.options().scope == SearchScope::CurrentDocument {
             self.highlight.emit_results(&mut self.effects);

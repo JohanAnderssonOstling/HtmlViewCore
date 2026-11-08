@@ -5,7 +5,8 @@ use super::*;
 impl RendererCore {
     pub(crate) fn resolve_href_target(&self, href: &str) -> Option<(usize, Option<String>)> {
         let resolved = self.page.session.resolve_link(href)?;
-        let document = if href.is_empty() || href.starts_with('#') {
+        let document = if resolved.resource == self.nav.document_uris()[self.nav.current_document()]
+        {
             self.nav.current_document()
         } else {
             let mut matches = self

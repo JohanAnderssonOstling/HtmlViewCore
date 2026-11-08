@@ -75,17 +75,14 @@ impl RendererCore {
             }
             false
         });
-        // Keep the open scope across image-only relayout of its page. A
-        // cross-document popup owns the active native resources, so postpone
-        // page geometry work until that popup closes.
+        // Scopes own their engine registrations; page and popup layout can
+        // update independently while sharing the caller's native cache.
         let mut note = self.note.take();
-        let cross_document = note.as_ref().is_some_and(|note| note.owner.is_some());
         let image_poll = self.page.session.poll_resources();
         if image_poll.decoded {
             self.revisions.invalidate_resources();
         }
         if image_poll.layout_needed
-            && !cross_document
             && let Err(error) =
                 self.apply_document_update_without_repaint(DocumentUpdate::default(), glyph_shaper)
         {
@@ -124,6 +121,7 @@ impl RendererCore {
         self.configure_layout_for_viewport_impl(viewport_size);
         let requested_geometry = self.frame_geometry_cache_key();
         if previous_geometry != Some(requested_geometry) {
+            self.interact_selection(SelectionInput::PointerLeave);
             if previous_geometry
                 .is_some_and(|previous| can_reproject_width_only(previous, requested_geometry))
             {

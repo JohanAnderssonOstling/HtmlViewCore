@@ -11,9 +11,8 @@
 use html::reading::ReadingTarget;
 use html::render::{DocumentPainter, OverlayPaintScratch, Painter, SceneImagePolicy, TextOverlay};
 use html::search::DocumentSearch;
-use html::selection::SelectionPaintScratch;
+use html::selection::{SelectionPaintScratch, SelectionPaintStyle};
 use html::targets::TextQuote;
-
 
 use html::resources::DecodedImages;
 use html::layout::RenderView;
@@ -32,6 +31,8 @@ use std::sync::Arc;
 pub struct AnnotationOverlayState {
     source: Vec<RendererAnnotation>,
     resolved: Vec<ResolvedAnnotation>,
+    painted: Vec<ResolvedAnnotation>,
+    active_id: Option<String>,
 }
 
 struct ResolvedAnnotation {
@@ -238,17 +239,20 @@ impl AnnotationOverlayState {
     pub fn replace(&mut self, annotations: Vec<RendererAnnotation>) {
         self.source = annotations;
         self.resolved.clear();
+        self.painted.clear();
     }
 
     pub fn upsert(&mut self, annotation: RendererAnnotation) {
         self.source.retain(|item| item.id != annotation.id);
         self.source.push(annotation);
         self.resolved.clear();
+        self.painted.clear();
     }
 
     pub fn remove(&mut self, id: &str) {
         self.source.retain(|item| item.id != id);
         self.resolved.clear();
+        self.painted.clear();
     }
 
     pub fn resolve_with_cfi(
@@ -283,6 +287,69 @@ impl AnnotationOverlayState {
             });
         self.resolved.clear();
         self.resolved.extend(entries);
+        self.rebuild_paint();
+    }
+
+    pub fn set_active(&mut self, id: Option<String>) {
+        self.active_id = id;
+        self.rebuild_paint();
+    }
+
+    /// Keep all hit targets, but paint each overlapping group with one stable
+    /// appearance. The open note takes precedence only across its own range.
+    fn rebuild_paint(&mut self) {
+        self.painted.clear();
+        let mut entries = self.resolved.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.range.start, entry.range.end));
+        let mut start = 0;
+        while start < entries.len() {
+            let mut end = start + 1;
+            let mut range = entries[start].range.clone();
+            while end < entries.len() && entries[end].range.start < range.end {
+                range.end = range.end.max(entries[end].range.end);
+                end += 1;
+            }
+            let group = &entries[start..end];
+            let source_index = group.iter().map(|entry| entry.source_index).min().unwrap();
+            let active = group.iter().find(|entry| {
+                Some(self.source[entry.source_index].id.as_str()) == self.active_id.as_deref()
+            });
+            if let Some(active) = active {
+                if range.start < active.range.start {
+                    self.painted.push(ResolvedAnnotation {
+                        source_index,
+                        range: range.start..active.range.start,
+                    });
+                }
+                self.painted.push(ResolvedAnnotation {
+                    source_index: active.source_index,
+                    range: active.range.clone(),
+                });
+                if active.range.end < range.end {
+                    self.painted.push(ResolvedAnnotation {
+                        source_index,
+                        range: active.range.end..range.end,
+                    });
+                }
+            } else {
+                self.painted.push(ResolvedAnnotation {
+                    source_index,
+                    range,
+                });
+            }
+            start = end;
+        }
+    }
+
+    pub fn overlapping_ids(&self, id: &str) -> Vec<String> {
+        let Some(range) = self.glyph_range(id) else {
+            return Vec::new();
+        };
+        self.resolved
+            .iter()
+            .filter(|entry| entry.range.start < range.end && range.start < entry.range.end)
+            .map(|entry| self.source[entry.source_index].id.clone())
+            .collect()
     }
 
     /// The glyph range an annotation occupies in the document on screen, if it
@@ -424,7 +491,7 @@ impl<'a> PagePainter<'a> {
                 style: AnnotationStyle::Highlight,
                 color: self.interaction_palette.reading,
             });
-        let annotations = self.annotations.resolved.iter().map(|entry| {
+        let annotations = self.annotations.painted.iter().map(|entry| {
             let annotation = &self.annotations.source[entry.source_index];
             let rgba = annotation.color;
             TextOverlay {
@@ -433,14 +500,29 @@ impl<'a> PagePainter<'a> {
                 color: Color::rgba8(rgba[0], rgba[1], rgba[2], rgba[3]),
             }
         });
-        self.geo
-            .paint_overlays(search.chain(reading).chain(annotations), cx, ranges);
+        let active = self
+            .annotations
+            .active_id
+            .as_deref()
+            .and_then(|id| self.annotations.glyph_range(id))
+            .map(|range| TextOverlay {
+                range,
+                style: AnnotationStyle::Underline,
+                color: self.interaction_palette.active_annotation,
+            });
+        self.geo.paint_overlays(
+            search.chain(reading).chain(annotations).chain(active),
+            cx,
+            ranges,
+        );
         self.geo.paint_selection(
             self.selection,
-            self.interaction_palette.selection,
+            SelectionPaintStyle {
+                selection: self.interaction_palette.selection,
+                hover_foreground: self.reader_palette.foreground,
+            },
             cx,
             selection_scratch,
         );
     }
-
 }

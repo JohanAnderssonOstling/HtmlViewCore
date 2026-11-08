@@ -13,7 +13,7 @@ use html_pipeline::engine::reading_queries;
 use html::pagination::PageRequest;
 use html::reading::ReadingOrigin;
 use html::targets::ElementTarget;
-use html::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::engine::text_paint;
 use html_render_core::RecordingPainter;
 #[path = "tests/chapter_start.rs"]
@@ -33,7 +33,7 @@ use kurbo::{Point, Size};
 
 use crate::cfi::PublicationCfi;
 use html::search::SearchIndex;
-use crate::text_backend::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError};
+use crate::text_backend::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper};
 #[cfg(test)]
 use html_pipeline::engine::GlyphResourceStore;
 use crate::{
@@ -52,61 +52,34 @@ fn selected_markdown(core: &RendererCore) -> Option<String> {
 struct TestShaper {
     glyphs: HashMap<(char, u32), GlyphHandle>,
     generation: GlyphResourceGeneration,
-    append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     next_id: GlyphHandle,
-    reject_glyphs: bool,
 }
 
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.glyphs.clear();
-        self.generation = GlyphResourceGeneration::default();
-        self.next_id = GlyphHandle(0);
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-            self.glyphs = glyphs;
-            self.generation = glyph_store;
-            self.next_id = GlyphHandle(self.glyphs.len() as u32);
-        }
-    }
-
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        if self.reject_glyphs {
-            return Err(shaping_contracts::shape_error_registry_capacity_exhausted(self.glyphs.len()));
-        }
-        let key = (request.character, request.style.font_size.to_bits());
-        let advance = request.style.font_size * 0.5;
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.glyphs.len() as u32);
-        assert_eq!(
-            glyph, self.next_id,
-            "native glyph cache and handle counter diverged"
-        );
-        self.next_id.0 += 1;
-        self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let key = (character, style.font_size.to_bits());
+            let advance = style.font_size * 0.5;
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
+            assert_eq!(
+                glyph, self.next_id,
+                "native glyph cache and handle counter diverged"
+            );
+            self.next_id.0 += 1;
+            self.glyphs.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 
@@ -3823,49 +3796,6 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
     std::fs::remove_dir_all(fixture).unwrap();
 }
 
-#[test]
-fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
-    let (provider, _) = CountingProvider::new(vec![(
-        "doc.html",
-        "<html><body><p>Transactional settings</p></body></html>",
-    )]);
-    let provider: Arc<dyn crate::ResourceProvider> = provider;
-    let mut shaper = TestShaper::default();
-    let mut options = DocumentOptions::new(600.0)
-        .unwrap()
-        .with_root_font_size(16.0)
-        .unwrap();
-    options.image_sizing_policy = ImageSizingPolicy::SmartStandalone;
-    options.text_composition_policy = TextCompositionPolicy::BookOptimized;
-    options.note_flow = NoteFlow::Excluded;
-    let loaded = Document::load(provider.clone(), "doc.html", options, &mut shaper)
-        .expect("fixture document must load");
-    let services = RendererServices::default();
-    let mut core = RendererCore::new(
-        services.clone(),
-        loaded,
-        provider,
-        vec!["doc.html".to_owned()],
-        0,
-        RendererInitialConfig::default(),
-    );
-    let committed_size = core.page.root_font_size();
-    let committed_input_size = core.page.configuration().font_size();
-    core.effects.events.clear();
-
-    shaper.reject_glyphs = true;
-    core.set_root_font_size(&mut shaper, 24.0);
-
-    assert_eq!(core.page.root_font_size(), committed_size);
-    assert_eq!(core.page.configuration().font_size(), committed_input_size);
-    let events = &core.effects.events;
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RendererEvent::FontSizeChanged(size) if *size == 24.0))
-    );
-    assert!(events.iter().any(|event| matches!(event, RendererEvent::OperationFailed { operation: RendererOperation::UpdateDocument, message } if !message.is_empty())));
-}
 
 #[test]
 fn pre_frame_relayout_preserves_the_document_start_before_the_first_glyph() {
@@ -6218,7 +6148,6 @@ fn reader_color_update_preserves_chapter_text_selection_and_geometry() {
     let layout_revision = core.revisions.layout;
     let display_revision = core.revisions.base_display;
     let line_count = core.page.render_view().text().line_count();
-    shaper.reject_glyphs = true;
     core.apply(
         &mut shaper,
         crate::RendererCommand::SetReaderStyleOverrides(html::style::ReaderStyleOverrides {

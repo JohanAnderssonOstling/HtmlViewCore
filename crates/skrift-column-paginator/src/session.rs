@@ -12,9 +12,10 @@ use html::export::{ExportRequest, TableExportFormat};
 #[cfg(test)]
 use html::layout::BoxId;
 use html::selection::{SelectionInput, SelectionKind, SelectionOutcome, SelectionUnit};
+#[cfg(test)]
 use html::text::GlyphResourceGeneration;
 #[cfg(test)]
-use html::text::{GlyphRequest, FontMetrics, ShapedGlyph};
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use std::ops::Range;
 use std::sync::Arc;
 use web_time::Instant;
@@ -22,9 +23,9 @@ use web_time::Instant;
 use kurbo::{Point, Rect, Size};
 
 use crate::{
-    ClipboardWrite, FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, Painter,
-    ReadingTarget, RendererCommand, RendererCore, RendererEffects,
-    RendererOperation, RendererRevisions, RendererServices, ResourceProvider,
+    ClipboardWrite, FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, Painter, ReadingTarget,
+    RendererCommand, RendererCore, RendererEffects, RendererOperation, RendererRevisions,
+    RendererServices, ResourceProvider,
 };
 
 pub use html::pagination::PageReadingLine as ReadingLine;
@@ -149,13 +150,39 @@ impl<S: GlyphShaper> RendererSession<S> {
         .handled
     }
 
-    pub fn note_pointer_move(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        self.interact_note(SelectionInput::PointerMove {
+    pub fn note_pointer_move(
+        &mut self,
+        position: Point,
+        mode: crate::SelectionMode,
+        pressed: bool,
+        hovered: bool,
+    ) -> bool {
+        // A release outside the window may never deliver PointerUp. Finish
+        // before hit testing so re-entry cannot extend that old gesture.
+        let finished = !pressed && self.interact_note(SelectionInput::Finish).handled;
+        if !hovered {
+            let leave = self.interact_note(SelectionInput::PointerLeave);
+            if !leave.dragging {
+                return finished || leave.changed;
+            }
+        }
+        let outcome = self.interact_note(SelectionInput::PointerMove {
             position,
             mode,
             drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
-        })
-        .handled
+        });
+        let left = !hovered && self.note_pointer_leave();
+        finished || outcome.handled || outcome.changed || left
+    }
+
+    pub fn note_pointer_leave(&mut self) -> bool {
+        self.interact_note(SelectionInput::PointerLeave).changed
+    }
+
+    pub fn note_link_cursor_active(&self) -> bool {
+        self.core
+            .note_parts()
+            .is_some_and(|(note, _)| note.link_hovered())
     }
 
     pub fn note_pointer_up(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
@@ -171,7 +198,11 @@ impl<S: GlyphShaper> RendererSession<S> {
         let Some((note, owner)) = self.core.note_parts_mut() else {
             return SelectionOutcome::default();
         };
-        note.interact(owner, input)
+        let outcome = note.interact(owner, input);
+        if outcome.changed {
+            self.core.request_overlay_repaint();
+        }
+        outcome
     }
 
     /// Text currently selected inside the note, for the host to copy.
@@ -256,6 +287,11 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.selection_bounds()
     }
 
+    /// Every annotation sharing text with the supplied annotation.
+    pub fn overlapping_annotation_ids(&self, id: &str) -> Vec<String> {
+        self.core.overlapping_annotation_ids(id)
+    }
+
     /// Where an annotation sits on screen, for the same reason.
     pub fn annotation_bounds(&self, id: &str) -> Option<kurbo::Rect> {
         self.core.annotation_bounds(id)
@@ -294,9 +330,11 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn visible_page_key(&self) -> Option<(usize, crate::FrameGeometryCacheKey)> {
-        Some((self.reading_document()?, self.core.page.frame.geometry_key()?))
+        Some((
+            self.reading_document()?,
+            self.core.page.frame.geometry_key()?,
+        ))
     }
-
 
     /// Match visible source text without exposing extraction or offset mapping.
     pub fn match_visible_text(
@@ -327,16 +365,6 @@ impl<S: GlyphShaper> RendererSession<S> {
         &mut self.glyph_shaper
     }
 
-    pub fn document_resource_generation(&self) -> GlyphResourceGeneration {
-        self.core.page.session.glyph_resource_generation()
-    }
-
-    pub fn note_resource_generation(&self) -> Option<GlyphResourceGeneration> {
-        self.core
-            .note_parts()
-            .map(|(_, owner)| owner.glyph_resource_generation())
-    }
-
     pub fn revisions(&self) -> RendererRevisions {
         self.core.revisions
     }
@@ -344,7 +372,11 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// Returns whether visible resources are still being loaded or decoded.
     pub fn has_pending_resources(&self) -> bool {
         self.core.page.session.resources_pending()
-            || self.core.note.as_ref().and_then(|note| note.owner.as_ref())
+            || self
+                .core
+                .note
+                .as_ref()
+                .and_then(|note| note.owner.as_ref())
                 .is_some_and(|owner| owner.resources_pending())
     }
 
@@ -670,32 +702,28 @@ impl<S: GlyphShaper> RendererSession<S> {
         outcome
     }
 
-    /// Updates both link hover state and an active selection.
+    /// Updates hover and selection using the current primary-button state.
+    /// A missed release finishes the old gesture before movement is hit tested.
     pub fn pointer_move(
         &mut self,
         position: Point,
         mode: crate::SelectionMode,
+        pressed: bool,
     ) -> PointerMoveOutcome {
-        let position = self.core.to_layout_point(position);
-        let was_over_link = self.core.page.link_hovered;
-        let over_link = self.core.link_at(position);
-        if over_link {
-            self.core.activate_link_cursor();
-        } else {
-            self.core.deactivate_link_cursor();
+        if !pressed && self.pointer_down_position.take().is_some() {
+            // Finish preserves the selection and cannot activate a link.
+            self.core.interact_selection(SelectionInput::Finish);
         }
-        let handled = self
-            .core
-            .interact_selection(SelectionInput::PointerMove {
-                position,
-                mode,
-                drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
-            })
-            .handled;
+        let position = self.core.to_layout_point(position);
+        let outcome = self.core.interact_selection(SelectionInput::PointerMove {
+            position,
+            mode,
+            drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
+        });
         PointerMoveOutcome {
-            handled,
-            over_link,
-            link_hover_changed: was_over_link != over_link,
+            handled: outcome.handled,
+            over_link: outcome.over_link,
+            link_hover_changed: outcome.hover_changed,
         }
     }
 
@@ -734,13 +762,13 @@ impl<S: GlyphShaper> RendererSession<S> {
         handled
     }
 
+    /// Clears hover while preserving a captured selection or click until release.
     pub fn pointer_leave(&mut self) {
-        self.pointer_down_position = None;
-        self.core.deactivate_link_cursor();
+        self.core.interact_selection(SelectionInput::PointerLeave);
     }
 
     pub fn link_cursor_active(&self) -> bool {
-        self.core.page.link_hovered
+        self.core.page.selection.link_hovered()
     }
 
     pub fn set_interaction_palette(&mut self, palette: InteractionPalette) {
@@ -906,12 +934,12 @@ mod tests {
     use html::style::{ReaderStyleOverrides, ThemeAdaptation};
     use html_resources::DecodedImage;
 
-    use crate::text_backend::{FontSlant, GlyphHandle, ShapeError};
+    use crate::text_backend::{FontSlant, GlyphHandle};
     use html_pipeline::engine::GlyphResourceStore;
     use crate::FileSystemProvider;
     use crate::RendererEvent;
     use html_render_core::RecordingPainter;
-    
+
     use peniko::{Color, Image};
 
     use super::*;
@@ -920,51 +948,30 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
         glyph_shape_calls: usize,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.glyph_shape_calls += 1;
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                self.glyph_shape_calls += 1;
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(&glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -1256,7 +1263,11 @@ mod tests {
         );
         assert!(
             renderer
-                .pointer_move(point_at(&renderer, "pha"), crate::SelectionMode::Plain)
+                .pointer_move(
+                    point_at(&renderer, "pha"),
+                    crate::SelectionMode::Plain,
+                    true
+                )
                 .handled
         );
         assert!(renderer.pointer_up(point_at(&renderer, "pha"), crate::SelectionMode::Plain));
@@ -1452,7 +1463,7 @@ mod tests {
             screen.point.y + line.height() / 2.0,
         );
 
-        let hover = renderer.pointer_move(position, crate::SelectionMode::Plain);
+        let hover = renderer.pointer_move(position, crate::SelectionMode::Plain, false);
         assert!(hover.over_link);
         assert!(hover.link_hover_changed);
         assert!(
@@ -1567,7 +1578,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         renderer.apply(RendererCommand::SetFontSize(16.0));
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
@@ -1616,7 +1628,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
         renderer.apply(RendererCommand::SetImageSizingPolicy(
@@ -1667,7 +1680,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
 
         renderer
             .prepare_frame(Size::new(600.0, 800.0))
@@ -1690,7 +1704,9 @@ mod tests {
             first_calls,
             "a position-only width resize must reuse shaped visible lines"
         );
-        renderer.apply(RendererCommand::SetColumnWidth(renderer.column_width() - 20.0));
+        renderer.apply(RendererCommand::SetColumnWidth(
+            renderer.column_width() - 20.0,
+        ));
         renderer
             .prepare_frame(Size::new(620.0, 800.0))
             .paint(&mut RecordingPainter::default());
@@ -1730,7 +1746,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         let viewport = Size::new(320.0, 96.0);
 
         renderer.prepare_frame(viewport);

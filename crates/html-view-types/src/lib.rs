@@ -257,6 +257,8 @@ pub enum RendererCommand {
     /// Selects a zero-based match directly, preserving next/previous navigation.
     NavigateSearchTo(usize),
     SetAnnotations(Vec<RendererAnnotation>),
+    /// Emphasize an open note while retaining every overlapping hit target.
+    SetActiveAnnotation(Option<String>),
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),

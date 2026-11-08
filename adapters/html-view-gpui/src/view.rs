@@ -22,25 +22,25 @@ use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase, Element,
     ElementId, Entity, EventEmitter, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior,
     ImageFormat, InspectorElementId, IntoElement, KeyContext, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point as GpuiPoint, Render, ScrollDelta,
-    ScrollWheelEvent, Style, Window, WindowTextSystem, relative,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point as GpuiPoint,
+    Render, ScrollDelta, ScrollWheelEvent, Style, Window, WindowTextSystem, relative,
 };
 use html::export::TableExportFormat;
+use html::reading::ReadingFragment;
 use image::RgbaImage;
 use kurbo::{Point, Size};
 use skrift_column_paginator::{
     BlockingJob, BlockingJobSpawner, ClipboardWrite, ContentHit, DisplayCacheKey, FontFace,
     FrameDisplayCacheKeys, FrameGeometryCacheKey, InteractionPalette, PointerDownOptions,
-    ReadingFragment, ReadingTarget, RendererCommand, RendererEffects, RendererEvent,
-    RendererServices, RendererSession, ResourceProvider, SelectionMode, VisibleTextMatches,
+    ReadingTarget, RendererCommand, RendererEffects, RendererEvent, RendererServices,
+    RendererSession, ResourceProvider, SelectionMode, VisibleTextMatches,
 };
 
 use gpui::AppContext;
 use html_gpui::TextShapeCacheStats;
-use skrift_column_paginator::text_backend::GlyphShaper;
 use html_gpui::backend::{
-    GpuiCommandPainter, GpuiScene, GpuiTextCache, GpuiTextResources, ImageCache, LoadedFontFace,
-    face_key, load_font_face,
+    GpuiCommandPainter, GpuiScene, GpuiTextCache, ImageCache, LoadedFontFace, face_key,
+    load_font_face,
 };
 
 /// A window point in the note's own coordinates, which is where its geometry
@@ -155,8 +155,12 @@ impl Element for HtmlNoteElement {
             prepaint.overlay.paint(bounds, window, cx);
         });
 
-        // Selecting in a note is the page's interaction applied to a second
-        // view, so the events it needs are the page's three.
+        if self.view.read(cx).renderer.note_link_cursor_active() {
+            window.set_cursor_style(CursorStyle::PointingHand, &prepaint.hitbox);
+        }
+
+        // Route movement outside the hitbox too: captured drags keep extending,
+        // while leaving the note clears its link hover.
         let origin = bounds.origin;
         let hitbox = prepaint.hitbox.clone();
         let target = self.view.clone();
@@ -180,25 +184,52 @@ impl Element for HtmlNoteElement {
         let hitbox = prepaint.hitbox.clone();
         let target = self.view.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+            if phase != DispatchPhase::Bubble {
                 return;
             }
-            let position = event.position;
-            let semantic = event.modifiers.control;
+            let hovered = hitbox.is_hovered(window);
             target.update(cx, |view, cx| {
-                if view.note_pointer_move(position, origin, semantic, cx) {
+                let changed = view.note_pointer_move(
+                    event.position,
+                    origin,
+                    event.modifiers.control,
+                    event.pressed_button == Some(MouseButton::Left),
+                    hovered,
+                    cx,
+                );
+                if changed {
                     cx.notify();
                 }
             });
         });
 
         let target = self.view.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            target.update(cx, |view, cx| {
+                if view.renderer.note_pointer_leave() {
+                    cx.notify();
+                }
+                view.flush_effects(cx);
+            });
+        });
+
+        let hitbox = prepaint.hitbox.clone();
+        let target = self.view.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                 return;
             }
             target.update(cx, |view, cx| {
-                if view.note_pointer_up(event.position, origin, event.modifiers.control, cx) {
+                let mut changed =
+                    view.note_pointer_up(event.position, origin, event.modifiers.control, cx);
+                if !hitbox.is_hovered(window) {
+                    changed |= view.renderer.note_pointer_leave();
+                    view.flush_effects(cx);
+                }
+                if changed {
                     cx.notify();
                 }
             });
@@ -220,7 +251,10 @@ struct HtmlDocumentPrepaint {
 
 enum HostMessage {
     ResourceReady,
-    FontLoaded { key: String, result: Result<LoadedFontFace, String> },
+    FontLoaded {
+        key: String,
+        result: Result<LoadedFontFace, String>,
+    },
 }
 
 struct GpuiHost {
@@ -267,11 +301,7 @@ impl GpuiHost {
     }
 
     /// Loads publication faces still needed by the reader's font policy.
-    fn prepare_font_faces(
-        &mut self,
-        faces: &[FontFace],
-        provider: Arc<dyn ResourceProvider>,
-    ) {
+    fn prepare_font_faces(&mut self, faces: &[FontFace], provider: Arc<dyn ResourceProvider>) {
         let pending = {
             let requested = &mut self.font_requests;
             faces
@@ -334,8 +364,6 @@ pub struct HtmlView {
     prepared_viewport: Option<Size>,
     visible_page_key: Option<(usize, FrameGeometryCacheKey)>,
     prepared_paint: Option<(FrameDisplayCacheKeys, PreparedPaint)>,
-    document_paint_resources: GpuiTextResources,
-    note_paint_resources: Option<GpuiTextResources>,
     display_dirty: bool,
     pointer_active: bool,
     pointer_tap_start: Option<(GpuiPoint<Pixels>, Instant, bool)>,
@@ -549,12 +577,35 @@ impl Element for HtmlDocumentElement {
                 return;
             }
             let pointer_active = mouse_move_target.read(cx).pointer_active;
-            if !pointer_active && !hitbox.is_hovered(window) {
+            let hovered = hitbox.is_hovered(window);
+            if !pointer_active && !hovered {
+                if mouse_move_target.read(cx).renderer.link_cursor_active() {
+                    mouse_move_target.update(cx, |view, cx| {
+                        view.renderer.pointer_leave();
+                        view.flush_effects(cx);
+                    });
+                }
                 return;
             }
             mouse_move_target.update(cx, |view, cx| {
                 view.on_mouse_move(event, window, cx);
+                if !hovered {
+                    view.renderer.pointer_leave();
+                    view.flush_effects(cx);
+                }
             });
+        });
+
+        let mouse_exit_target = self.view.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble
+                && mouse_exit_target.read(cx).renderer.link_cursor_active()
+            {
+                mouse_exit_target.update(cx, |view, cx| {
+                    view.renderer.pointer_leave();
+                    view.flush_effects(cx);
+                });
+            }
         });
 
         let mouse_up_target = self.view.clone();
@@ -602,9 +653,6 @@ pub struct DocumentTap;
 
 impl EventEmitter<RendererEvent> for HtmlView {}
 impl EventEmitter<DocumentTap> for HtmlView {}
-
-
-
 
 impl HtmlView {
     pub fn from_provider(
@@ -705,13 +753,10 @@ impl HtmlView {
             }
         })
         .detach();
-        let document_paint_resources = renderer.glyph_shaper().resources();
         let mut view = Self {
             host,
             renderer,
             effects: RendererEffects::default(),
-            document_paint_resources,
-            note_paint_resources: None,
             appearance: appearance::PendingAppearance::default(),
             focus,
             images: ImageCache::default(),
@@ -735,7 +780,8 @@ impl HtmlView {
         self.renderer.drain_effects(&mut self.effects);
         for request in self.effects.font_loads.drain(..) {
             if request.use_publication_fonts {
-                self.host.prepare_font_faces(&request.faces, request.provider);
+                self.host
+                    .prepare_font_faces(&request.faces, request.provider);
             }
         }
         for write in self.effects.clipboard.drain(..) {
@@ -775,25 +821,8 @@ impl HtmlView {
         }
     }
 
-    fn sync_paint_resources(&mut self) {
-        let shaper = self.renderer.glyph_shaper();
-        let generation = shaper.resource_generation();
-        if self.renderer.document_resource_generation() == generation {
-            self.document_paint_resources = shaper.resources();
-        }
-        match self.renderer.note_resource_generation() {
-            Some(note_generation) if note_generation == generation => {
-                self.note_paint_resources = Some(shaper.resources());
-            }
-            Some(_) => {}
-            None => self.note_paint_resources = None,
-        }
-    }
-
     pub fn apply(&mut self, command: RendererCommand, cx: &mut Context<Self>) {
-        self.sync_paint_resources();
         self.renderer.apply(command);
-        self.sync_paint_resources();
         self.flush_effects(cx);
     }
 
@@ -870,13 +899,11 @@ impl HtmlView {
     /// Opens the note a reference points at, as activating the reference
     /// would. Emits `FootnoteOpened` and reports whether a note was found.
     pub fn open_note(&mut self, href: &str, cx: &mut Context<Self>) -> bool {
-        self.sync_paint_resources();
         let preview = self.renderer.note_preview(href);
         self.flush_effects(cx);
         let Some(preview) = preview else {
             return false;
         };
-        self.sync_paint_resources();
         cx.emit(RendererEvent::FootnoteOpened(preview));
         true
     }
@@ -986,7 +1013,9 @@ impl HtmlView {
         position: GpuiPoint<Pixels>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let selected = self.renderer.select_element_at(self.document_point(position));
+        let selected = self
+            .renderer
+            .select_element_at(self.document_point(position));
         if selected {
             cx.notify();
         }
@@ -1111,7 +1140,8 @@ impl HtmlView {
         format: TableExportFormat,
         cx: &mut Context<Self>,
     ) -> bool {
-        let result = self.renderer
+        let result = self
+            .renderer
             .copy_table_at(self.document_point(position), format);
         self.flush_effects(cx);
         result
@@ -1141,6 +1171,11 @@ impl HtmlView {
         self.window_bounds(self.renderer.selection_bounds())
     }
 
+    /// Every annotation sharing text with the supplied annotation.
+    pub fn overlapping_annotation_ids(&self, id: &str) -> Vec<String> {
+        self.renderer.overlapping_annotation_ids(id)
+    }
+
     /// The same, for an annotation already drawn on the page.
     pub fn annotation_bounds(&self, id: &str) -> Option<Bounds<Pixels>> {
         self.window_bounds(self.renderer.annotation_bounds(id))
@@ -1161,25 +1196,12 @@ impl HtmlView {
     }
 
     pub fn text_shape_cache_stats(&self) -> TextShapeCacheStats {
-        self.renderer
-            .glyph_shaper()
-            .shape_cache_stats()
+        self.renderer.glyph_shaper().shape_cache_stats()
     }
 
-    /// Paints a note from a footnote preview into its own command buffer.
-    /// Its glyphs were shaped by this view's cache while the note was laid
-    /// out, so they resolve against the same store the page uses.
-    /// Turns a note into paint commands once, for an element to draw many
-    /// times. Call this when a note opens, never while rendering: it borrows
-    /// this view, which is itself in the tree being rendered.
-    ///
-    /// Height and paint order come from the engine's scene rather than from
-    /// anything worked out here.
-    /// The open note's selection highlight, rebuilt each frame because it
-    /// changes as the pointer drags.
+    /// Rebuild the open note's selection highlight as the pointer drags.
     fn prepare_note_overlay(&mut self) -> GpuiScene {
-        let mut painter =
-            GpuiCommandPainter::commands_only(self.renderer.glyph_shaper().resources());
+        let mut painter = GpuiCommandPainter::commands_only();
         self.renderer.paint_note_selection(&mut painter);
         painter.finish()
     }
@@ -1203,11 +1225,16 @@ impl HtmlView {
         position: GpuiPoint<Pixels>,
         origin: GpuiPoint<Pixels>,
         semantic: bool,
+        pressed: bool,
+        hovered: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let result = self
-            .renderer
-            .note_pointer_move(note_local(position, origin), selection_mode(semantic));
+        let result = self.renderer.note_pointer_move(
+            note_local(position, origin),
+            selection_mode(semantic),
+            pressed,
+            hovered,
+        );
         self.flush_effects(cx);
         result
     }
@@ -1237,22 +1264,14 @@ impl HtmlView {
 
     /// Drops the open note so nothing selected in it outlives the panel.
     pub fn close_note(&mut self, cx: &mut Context<Self>) {
-        self.sync_paint_resources();
         self.renderer.close_note();
-        self.sync_paint_resources();
-        self.note_paint_resources = None;
         self.flush_effects(cx);
     }
 
     pub fn prepare_note(&mut self) -> Option<PreparedNote> {
-        self.sync_paint_resources();
         let scene = self.renderer.note_scene()?;
-        let resources = self.note_paint_resources.as_ref()?;
-        if Some(resources.generation()) != self.renderer.note_resource_generation() {
-            return None;
-        }
-        let mut painter = GpuiCommandPainter::new(&mut self.images, resources.clone())
-            .image_theme(self.renderer.image_theme());
+        let mut painter =
+            GpuiCommandPainter::new(&mut self.images).image_theme(self.renderer.image_theme());
         scene.paint(&mut painter);
         let recorded = painter.finish();
         println!(
@@ -1282,9 +1301,7 @@ impl HtmlView {
                 .as_ref()
                 .map(|(_, paint)| paint.clone())
                 .unwrap_or_else(|| {
-                    let empty =
-                        GpuiCommandPainter::commands_only(self.renderer.glyph_shaper().resources())
-                            .finish();
+                    let empty = GpuiCommandPainter::commands_only().finish();
                     PreparedPaint {
                         base: empty.clone(),
                         overlay: empty,
@@ -1332,7 +1349,6 @@ impl HtmlView {
     /// Composes pagination and GPUI commands from retained document state.
     /// This may not poll resources or invoke the HTML pipeline.
     fn compose_viewport_display_list(&mut self, viewport: Size) -> PreparedPaint {
-        self.sync_paint_resources();
         let total_started = Instant::now();
         let renderer_started = Instant::now();
         let image_theme = self.renderer.image_theme();
@@ -1349,9 +1365,7 @@ impl HtmlView {
             .as_ref()
             .is_none_or(|(key, _)| *key != keys.base)
             .then(|| {
-                let painter =
-                    GpuiCommandPainter::new(&mut self.images, self.document_paint_resources.clone())
-                        .image_theme(image_theme);
+                let painter = GpuiCommandPainter::new(&mut self.images).image_theme(image_theme);
                 match base.take() {
                     Some((_, scene)) => painter.reusing(scene),
                     None => painter,
@@ -1361,7 +1375,7 @@ impl HtmlView {
             .as_ref()
             .is_none_or(|(key, _)| *key != keys.overlay)
             .then(|| {
-                let painter = GpuiCommandPainter::commands_only(self.document_paint_resources.clone());
+                let painter = GpuiCommandPainter::commands_only();
                 match overlay.take() {
                     Some((_, scene)) => painter.reusing(scene),
                     None => painter,
@@ -1398,7 +1412,6 @@ impl HtmlView {
     }
 
     fn handle_host_message(&mut self, message: HostMessage, cx: &mut Context<Self>) {
-        self.sync_paint_resources();
         {
             use std::cell::Cell;
             thread_local!(static COUNT: Cell<u64> = const { Cell::new(0) });
@@ -1424,7 +1437,9 @@ impl HtmlView {
             }
             HostMessage::FontLoaded { key, result } => {
                 let result = result.and_then(|loaded| {
-                    self.renderer.glyph_shaper_mut().register_publication_font(loaded)
+                    self.renderer
+                        .glyph_shaper_mut()
+                        .register_publication_font(loaded)
                 });
                 match result {
                     Ok(true) => {
@@ -1440,7 +1455,6 @@ impl HtmlView {
                 }
             }
         }
-        self.sync_paint_resources();
         self.flush_effects(cx);
     }
 
@@ -1489,10 +1503,15 @@ impl HtmlView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let pressed = event.pressed_button == Some(MouseButton::Left);
+        if !pressed {
+            self.pointer_active = false;
+            self.pointer_tap_start = None;
+        }
         let position = self.document_point(event.position);
-        let outcome = self
-            .renderer
-            .pointer_move(position, selection_mode(event.modifiers.control));
+        let outcome =
+            self.renderer
+                .pointer_move(position, selection_mode(event.modifiers.control), pressed);
         if outcome.link_hover_changed {
             cx.notify();
         }
@@ -1507,7 +1526,10 @@ impl HtmlView {
             return;
         }
         self.pointer_active = false;
-        let handled = self.renderer.pointer_up(self.document_point(event.position), selection_mode(event.modifiers.control));
+        let handled = self.renderer.pointer_up(
+            self.document_point(event.position),
+            selection_mode(event.modifiers.control),
+        );
         if let Some((start, started_at, image_hit)) = self.pointer_tap_start.take() {
             let moved = f32::from(event.position.x - start.x).abs() > 8.0
                 || f32::from(event.position.y - start.y).abs() > 8.0;
