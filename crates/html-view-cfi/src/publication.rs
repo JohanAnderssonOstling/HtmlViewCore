@@ -1,6 +1,7 @@
 //! Maps renderer document indices to the original EPUB package addresses.
 
 use html_view_types::SourcePosition;
+use crate::syntax::{Location, ParsedPath, package_steps, parse_fragment, synthetic_index};
 use std::collections::HashMap;
 
 /// `None` uses the synthetic document addresses of non-EPUB publications.
@@ -30,28 +31,38 @@ impl PublicationCfi {
     }
 
     pub fn to_publication(&self, internal: &str) -> Option<String> {
+        let fragment = parse_fragment(internal)?;
+        let document = synthetic_index(&fragment.package)?;
         let Some(bases) = &self.bases else {
             return Some(internal.to_owned());
         };
-        let (package, content) = split(internal)?;
-        let document = synthetic_index(package)?;
         let base = bases.get(document)?.as_deref()?;
-        Some(join(base, content))
+        package_steps(base)?;
+        Some(join(base, fragment.content))
     }
 
     pub fn to_internal(&self, publication: &str) -> Option<String> {
+        let fragment = parse_fragment(publication)?;
+        let document = self.index_for_package(&fragment.package)?;
         if self.bases.is_none() {
             return Some(publication.to_owned());
         }
-        let (package, content) = split(publication)?;
-        let steps = package_steps(package)?;
-        let document = *self.documents.get(&steps)?;
-        Some(join(&format!("/6/{}", (document + 1) * 2), content))
+        Some(join(
+            &format!("/6/{}", (document + 1) * 2),
+            fragment.content,
+        ))
     }
 
     pub fn document_index(&self, cfi: &str) -> Option<usize> {
-        let internal = self.to_internal(cfi)?;
-        synthetic_index(split(&internal)?.0)
+        self.index_for_package(&parse_fragment(cfi)?.package)
+    }
+
+    fn index_for_package(&self, package: &[usize]) -> Option<usize> {
+        if self.bases.is_none() {
+            synthetic_index(package)
+        } else {
+            self.documents.get(package).copied()
+        }
     }
 
     pub fn source_position_cfi(&self, position: &SourcePosition) -> Option<String> {
@@ -59,15 +70,17 @@ impl PublicationCfi {
     }
 
     pub fn parse_source_position(&self, cfi: &str) -> Option<SourcePosition> {
-        let internal = self.to_internal(cfi)?;
-        if split(&internal)?.1.is_none() {
-            return Some(SourcePosition {
-                document: self.document_index(cfi)?,
-                path: Vec::new(),
-                utf16_offset: None,
-            });
-        }
-        super::parse_source_position(&internal)
+        let fragment = parse_fragment(cfi)?;
+        let document = self.index_for_package(&fragment.package)?;
+        let path = match fragment.location {
+            Some(Location::Point(path) | Location::Range(path, _)) => path,
+            None => ParsedPath::default(),
+        };
+        Some(SourcePosition {
+            document,
+            path: path.steps,
+            utf16_offset: path.offset,
+        })
     }
 }
 
@@ -76,73 +89,6 @@ fn join(package: &str, content: Option<&str>) -> String {
         Some(content) => format!("epubcfi({package}!{content})"),
         None => format!("epubcfi({package})"),
     }
-}
-
-fn synthetic_index(package: &str) -> Option<usize> {
-    let steps = package_steps(package)?;
-    let [6, step] = steps.as_slice() else {
-        return None;
-    };
-    (*step >= 2 && step.is_multiple_of(2)).then(|| step / 2 - 1)
-}
-
-fn split(cfi: &str) -> Option<(&str, Option<&str>)> {
-    let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
-    let mut assertion = false;
-    let mut escaped = false;
-    for (index, ch) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '^' => escaped = true,
-            '[' if !assertion => assertion = true,
-            ']' if assertion => assertion = false,
-            '!' if !assertion => return Some((&inner[..index], Some(&inner[index + 1..]))),
-            _ => {}
-        }
-    }
-    (!assertion && !escaped).then_some((inner, None))
-}
-
-/// Ignore optional assertions when matching structurally equivalent addresses.
-fn package_steps(package: &str) -> Option<Vec<usize>> {
-    let mut plain = String::new();
-    let mut assertion = false;
-    let mut escaped = false;
-    for ch in package.chars() {
-        if escaped {
-            if !assertion {
-                return None;
-            }
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '^' if assertion => escaped = true,
-            '[' if !assertion => assertion = true,
-            ']' if assertion => assertion = false,
-            _ if assertion => {}
-            '/' | '0'..='9' => plain.push(ch),
-            _ => return None,
-        }
-    }
-    if assertion || escaped {
-        return None;
-    }
-    let steps = plain
-        .strip_prefix('/')?
-        .split('/')
-        .map(|step| {
-            if step.starts_with('0') {
-                return None;
-            }
-            let value = step.parse::<usize>().ok()?;
-            (value > 0 && value.is_multiple_of(2)).then_some(value)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    (!steps.is_empty()).then_some(steps)
 }
 
 #[cfg(test)]

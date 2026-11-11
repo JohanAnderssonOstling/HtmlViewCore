@@ -96,7 +96,7 @@ impl Reader {
             doc_index,
             None,
             config,
-        )?;
+        ).map_err(|error| error.to_string())?;
         session.set_note_popup_width(Some(336.0));
         Ok(Self {
             session,
@@ -302,18 +302,20 @@ impl ApplicationHandler for Harness {
                 self.pointer = Point::new(position.x, position.y);
                 if self.selecting_note {
                     if let Some(geometry) = self.popup_geometry {
-                        self.reader
-                            .session
-                            .note_pointer_move(
-                                geometry.local_point(self.pointer),
-                                SelectionMode::Plain,
-                            );
+                        self.reader.session.note_pointer_move(
+                            geometry.local_point(self.pointer),
+                            SelectionMode::Plain,
+                            self.selecting_note,
+                            geometry.contains(self.pointer),
+                        );
                     }
                     self.request_redraw();
                 } else if self.selecting {
-                    self.reader
-                        .session
-                        .pointer_move(self.pointer, SelectionMode::Plain);
+                    self.reader.session.pointer_move(
+                        self.pointer,
+                        SelectionMode::Plain,
+                        self.selecting,
+                    );
                     self.request_redraw();
                 }
             }

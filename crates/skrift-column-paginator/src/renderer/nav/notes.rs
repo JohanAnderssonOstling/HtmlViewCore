@@ -46,7 +46,16 @@ impl RendererCore {
             self.effects.emit(RendererEvent::FootnoteOpened(preview));
             return true;
         }
-        self.navigate_to_href(glyph_shaper, &href);
+        if self.resolve_href_target(&href).is_some() {
+            self.navigate_to_href(glyph_shaper, &href);
+        } else if let Some(link) = self.page.session.resolve_link(&href) {
+            let mut url = link.resource;
+            if let Some(fragment) = link.fragment {
+                url.push('#');
+                url.push_str(&fragment);
+            }
+            self.effects.emit(RendererEvent::ExternalLink(url));
+        }
         true
     }
 

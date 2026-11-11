@@ -257,6 +257,8 @@ pub enum RendererCommand {
     /// Selects a zero-based match directly, preserving next/previous navigation.
     NavigateSearchTo(usize),
     SetAnnotations(Vec<RendererAnnotation>),
+    /// Emphasize an open note while retaining every overlapping hit target.
+    SetActiveAnnotation(Option<String>),
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),
@@ -290,8 +292,18 @@ pub struct ReadingPosition {
     pub document_count: usize,
 }
 
+/// Image data already loaded by the document, or original encoded source bytes.
+#[derive(Clone, Debug)]
+pub enum OpenedImage {
+    Raster { width: usize, height: usize, rgba: Vec<u8> },
+    Svg { bytes: Vec<u8> },
+    Encoded { bytes: Vec<u8> },
+}
+
 #[derive(Clone, Debug)]
 pub enum RendererEvent {
+    /// A resolved link outside the supplied document list; the host opens it.
+    ExternalLink(String),
     /// The composed page changed, including a reflow at the same source anchor.
     VisiblePageChanged,
     /// A deliberate jump committed; emitted before its settled position.
@@ -323,11 +335,11 @@ pub enum RendererEvent {
     SpeakableText(String),
     ImageOpened {
         uri: String,
-        bytes: Vec<u8>,
+        image: OpenedImage,
     },
     OperationFailed {
         operation: RendererOperation,
-        message: String,
+        message: html::Error,
     },
 }
 
@@ -551,6 +563,7 @@ pub struct ColumnLayout {
     pub base_col_width: f64,
     pub col_count: f64,
     pub col_gap: f64,
+    pub min_col_gap: f64,
     pub size: Size,
     pub scale: f64,
     pub max_col_count: Option<u8>,
@@ -584,14 +597,19 @@ impl ColumnLayout {
 
     /// Derive column count and gap from the committed width and viewport.
     pub fn recompute_columns(&mut self) {
-        let raw_count = (self.size.width / self.col_width).floor();
+        let raw_count = ((self.size.width + self.min_col_gap)
+            / (self.col_width + self.min_col_gap))
+            .floor();
         self.col_count = self.max_col_count.map_or(raw_count.max(1.0), |maximum| {
             raw_count.max(1.0).min(f64::from(maximum))
         });
-        // Side margins belong to the host. Spread slack between multiple
-        // columns; a lone column is centered by `col_x` instead.
+        // Preserve the minimum gap, then share extra width across the inner
+        // gaps and both outer edges. `col_x` centers the resulting column group.
         self.col_gap = if self.col_count > 1.0 {
-            ((self.size.width - self.col_count * self.col_width) / (self.col_count - 1.0)).max(0.0)
+            let slack = (self.size.width - self.col_count * self.col_width
+                - (self.col_count - 1.0) * self.min_col_gap)
+                .max(0.0);
+            self.min_col_gap + slack / (self.col_count + 1.0)
         } else {
             0.0
         };
@@ -638,6 +656,7 @@ impl Default for ColumnLayout {
             base_col_width: 600.0,
             col_count: 0.0,
             col_gap: 0.0,
+            min_col_gap: 0.0,
             size: Size::ZERO,
             scale: 1.0,
             max_col_count: None,
@@ -647,7 +666,7 @@ impl Default for ColumnLayout {
 
 #[derive(Clone, Copy, Default)]
 pub struct ViewportState {
-    /// Composition to prepare, or the last installed page's resolved request.
+    /// Composition to prepare; completed backward turns resume from the page start.
     request: PageRequest,
     /// Viewport origin; backward requests retain it until a page is installed.
     start_offset_y: f64,
@@ -696,11 +715,21 @@ impl ViewportState {
         );
     }
 
-    /// Installs the resolved composition without interpreting its direction or
-    /// document boundaries. Continuation remains on the installed engine page.
+    /// Settles backward composition on the displayed start so later viewport
+    /// changes retain that start. Continuation remains on the installed engine page.
     pub fn install_page(&mut self, page: &PagePositions) {
         *self = Self {
-            request: page.request,
+            request: match page.request {
+                PageRequest::EndingAt(_) => {
+                    PageRequest::StartingAt(page.start_line)
+                }
+                PageRequest::EndingAtOffset(_) => {
+                    // The page can start inside an oversized group's content.
+                    // A cursor alone would restart that group after a resize.
+                    PageRequest::StartingAtOffset(page.paint_start_offset_y)
+                }
+                request => request,
+            },
             start_offset_y: page.paint_start_offset_y,
         };
     }
@@ -865,23 +894,23 @@ mod renderer_revision_tests {
 
 
     #[test]
-    fn multiple_column_slack_stays_between_columns_and_single_column_is_centered() {
+    fn column_slack_is_shared_with_outer_edges_and_single_column_is_centered() {
         let mut layout = ColumnLayout {
             col_width: 300.0,
             base_col_width: 300.0,
             max_col_count: Some(2),
             ..Default::default()
         };
-        layout.configure_viewport(Size::new(800.0, 600.0));
+        layout.configure_viewport(Size::new(810.0, 600.0));
         assert_eq!(layout.col_count, 2.0);
-        assert_eq!(layout.col_gap, 200.0);
+        assert_eq!(layout.col_gap, 70.0);
         assert_eq!(
             page_placements::col_x(&layout.page_geometry(), 0.0, 0.0),
-            0.0
+            70.0
         );
         assert_eq!(
             page_placements::col_x(&layout.page_geometry(), 1.0, 0.0),
-            500.0
+            440.0
         );
 
         layout.max_col_count = Some(1);
@@ -889,11 +918,11 @@ mod renderer_revision_tests {
         assert_eq!(layout.col_gap, 0.0);
         assert_eq!(
             page_placements::col_x(&layout.page_geometry(), 0.0, 0.0),
-            250.0
+            255.0
         );
         assert_eq!(
             page_placements::col_x(&layout.page_geometry(), 0.0, 300.0),
-            550.0
+            555.0
         );
 
         layout.max_col_count = Some(2);
@@ -913,6 +942,7 @@ mod renderer_revision_tests {
             LineScreen {
                 point: Point::new(250.0, 12.0),
                 col_index: 0,
+                visible_y: None,
             },
         );
         let mut frame = VisibleFrame::default();
@@ -976,7 +1006,7 @@ mod renderer_revision_tests {
     }
 
     #[test]
-    fn backward_composition_installs_its_end_anchor() {
+    fn backward_composition_installs_its_start_anchor() {
         let mut viewport = ViewportState::default();
 
         viewport.begin_backward_at(24.0, Some(7));
@@ -995,7 +1025,7 @@ mod renderer_revision_tests {
         assert_eq!(viewport.start_offset_y(), 8.0);
         assert!(matches!(
             viewport.request(),
-            PageRequest::EndingAt(7)
+            PageRequest::StartingAt(0)
         ));
     }
 
@@ -1029,6 +1059,7 @@ mod renderer_revision_tests {
             LineScreen {
                 point: Point::new(1.0, 2.0),
                 col_index: 0,
+                visible_y: None,
             },
         );
         frame.install_page(PagePositions {
@@ -1043,6 +1074,7 @@ mod renderer_revision_tests {
             LineScreen {
                 point: Point::new(3.0, 4.0),
                 col_index: 1,
+                visible_y: None,
             },
         );
         let page = PagePositions {
@@ -1059,6 +1091,7 @@ mod renderer_revision_tests {
                 source_top: 3.0,
                 source_bottom: 4.0,
                 col_index: 1,
+                visible_y: None,
             }],
             block_decoration_indices: Some(vec![2, 5]),
             reached_end: false,

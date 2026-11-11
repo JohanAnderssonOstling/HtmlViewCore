@@ -2,6 +2,9 @@ use crate::RendererCore;
 use kurbo::Rect;
 
 impl RendererCore {
+    pub(crate) fn overlapping_annotation_ids(&self, id: &str) -> Vec<String> {
+        self.annotations.overlapping_ids(id)
+    }
 
     /// The box the current selection occupies on the page.
     ///

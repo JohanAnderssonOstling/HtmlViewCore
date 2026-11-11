@@ -18,7 +18,7 @@ pub(crate) struct DocumentLoadSettings {
 }
 
 impl DocumentLoadSettings {
-    fn into_options(self) -> Result<DocumentOptions, Error> {
+    pub(crate) fn into_options(self) -> Result<DocumentOptions, Error> {
         let mut options =
             DocumentOptions::new(self.column_width)?.with_root_font_size(self.root_font_size)?;
         options.reader_overrides = self.reader_overrides;
@@ -43,9 +43,9 @@ pub(crate) fn prepare_document_with_settings(
     provider: Arc<dyn ResourceProvider>,
     uri: &str,
     settings: DocumentLoadSettings,
-) -> Result<PreparedDocument, String> {
-    let options = settings.into_options().map_err(|error| error.to_string())?;
-    Document::prepare(provider, uri, options).map_err(|error| error.to_string())
+) -> Result<PreparedDocument, html::Error> {
+    let options = settings.into_options()?;
+    Document::prepare(provider, uri, options)
 }
 
 #[cfg(test)]

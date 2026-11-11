@@ -1,20 +1,20 @@
+use html::Error as DocumentError;
 #[cfg(test)]
 use html_engine_model::page_placements;
 #[cfg(test)]
-use html_pipeline::engine::{CaretAffinity, geometry_queries};
+use html_pipeline::engine::CaretAffinity;
 #[cfg(test)]
 use html::targets::{DocumentTarget, ResolvedDestination};
-#[cfg(test)]
-use html_pipeline::engine::export_queries;
 #[cfg(test)]
 use html_dom as dom_values;
 use html::export::{ExportRequest, TableExportFormat};
 #[cfg(test)]
 use html::layout::BoxId;
 use html::selection::{SelectionInput, SelectionKind, SelectionOutcome, SelectionUnit};
+#[cfg(test)]
 use html::text::GlyphResourceGeneration;
 #[cfg(test)]
-use html::text::{GlyphRequest, FontMetrics, ShapedGlyph};
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use std::ops::Range;
 use std::sync::Arc;
 use web_time::Instant;
@@ -22,9 +22,9 @@ use web_time::Instant;
 use kurbo::{Point, Rect, Size};
 
 use crate::{
-    ClipboardWrite, FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, Painter,
-    ReadingTarget, RendererCommand, RendererCore, RendererEffects,
-    RendererOperation, RendererRevisions, RendererServices, ResourceProvider,
+    ClipboardWrite, FrameDisplayCacheKeys, GlyphShaper, InteractionPalette, Painter, ReadingTarget,
+    RendererCommand, RendererCore, RendererEffects, RendererOperation, RendererRevisions,
+    RendererServices, ResourceProvider,
 };
 
 pub use html::pagination::PageReadingLine as ReadingLine;
@@ -86,6 +86,7 @@ pub struct RendererSession<S> {
     glyph_shaper: S,
     pointer_down_position: Option<Point>,
     navigation_revision: u64,
+    font_revision: Arc<()>,
 }
 
 /// Content actions available at a painted document point.
@@ -127,6 +128,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             glyph_shaper,
             pointer_down_position: None,
             navigation_revision: 0,
+            font_revision: Arc::new(()),
         }
     }
 
@@ -149,13 +151,39 @@ impl<S: GlyphShaper> RendererSession<S> {
         .handled
     }
 
-    pub fn note_pointer_move(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
-        self.interact_note(SelectionInput::PointerMove {
+    pub fn note_pointer_move(
+        &mut self,
+        position: Point,
+        mode: crate::SelectionMode,
+        pressed: bool,
+        hovered: bool,
+    ) -> bool {
+        // A release outside the window may never deliver PointerUp. Finish
+        // before hit testing so re-entry cannot extend that old gesture.
+        let finished = !pressed && self.interact_note(SelectionInput::Finish).handled;
+        if !hovered {
+            let leave = self.interact_note(SelectionInput::PointerLeave);
+            if !leave.dragging {
+                return finished || leave.changed;
+            }
+        }
+        let outcome = self.interact_note(SelectionInput::PointerMove {
             position,
             mode,
             drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
-        })
-        .handled
+        });
+        let left = !hovered && self.note_pointer_leave();
+        finished || outcome.handled || outcome.changed || left
+    }
+
+    pub fn note_pointer_leave(&mut self) -> bool {
+        self.interact_note(SelectionInput::PointerLeave).changed
+    }
+
+    pub fn note_link_cursor_active(&self) -> bool {
+        self.core
+            .note_parts()
+            .is_some_and(|(note, _)| note.link_hovered())
     }
 
     pub fn note_pointer_up(&mut self, position: Point, mode: crate::SelectionMode) -> bool {
@@ -171,7 +199,11 @@ impl<S: GlyphShaper> RendererSession<S> {
         let Some((note, owner)) = self.core.note_parts_mut() else {
             return SelectionOutcome::default();
         };
-        note.interact(owner, input)
+        let outcome = note.interact(owner, input);
+        if outcome.changed {
+            self.core.request_overlay_repaint();
+        }
+        outcome
     }
 
     /// Text currently selected inside the note, for the host to copy.
@@ -211,7 +243,7 @@ impl<S: GlyphShaper> RendererSession<S> {
         start_index: usize,
         nav_state: Option<&str>,
         config: crate::RendererInitialConfig,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DocumentError> {
         let started = (std::env::var_os("BOKHEIM_PROFILE_RESIZE").is_some()
             || std::env::var_os("GPUI_KOBO_PROFILE").is_some())
         .then(Instant::now);
@@ -243,10 +275,29 @@ impl<S: GlyphShaper> RendererSession<S> {
     pub fn from_preparation(
         services: RendererServices,
         mut glyph_shaper: S,
-        prepared: crate::RendererPreparation,
-    ) -> Result<Self, String> {
+        mut prepared: crate::RendererPreparation,
+    ) -> Result<Self, DocumentError> {
+        // A retained document entering another session must recheck installed fonts.
+        prepared.refresh_fonts |= prepared.font_revision.is_some();
         let core = RendererCore::from_preparation(services, &mut glyph_shaper, prepared)?;
         Ok(Self::from_core(core, glyph_shaper))
+    }
+
+    /// Replace the publication, returning the previous document for bounded reuse.
+    pub fn replace_document(
+        &mut self,
+        mut prepared: crate::RendererPreparation,
+    ) -> Result<crate::RendererPreparation, DocumentError> {
+        prepared.refresh_fonts |= prepared
+            .font_revision
+            .as_ref()
+            .is_some_and(|revision| !Arc::ptr_eq(revision, &self.font_revision));
+        let mut previous = self.core.replace_document(&mut self.glyph_shaper, prepared)?;
+        previous.font_revision = Some(self.font_revision.clone());
+        self.pointer_down_position = None;
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        self.core.emit_state_snapshot();
+        Ok(previous)
     }
 
     /// Where the current selection sits on screen, for a caller placing a
@@ -254,6 +305,11 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// the selection is not on the page now shown.
     pub fn selection_bounds(&self) -> Option<kurbo::Rect> {
         self.core.selection_bounds()
+    }
+
+    /// Every annotation sharing text with the supplied annotation.
+    pub fn overlapping_annotation_ids(&self, id: &str) -> Vec<String> {
+        self.core.overlapping_annotation_ids(id)
     }
 
     /// Where an annotation sits on screen, for the same reason.
@@ -294,9 +350,11 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn visible_page_key(&self) -> Option<(usize, crate::FrameGeometryCacheKey)> {
-        Some((self.reading_document()?, self.core.page.frame.geometry_key()?))
+        Some((
+            self.reading_document()?,
+            self.core.page.frame.geometry_key()?,
+        ))
     }
-
 
     /// Match visible source text without exposing extraction or offset mapping.
     pub fn match_visible_text(
@@ -327,16 +385,6 @@ impl<S: GlyphShaper> RendererSession<S> {
         &mut self.glyph_shaper
     }
 
-    pub fn document_resource_generation(&self) -> GlyphResourceGeneration {
-        self.core.page.session.glyph_resource_generation()
-    }
-
-    pub fn note_resource_generation(&self) -> Option<GlyphResourceGeneration> {
-        self.core
-            .note_parts()
-            .map(|(_, owner)| owner.glyph_resource_generation())
-    }
-
     pub fn revisions(&self) -> RendererRevisions {
         self.core.revisions
     }
@@ -344,7 +392,11 @@ impl<S: GlyphShaper> RendererSession<S> {
     /// Returns whether visible resources are still being loaded or decoded.
     pub fn has_pending_resources(&self) -> bool {
         self.core.page.session.resources_pending()
-            || self.core.note.as_ref().and_then(|note| note.owner.as_ref())
+            || self
+                .core
+                .note
+                .as_ref()
+                .and_then(|note| note.owner.as_ref())
                 .is_some_and(|owner| owner.resources_pending())
     }
 
@@ -363,6 +415,9 @@ impl<S: GlyphShaper> RendererSession<S> {
     }
 
     pub fn apply(&mut self, command: RendererCommand) {
+        if matches!(&command, RendererCommand::RefreshFonts) {
+            self.font_revision = Arc::new(());
+        }
         let navigates = match &command {
             RendererCommand::NavigatePage(step) | RendererCommand::NavigateLine(step) => *step != 0,
             RendererCommand::NavigateToHref(_)
@@ -472,6 +527,20 @@ impl<S: GlyphShaper> RendererSession<S> {
         self.core.copy_selection_to_clipboard()
     }
 
+    /// Resolve a hit link against its document before handing it to the host.
+    pub fn link_href_at(&self, position: Point) -> Option<String> {
+        let position = self.core.to_layout_point(position);
+        let geometry = self.core.page.geometry();
+        let link = geometry.link_at(position)?;
+        let resolved = self.core.page.session.resolve_link(link.href)?;
+        let mut href = resolved.resource;
+        if let Some(fragment) = resolved.fragment {
+            href.push('#');
+            href.push_str(&fragment);
+        }
+        Some(href)
+    }
+
     pub fn content_at(&self, position: Point) -> ContentHit {
         let position = self.core.to_layout_point(position);
         let geometry = self.core.page.geometry();
@@ -513,6 +582,14 @@ impl<S: GlyphShaper> RendererSession<S> {
                 .emit_operation_failed(RendererOperation::CopyEquationLatex, message);
         }
         true
+    }
+
+    pub fn open_image_at(&mut self, position: Point) -> bool {
+        let position = self.core.to_layout_point(position);
+        let Some(image) = self.core.hit_test_document_image(position) else {
+            return false;
+        };
+        self.core.open_image(image)
     }
 
     pub fn copy_image_at(&mut self, position: Point) -> bool {
@@ -605,6 +682,11 @@ impl<S: GlyphShaper> RendererSession<S> {
         Some((self.selection_cfi()?, self.core.page.selected_text()?))
     }
 
+    pub fn selection_language(&self) -> Option<&str> {
+        let page = &self.core.page;
+        page.selection.selection(page.render_view())?.language()
+    }
+
     pub fn selection_endpoints(&self) -> (Option<Point>, Option<Point>) {
         let (start, end) = self
             .core
@@ -670,32 +752,31 @@ impl<S: GlyphShaper> RendererSession<S> {
         outcome
     }
 
-    /// Updates both link hover state and an active selection.
+    /// Updates hover and selection using the current primary-button state.
+    /// A missed release finishes the old gesture before movement is hit tested.
     pub fn pointer_move(
         &mut self,
         position: Point,
         mode: crate::SelectionMode,
+        pressed: bool,
     ) -> PointerMoveOutcome {
-        let position = self.core.to_layout_point(position);
-        let was_over_link = self.core.page.link_hovered;
-        let over_link = self.core.link_at(position);
-        if over_link {
-            self.core.activate_link_cursor();
-        } else {
-            self.core.deactivate_link_cursor();
+        if !pressed {
+            self.pointer_down_position = None;
+            // Programmatic word selection also leaves a touch anchor, without
+            // a pointer-down position. Hover must never extend that selection.
+            // Finish preserves the selected text and cannot activate a link.
+            self.core.interact_selection(SelectionInput::Finish);
         }
-        let handled = self
-            .core
-            .interact_selection(SelectionInput::PointerMove {
-                position,
-                mode,
-                drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
-            })
-            .handled;
+        let position = self.core.to_layout_point(position);
+        let outcome = self.core.interact_selection(SelectionInput::PointerMove {
+            position,
+            mode,
+            drag_distance: f64::from(crate::WORD_SELECTION_DRAG_DISTANCE),
+        });
         PointerMoveOutcome {
-            handled,
-            over_link,
-            link_hover_changed: was_over_link != over_link,
+            handled: outcome.handled,
+            over_link: outcome.over_link,
+            link_hover_changed: outcome.hover_changed,
         }
     }
 
@@ -734,13 +815,13 @@ impl<S: GlyphShaper> RendererSession<S> {
         handled
     }
 
+    /// Clears hover while preserving a captured selection or click until release.
     pub fn pointer_leave(&mut self) {
-        self.pointer_down_position = None;
-        self.core.deactivate_link_cursor();
+        self.core.interact_selection(SelectionInput::PointerLeave);
     }
 
     pub fn link_cursor_active(&self) -> bool {
-        self.core.page.link_hovered
+        self.core.page.selection.link_hovered()
     }
 
     pub fn set_interaction_palette(&mut self, palette: InteractionPalette) {
@@ -895,7 +976,6 @@ impl FramePainter<'_> {
 #[cfg(test)]
 mod tests {
     use html_resources::resources::images::decoded_images_get;
-    use html_pipeline::engine::text_paint;
 
     use html_pipeline::engine::TextExportFormat;
     use std::collections::HashMap;
@@ -906,12 +986,12 @@ mod tests {
     use html::style::{ReaderStyleOverrides, ThemeAdaptation};
     use html_resources::DecodedImage;
 
-    use crate::text_backend::{FontSlant, GlyphHandle, ShapeError};
+    use crate::text_backend::{FontSlant, GlyphHandle};
     use html_pipeline::engine::GlyphResourceStore;
     use crate::FileSystemProvider;
     use crate::RendererEvent;
     use html_render_core::RecordingPainter;
-    
+
     use peniko::{Color, Image};
 
     use super::*;
@@ -920,51 +1000,30 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
         glyph_shape_calls: usize,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.glyph_shape_calls += 1;
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                self.glyph_shape_calls += 1;
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(&glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -1049,10 +1108,10 @@ mod tests {
         assert!(
             matches!(renderer.core.effects.clipboard.last(), Some(ClipboardWrite::Text(text)) if text == r"\frac{1}{x}")
         );
-        let old_source = text_paint::render_view_images(&renderer.core.page.render_view())[0]
+        let old_source = (renderer.core.page.render_view()).images()[0]
             .source
             .clone();
-        let old_width = text_paint::render_view_images(&renderer.core.page.render_view())[0].width;
+        let old_width = (renderer.core.page.render_view()).images()[0].width;
         renderer.apply(RendererCommand::SetReaderStyleOverrides(
             html::style::ReaderStyleOverrides {
                 foreground: Some(0xeeeeeeff),
@@ -1075,17 +1134,17 @@ mod tests {
             .paint(&mut RecordingPainter::default());
         renderer.update_resources();
         assert!(
-            text_paint::render_view_images(&renderer.core.page.render_view())[0].width > old_width
+            (renderer.core.page.render_view()).images()[0].width > old_width
         );
         let ImageSource::MathMl { svg: old_svg, .. } = old_source else {
             panic!("equation source")
         };
         let ImageSource::MathMl { svg: new_svg, .. } =
-            &text_paint::render_view_images(&renderer.core.page.render_view())[0].source
+            &(renderer.core.page.render_view()).images()[0].source
         else {
             panic!("equation source")
         };
-        assert_ne!(&old_svg, new_svg);
+        assert_ne!(old_svg.as_ref(), new_svg.as_ref());
         let DecodedImage::Svg { bytes, .. } = decoded_images_get(
             renderer.core.page.session.images(),
             dom_values::image_id_new(0),
@@ -1094,7 +1153,7 @@ mod tests {
             panic!("decoded math SVG")
         };
         assert_eq!(
-            bytes, new_svg,
+            bytes.as_ref(), new_svg.as_ref(),
             "font-size changes must replace the decoded SVG source"
         );
         std::fs::remove_file(file).unwrap();
@@ -1213,8 +1272,8 @@ mod tests {
             let text = doc.text();
             let all: String = (0..text.glyph_count())
                 .filter_map(|index| {
-                    text_paint::glyph_at(text, index)
-                        .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+                    (text).glyph_at(index)
+                        .and_then(|glyph| (text).glyph_metric(glyph))
                         .map(|metric| metric.ch())
                 })
                 .collect();
@@ -1256,7 +1315,11 @@ mod tests {
         );
         assert!(
             renderer
-                .pointer_move(point_at(&renderer, "pha"), crate::SelectionMode::Plain)
+                .pointer_move(
+                    point_at(&renderer, "pha"),
+                    crate::SelectionMode::Plain,
+                    true
+                )
                 .handled
         );
         assert!(renderer.pointer_up(point_at(&renderer, "pha"), crate::SelectionMode::Plain));
@@ -1276,11 +1339,7 @@ mod tests {
         let (_, first, last) =
             crate::cfi::parse_cfi_range(&renderer.core.page, &element_cfi).unwrap();
         assert_eq!(
-            export_queries::render_export_view_text(
-                renderer.core.doc().export(),
-                first..last,
-                TextExportFormat::PlainAndMarkdown
-            )
+            (renderer.core.doc().export()).text(first..last, TextExportFormat::PlainAndMarkdown)
             .plain
             .unwrap(),
             element_text
@@ -1301,11 +1360,7 @@ mod tests {
         assert_eq!(text, "alpha beta gamma delta epsilon");
         let (_, first, last) = crate::cfi::parse_cfi_range(&renderer.core.page, &cfi).unwrap();
         assert_eq!(
-            export_queries::render_export_view_text(
-                renderer.core.doc().export(),
-                first..last,
-                TextExportFormat::PlainAndMarkdown
-            )
+            (renderer.core.doc().export()).text(first..last, TextExportFormat::PlainAndMarkdown)
             .plain
             .unwrap(),
             text
@@ -1342,11 +1397,7 @@ mod tests {
             let (cfi, _) = renderer.selected_passage().unwrap();
             let (_, first, last) = crate::cfi::parse_cfi_range(&renderer.core.page, &cfi).unwrap();
             assert_eq!(
-                export_queries::render_export_view_text(
-                    renderer.core.doc().export(),
-                    first..last,
-                    TextExportFormat::PlainAndMarkdown
-                )
+                (renderer.core.doc().export()).text(first..last, TextExportFormat::PlainAndMarkdown)
                 .plain
                 .as_deref(),
                 Some(word)
@@ -1426,7 +1477,7 @@ mod tests {
             .find(|glyph| addressing.link_for_glyph(*glyph).is_some())
             .expect("fixture should contain a linked glyph");
         let line_idx =
-            text_paint::render_text_view_line_for_glyph(renderer.core.doc().text(), linked_glyph)
+            (renderer.core.doc().text()).line_for_glyph(linked_glyph)
                 .unwrap();
         let screen = renderer
             .core
@@ -1445,14 +1496,14 @@ mod tests {
             .expect("linked line should be present");
         let position = Point::new(
             screen.point.x
-                + geometry_queries::render_view_geometry((renderer.core.page.geometry()).doc)
+                + ((renderer.core.page.geometry()).doc).geometry()
                     .caret_x((&line).id(), linked_glyph, CaretAffinity::Leading)
                     .unwrap_or(0.0)
                 + 0.1,
             screen.point.y + line.height() / 2.0,
         );
 
-        let hover = renderer.pointer_move(position, crate::SelectionMode::Plain);
+        let hover = renderer.pointer_move(position, crate::SelectionMode::Plain, false);
         assert!(hover.over_link);
         assert!(hover.link_hover_changed);
         assert!(
@@ -1567,7 +1618,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         renderer.apply(RendererCommand::SetFontSize(16.0));
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
@@ -1616,7 +1668,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         renderer.apply(RendererCommand::SetColumnWidth(800.0));
         renderer.apply(RendererCommand::SetMaxColumnCount(Some(1)));
         renderer.apply(RendererCommand::SetImageSizingPolicy(
@@ -1667,7 +1720,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
 
         renderer
             .prepare_frame(Size::new(600.0, 800.0))
@@ -1690,7 +1744,9 @@ mod tests {
             first_calls,
             "a position-only width resize must reuse shaped visible lines"
         );
-        renderer.apply(RendererCommand::SetColumnWidth(renderer.column_width() - 20.0));
+        renderer.apply(RendererCommand::SetColumnWidth(
+            renderer.column_width() - 20.0,
+        ));
         renderer
             .prepare_frame(Size::new(620.0, 800.0))
             .paint(&mut RecordingPainter::default());
@@ -1730,7 +1786,8 @@ mod tests {
             0,
             Some("0:0"),
             crate::RendererInitialConfig::default(),
-        ).expect("fixture document must load");
+        )
+        .expect("fixture document must load");
         let viewport = Size::new(320.0, 96.0);
 
         renderer.prepare_frame(viewport);
@@ -1748,7 +1805,7 @@ mod tests {
         let advances = || {
             let text = renderer.render_view().text();
             (0..text.glyph_count() as u32)
-                .map(|glyph| text_paint::character_advance(text, glyph))
+                .map(|glyph| (text).character_advance(glyph))
                 .collect::<Vec<_>>()
         };
         let shaped_advances = advances();
@@ -1777,7 +1834,7 @@ mod tests {
         );
         let text = renderer.render_view().text();
         let after = (0..text.glyph_count() as u32)
-            .map(|glyph| text_paint::character_advance(text, glyph))
+            .map(|glyph| (text).character_advance(glyph))
             .collect::<Vec<_>>();
         assert_eq!(
             after, shaped_advances,
@@ -1914,20 +1971,20 @@ mod tests {
         renderer.prepare_frame(Size::new(600.0, 800.0));
 
         let view = renderer.core.page.render_view().text();
-        let (line_idx, before_range, after_range) = text_paint::render_text_view_spatial_order(view).iter().copied()
+        let (line_idx, before_range, after_range) = (view).spatial_order().iter().copied()
             .find_map(|line_idx| {
-                let fragments = text_paint::render_text_view_line_text_fragments(view, line_idx)?.collect::<Vec<_>>();
+                let fragments = (view).line_text_fragments(line_idx)?.collect::<Vec<_>>();
                 (fragments.len() == 2 && fragments[0].glyphs().end == fragments[1].glyphs().start).then(|| (line_idx, fragments[0].glyphs(), fragments[1].glyphs()))
             })
             .expect("text on both sides of an inline image should remain independently positioned on one line");
         let line = view.line(line_idx).unwrap();
         let boundary = before_range.end;
         let before_image =
-            geometry_queries::render_view_geometry((renderer.core.page.geometry()).doc)
+            ((renderer.core.page.geometry()).doc).geometry()
                 .caret_x((&line).id(), boundary, CaretAffinity::Trailing)
                 .unwrap_or(0.0);
         let after_image =
-            geometry_queries::render_view_geometry((renderer.core.page.geometry()).doc)
+            ((renderer.core.page.geometry()).doc).geometry()
                 .caret_x((&line).id(), boundary, CaretAffinity::Leading)
                 .unwrap_or(0.0);
         assert!(
@@ -1935,11 +1992,7 @@ mod tests {
             "leading and trailing affinity must preserve the replaced-content gap"
         );
         assert_eq!(
-            geometry_queries::text_intersections(
-                geometry_queries::render_view_geometry(renderer.render_view()),
-                line_idx,
-                before_range.start..after_range.end
-            )
+            ((renderer.render_view()).geometry()).text_intersections(line_idx, before_range.start..after_range.end)
             .map(|range| (range.start, range.end))
             .collect::<Vec<_>>(),
             vec![
@@ -1980,43 +2033,35 @@ mod tests {
         let glyph_for = |target| {
             (0..view.glyph_count() as u32)
                 .find(|index| {
-                    text_paint::glyph_at(view, *index as usize)
-                        .and_then(|glyph| text_paint::glyph_metric(view, glyph))
+                    (view).glyph_at(*index as usize)
+                        .and_then(|glyph| (view).glyph_metric(glyph))
                         .is_some_and(|metric| metric.ch() == target)
                 })
                 .expect("fixture character must exist")
         };
         let outer_line =
-            text_paint::render_text_view_line_for_glyph(renderer.core.doc().text(), glyph_for('A'))
+            (renderer.core.doc().text()).line_for_glyph(glyph_for('A'))
                 .unwrap();
         let nested = glyph_for('I');
         let nested_line =
-            text_paint::render_text_view_line_for_glyph(renderer.core.doc().text(), nested)
+            (renderer.core.doc().text()).line_for_glyph(nested)
                 .unwrap();
 
         assert_ne!(outer_line, nested_line);
         assert_eq!(
-            geometry_queries::text_intersections(
-                geometry_queries::render_view_geometry(renderer.render_view()),
-                outer_line,
-                nested..nested + 1
-            )
+            ((renderer.render_view()).geometry()).text_intersections(outer_line, nested..nested + 1)
             .map(|range| (range.start, range.end))
             .next(),
             None
         );
         assert_eq!(
-            geometry_queries::text_intersections(
-                geometry_queries::render_view_geometry(renderer.render_view()),
-                nested_line,
-                nested..nested + 1
-            )
+            ((renderer.render_view()).geometry()).text_intersections(nested_line, nested..nested + 1)
             .map(|range| (range.start, range.end))
             .next(),
             Some((nested, nested + 1))
         );
         assert_eq!(
-            text_paint::render_text_view_line_for_glyph(renderer.core.doc().text(), glyph_for('B')),
+            (renderer.core.doc().text()).line_for_glyph(glyph_for('B')),
             Some(outer_line)
         );
         assert_eq!(

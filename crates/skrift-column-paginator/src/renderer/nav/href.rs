@@ -4,8 +4,22 @@ use super::*;
 
 impl RendererCore {
     pub(crate) fn resolve_href_target(&self, href: &str) -> Option<(usize, Option<String>)> {
-        let resolved = self.page.session.resolve_link(href)?;
-        let document = if href.is_empty() || href.starts_with('#') {
+        // Standalone reader fragments stay in this document even when website
+        // HTML declares a directory base for its other links and resources.
+        let resolved = if href.starts_with('#')
+            && self.nav.document_uris().len() == 1
+            && !self.nav.cfi.is_epub()
+        {
+            html::targets::resolve_link(
+                self.provider.as_ref(),
+                &self.nav.document_uris()[self.nav.current_document()],
+                href,
+            )
+        } else {
+            self.page.session.resolve_link(href)?
+        };
+        let document = if resolved.resource == self.nav.document_uris()[self.nav.current_document()]
+        {
             self.nav.current_document()
         } else {
             let mut matches = self

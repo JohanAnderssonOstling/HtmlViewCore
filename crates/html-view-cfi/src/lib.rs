@@ -5,11 +5,15 @@
 
 #[cfg(test)]
 use html_pipeline::engine::LaidOutDocument;
-use html::document::{SourcePosition as DocumentSourcePosition, SourceTextPosition};
+use html::document::{
+    SourceElementStep, SourcePosition as DocumentSourcePosition, SourceTextPosition,
+};
 use html::layout::RenderView;
 use html_view_types::SourcePosition;
-use std::borrow::Cow;
 use std::fmt::Write;
+
+mod syntax;
+use syntax::{Location, ParsedPath, needs_escape, parse_fragment, synthetic_index};
 
 mod publication;
 pub use publication::PublicationCfi;
@@ -27,59 +31,17 @@ pub fn source_position_cfi(position: &SourcePosition) -> String {
     result
 }
 
-/// The start of a point or range CFI, without optional ID assertions.
+/// The start of a point or range CFI, without optional assertions.
 pub fn parse_source_position(cfi: &str) -> Option<SourcePosition> {
-    let document = parse_cfi_spine_only(cfi)?;
-    let (_, content) = cfi
-        .strip_prefix("epubcfi(")?
-        .strip_suffix(')')?
-        .split_once('!')?;
-    let parts = split_range_components(content);
-    let start = match parts.as_slice() {
-        [point] => Cow::Borrowed(*point),
-        [common, start, _] => Cow::Owned(format!(
-            "{}/{}",
-            common.trim_end_matches('/'),
-            start.trim_start_matches('/')
-        )),
-        _ => return None,
+    let fragment = parse_fragment(cfi)?;
+    let document = synthetic_index(&fragment.package)?;
+    let path = match fragment.location? {
+        Location::Point(path) | Location::Range(path, _) => path,
     };
-    let mut plain = String::new();
-    let mut escaped = false;
-    let mut assertion = false;
-    for character in start.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '^' => escaped = true,
-            '[' => assertion = true,
-            ']' => assertion = false,
-            _ if !assertion => plain.push(character),
-            _ => {}
-        }
-    }
-    if escaped || assertion {
-        return None;
-    }
-    let (path, utf16_offset) = match plain.split_once(':') {
-        Some((path, offset)) => (path, Some(leading_usize(offset)?)),
-        None => (plain.as_str(), None),
-    };
-    let path = path
-        .split('/')
-        .filter(|step| !step.is_empty())
-        .map(str::parse)
-        .collect::<Result<Vec<usize>, _>>()
-        .ok()?;
-    if path.contains(&0) {
-        return None;
-    }
     Some(SourcePosition {
         document,
-        path,
-        utf16_offset,
+        path: path.steps,
+        utf16_offset: path.offset,
     })
 }
 
@@ -90,15 +52,7 @@ enum ParseBoundary {
 }
 
 pub fn parse_cfi_spine_only(cfi: &str) -> Option<usize> {
-    let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
-    let (spine_part, _) = inner.split_once('!')?;
-    let step = spine_part
-        .strip_prefix("/6/")?
-        .split('[')
-        .next()?
-        .parse::<usize>()
-        .ok()?;
-    (step >= 2 && step.is_multiple_of(2)).then(|| step / 2 - 1)
+    synthetic_index(&parse_fragment(cfi)?.package)
 }
 
 pub fn generate_cfi<'a>(
@@ -111,7 +65,7 @@ pub fn generate_cfi<'a>(
         .addressing()
         .source_position_for_glyph(glyph_idx, false)?;
     let mut result = format!("epubcfi(/6/{}!", (doc_index + 1) * 2);
-    append_document_position(&mut result, &source);
+    append_document_position(&mut result, &source, 0);
     result.push(')');
     Some(result)
 }
@@ -135,19 +89,13 @@ pub fn generate_cfi_from_source_position(
     result
 }
 
-fn append_document_position(result: &mut String, position: &DocumentSourcePosition<'_>) {
-    for element in position.elements() {
-        write!(result, "/{}", element.step()).unwrap();
-        if let Some(id) = element.id() {
-            result.push('[');
-            for character in id.chars() {
-                if matches!(character, '^' | '[' | ']' | '(' | ')' | ',' | ';' | '=') {
-                    result.push('^');
-                }
-                result.push(character);
-            }
-            result.push(']');
-        }
+fn append_document_position(
+    result: &mut String,
+    position: &DocumentSourcePosition<'_>,
+    skip: usize,
+) {
+    for element in position.elements().skip(skip) {
+        append_element(result, element);
     }
     write!(
         result,
@@ -156,6 +104,20 @@ fn append_document_position(result: &mut String, position: &DocumentSourcePositi
         position.utf16_offset()
     )
     .unwrap();
+}
+
+fn append_element(result: &mut String, element: SourceElementStep<'_>) {
+    write!(result, "/{}", element.step()).unwrap();
+    if let Some(id) = element.id() {
+        result.push('[');
+        for character in id.chars() {
+            if needs_escape(character) {
+                result.push('^');
+            }
+            result.push(character);
+        }
+        result.push(']');
+    }
 }
 
 /// Generates a standard EPUB CFI range for an exclusive glyph interval.
@@ -183,150 +145,78 @@ pub fn generate_cfi_range_from_source_positions(
     start: &DocumentSourcePosition<'_>,
     end: &DocumentSourcePosition<'_>,
 ) -> String {
-    let mut start_path = String::new();
-    let mut end_path = String::new();
-    append_document_position(&mut start_path, start);
-    append_document_position(&mut end_path, end);
-    let start_segments = start_path.split('/').filter(|segment| !segment.is_empty());
-    let end_segments = end_path.split('/').filter(|segment| !segment.is_empty());
-    let common_len = start_segments
-        .clone()
-        .zip(end_segments.clone())
+    let common_len = start
+        .elements()
+        .zip(end.elements())
         .take_while(|(left, right)| left == right)
         .count();
-    let mut result = format!("epubcfi(/6/{}!/", (doc_index + 1) * 2);
-    append_segments(&mut result, start_segments.clone().take(common_len));
-    result.push_str(",/");
-    append_segments(&mut result, start_segments.skip(common_len));
-    result.push_str(",/");
-    append_segments(&mut result, end_segments.skip(common_len));
+    let mut result = format!("epubcfi(/6/{}!", (doc_index + 1) * 2);
+    for element in start.elements().take(common_len) {
+        append_element(&mut result, element);
+    }
+    result.push(',');
+    append_document_position(&mut result, start, common_len);
+    result.push(',');
+    append_document_position(&mut result, end, common_len);
     result.push(')');
     result
 }
 
-fn append_segments<'a>(result: &mut String, segments: impl Iterator<Item = &'a str>) {
-    for (index, segment) in segments.enumerate() {
-        if index > 0 {
-            result.push('/');
-        }
-        result.push_str(segment);
-    }
-}
-
 pub fn parse_cfi<'a>(doc: impl Into<RenderView<'a>>, cfi: &str) -> Option<(usize, u32)> {
-    let doc = doc.into();
-    let doc_index = parse_cfi_spine_only(cfi)?;
-    let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
-    let (_, document_part) = inner.split_once('!')?;
+    let fragment = parse_fragment(cfi)?;
+    let document = synthetic_index(&fragment.package)?;
+    let Location::Point(path) = fragment.location? else {
+        return None;
+    };
     Some((
-        doc_index,
-        parse_document_position(doc, document_part, ParseBoundary::Glyph)?,
+        document,
+        resolve_document_position(doc.into(), &path, ParseBoundary::Glyph)?,
     ))
 }
 
 /// Resolves a standard range CFI to an exclusive glyph interval.
 pub fn parse_cfi_range<'a>(doc: impl Into<RenderView<'a>>, cfi: &str) -> Option<(usize, u32, u32)> {
-    let doc = doc.into();
-    let doc_index = parse_cfi_spine_only(cfi)?;
-    let inner = cfi.strip_prefix("epubcfi(")?.strip_suffix(')')?;
-    let (_, document_range) = inner.split_once('!')?;
-    let parts = split_range_components(document_range);
-    if parts.len() != 3 {
+    let fragment = parse_fragment(cfi)?;
+    let document = synthetic_index(&fragment.package)?;
+    let Location::Range(start, end) = fragment.location? else {
         return None;
-    }
-    let combine = |relative: &str| {
-        format!(
-            "{}/{}",
-            parts[0].trim_end_matches('/'),
-            relative.trim_start_matches('/')
-        )
     };
-    let start =
-        parse_document_position(doc, &combine(parts[1]), ParseBoundary::GlyphOrDocumentEnd)?;
-    let end = parse_document_position(doc, &combine(parts[2]), ParseBoundary::GlyphOrDocumentEnd)?;
-    (start < end).then_some((doc_index, start, end))
+    let doc = doc.into();
+    let start = resolve_document_position(doc, &start, ParseBoundary::GlyphOrDocumentEnd)?;
+    let end = resolve_document_position(doc, &end, ParseBoundary::GlyphOrDocumentEnd)?;
+    (start < end).then_some((document, start, end))
 }
 
-fn parse_document_position(
+fn resolve_document_position(
     doc: RenderView<'_>,
-    document_part: &str,
+    path: &ParsedPath,
     boundary: ParseBoundary,
 ) -> Option<u32> {
-    let mut segments = document_part
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .peekable();
-    let mut steps = Vec::new();
-    let mut character_offset = None;
-    while let Some(segment) = segments.next() {
-        let step = if segments.peek().is_none() {
-            match segment.split_once(':') {
-                Some((step, offset)) => {
-                    character_offset = Some(leading_usize(offset)?);
-                    step
-                }
-                None => segment,
-            }
-        } else {
-            segment
-        };
-        steps.push(leading_usize(step)?);
-    }
-    if steps.is_empty() {
+    if path.steps.is_empty() {
         return Some(0);
     }
-    let (elements, text_step) = match steps.last().copied() {
-        Some(last) if !last.is_multiple_of(2) => (&steps[..steps.len() - 1], Some(last)),
-        _ => (&steps[..], None),
+    let (elements, text_step) = match path.steps.last().copied() {
+        Some(last) if !last.is_multiple_of(2) => (&path.steps[..path.steps.len() - 1], Some(last)),
+        _ => (&path.steps[..], None),
     };
     doc.addressing().resolve_source_position(
         elements,
         text_step,
-        character_offset,
+        path.offset,
         matches!(boundary, ParseBoundary::GlyphOrDocumentEnd),
     )
-}
-
-fn split_range_components(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut assertion_depth = 0usize;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '^' => escaped = true,
-            '[' => assertion_depth += 1,
-            ']' => assertion_depth = assertion_depth.saturating_sub(1),
-            ',' if assertion_depth == 0 => {
-                parts.push(&value[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    parts
-}
-
-fn leading_usize(value: &str) -> Option<usize> {
-    let length = value.bytes().take_while(u8::is_ascii_digit).count();
-    value[..length].parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use html_pipeline::engine::text_paint;
 
-    use html::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+    use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 
     use super::*;
     use html_pipeline::engine::LayoutConstraints;
     use html::{
-        text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError},
+        text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper},
     };
     use html_pipeline::engine::GlyphResourceStore;
     use html_pipeline::DocumentFactory;
@@ -383,49 +273,28 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html::text::ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(*glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(*glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -467,7 +336,12 @@ mod tests {
 
     #[test]
     fn escaped_commas_do_not_split_ranges() {
-        assert_eq!(split_range_components("/4[id^,part],/1:0,/1:2").len(), 3);
+        assert_eq!(
+            syntax::components("/4[id^,part],/1:0,/1:2", b',')
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

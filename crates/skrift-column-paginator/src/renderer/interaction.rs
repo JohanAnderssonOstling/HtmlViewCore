@@ -1,10 +1,10 @@
 use html::selection::{SelectionExport, SelectionInput, SelectionOutcome};
-use html::export::{ExportPayload, ExportRequest};
+use html::export::{ExportPayload, ExportRequest, ImagePayload};
 use kurbo::{Point, Size};
 use std::sync::mpsc::{TryRecvError, channel};
 
 use crate::{
-    ClipboardWrite, DocumentImage, DocumentUpdate, FrameGeometryCacheKey, GlyphShaper,
+    ClipboardWrite, DocumentImage, DocumentUpdate, FrameGeometryCacheKey, GlyphShaper, OpenedImage,
     RendererCore, RendererEvent, RendererOperation,
 };
 
@@ -20,6 +20,23 @@ impl RendererCore {
     }
 
     pub(crate) fn open_image(&mut self, hit: DocumentImage) -> bool {
+        // Image loaders may fetch resources independently of the document
+        // provider (lazy book assets, remote article images, and inline SVG).
+        // Reuse their decoded data rather than rereading from that provider.
+        let loaded = self.page.session.export().and_then(|export| {
+            let ExportPayload::Image(image) = export.request(ExportRequest::Image(hit.image)).ok()?? else {
+                return None;
+            };
+            Some(match image {
+                ImagePayload::Raster { width, height, rgba } => OpenedImage::Raster { width, height, rgba: rgba.to_vec() },
+                ImagePayload::Svg { bytes } => OpenedImage::Svg { bytes: bytes.to_vec() },
+            })
+        });
+        if let Some(image) = loaded {
+            let uri = self.page.render_view().image_uri(hit.image).unwrap_or("Image").to_owned();
+            self.effects.emit(RendererEvent::ImageOpened { uri, image });
+            return true;
+        }
         let Some(request) = self.page.session.image_source_request(hit.image) else {
             return false;
         };
@@ -28,9 +45,9 @@ impl RendererCore {
                 .read()
                 .map(|source| RendererEvent::ImageOpened {
                     uri: source.uri,
-                    bytes: source.bytes,
+                    image: OpenedImage::Encoded { bytes: source.bytes },
                 })
-                .map_err(|error| error.to_string())
+                .map_err(html::Error::from)
         };
         if let Some(wake) = self.services.resource_waker.clone() {
             let (send, receive) = channel();
@@ -75,21 +92,18 @@ impl RendererCore {
             }
             false
         });
-        // Keep the open scope across image-only relayout of its page. A
-        // cross-document popup owns the active native resources, so postpone
-        // page geometry work until that popup closes.
+        // Scopes own their engine registrations; page and popup layout can
+        // update independently while sharing the caller's native cache.
         let mut note = self.note.take();
-        let cross_document = note.as_ref().is_some_and(|note| note.owner.is_some());
         let image_poll = self.page.session.poll_resources();
         if image_poll.decoded {
             self.revisions.invalidate_resources();
         }
         if image_poll.layout_needed
-            && !cross_document
             && let Err(error) =
                 self.apply_document_update_without_repaint(DocumentUpdate::default(), glyph_shaper)
         {
-            self.emit_operation_failed(RendererOperation::UpdateDocument, error.to_string());
+            self.emit_operation_failed(RendererOperation::UpdateDocument, error);
         }
         if let Some(open) = &mut note {
             let result = (|| {
@@ -112,7 +126,7 @@ impl RendererCore {
                 Ok::<(), html::Error>(())
             })();
             if let Err(error) = result {
-                self.emit_operation_failed(RendererOperation::PreviewNote, error.to_string());
+                self.emit_operation_failed(RendererOperation::PreviewNote, error);
             }
         }
         self.note = note;
@@ -124,6 +138,7 @@ impl RendererCore {
         self.configure_layout_for_viewport_impl(viewport_size);
         let requested_geometry = self.frame_geometry_cache_key();
         if previous_geometry != Some(requested_geometry) {
+            self.interact_selection(SelectionInput::PointerLeave);
             if previous_geometry
                 .is_some_and(|previous| can_reproject_width_only(previous, requested_geometry))
             {
@@ -273,7 +288,7 @@ fn can_reproject_width_only(
         && previous.page_request == requested.page_request
 }
 
-fn file_event(result: Result<RendererEvent, String>) -> RendererEvent {
+fn file_event(result: Result<RendererEvent, html::Error>) -> RendererEvent {
     result.unwrap_or_else(|message| RendererEvent::OperationFailed {
         operation: RendererOperation::UpdateDocument,
         message,

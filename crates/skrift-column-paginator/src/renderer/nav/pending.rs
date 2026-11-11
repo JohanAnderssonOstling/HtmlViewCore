@@ -27,7 +27,7 @@ pub(crate) struct PendingNavigation {
     doc: usize,
     action: NavigationRequest,
     settings: load::DocumentLoadSettings,
-    receive: Receiver<Result<PreparedDocument, String>>,
+    receive: Receiver<Result<PreparedDocument, html::Error>>,
     _cancellation: PreparationCancellation,
 }
 

@@ -5,7 +5,7 @@ use html::configuration::{DocumentUpdate, Update};
 use html::layout::LineId;
 use html::layout::RenderView;
 use html::pagination::PageRequest;
-use std::mem::{discriminant, replace};
+use std::mem::discriminant;
 use std::sync::Arc;
 
 use html_view_navigate::NavigationState;
@@ -18,11 +18,11 @@ use html_view_types::{
 };
 pub use html_view_types::{
     AnnotationStyle, BookSearchMatch, BookSearchResults, BookSearchTarget, ClipboardWrite, Color,
-    DisplayCacheKey, FontLoadRequest, FootnotePopupAnchor,
-    FootnotePreview, FrameDisplayCacheKeys, FrameGeometryCacheKey, InteractionPalette,
-    NoteDisplay, PopupAnchorCorner, ReaderPaintPalette, ReadingPosition, RendererAnnotation,
-    RendererCommand, RendererEffects, RendererEvent, RendererInitialConfig, RendererOperation,
-    RendererRevisions, RendererServices, SearchOptions, SearchScope, SourcePosition,
+    DisplayCacheKey, FontLoadRequest, FootnotePopupAnchor, FootnotePreview, FrameDisplayCacheKeys,
+    FrameGeometryCacheKey, InteractionPalette, NoteDisplay, OpenedImage, PopupAnchorCorner, ReaderPaintPalette,
+    ReadingPosition, RendererAnnotation, RendererCommand, RendererEffects, RendererEvent,
+    RendererInitialConfig, RendererOperation, RendererRevisions, RendererServices, SearchOptions,
+    SearchScope, SourcePosition,
 };
 use kurbo::Point;
 #[cfg(test)]
@@ -54,8 +54,10 @@ mod spine_item;
 /// Renderer-neutral text backend contract. UI adapters should use this module
 /// rather than importing layout or CSS model types.
 pub mod text_backend {
-    pub use html::text::{FontMetrics, FontSlant, GlyphHandle, GlyphRequest,
-        GlyphResourceGeneration, GlyphShaper, ShapeError, ShapedGlyph};
+    pub use html::text::{
+        FontMetrics, FontSlant, GlyphHandle, ShapedRun, TextRunShapeRequest,
+        GlyphResourceGeneration, GlyphShaper, ShapedGlyph,
+    };
 }
 
 pub use html::reading::{ReadingFragment, ReadingTarget};
@@ -138,6 +140,7 @@ mod frame_cache_tests {
         buffer.push(LineScreen {
             point: Point::new(0.0, 0.0),
             col_index: 0,
+            visible_y: None,
         });
         let capacity = buffer.capacity();
         let mut positions = page_placements::with_buffer(40, buffer);
@@ -147,6 +150,7 @@ mod frame_cache_tests {
             LineScreen {
                 point: Point::new(10.0, 20.0),
                 col_index: 1,
+                visible_y: None,
             },
         );
 
@@ -174,8 +178,9 @@ mod frame_cache_tests {
 }
 
 /// The provider-backed, parse-and-style portion of initial renderer creation.
-/// It contains no UI framework objects or platform text-system handles and can
-/// therefore be built on a host worker before a renderer entity is installed.
+/// Fresh preparation contains no UI framework objects or platform text handles
+/// and can run on a worker. Suspended documents can also retain completed
+/// geometry and glyph products until resumed with a compatible backend.
 pub struct RendererPreparation {
     loaded: PreparedDocument,
     provider: Arc<dyn ResourceProvider>,
@@ -186,6 +191,8 @@ pub struct RendererPreparation {
     nav_state: Option<String>,
     initial_anchor: Option<String>,
     config: RendererInitialConfig,
+    font_revision: Option<Arc<()>>,
+    refresh_fonts: bool,
 }
 
 pub(crate) struct RendererCore {
@@ -204,7 +211,7 @@ pub(crate) struct RendererCore {
     viewport: ViewportState,
     column_viewport_request: Option<nav::ColumnViewportRequest>,
     pending_navigation: Option<nav::PendingNavigation>,
-    pending_file_events: Vec<std::sync::mpsc::Receiver<Result<RendererEvent, String>>>,
+    pending_file_events: Vec<std::sync::mpsc::Receiver<Result<RendererEvent, html::Error>>>,
     prepared_navigation: Option<(usize, Document)>,
     frame_scratch: FrameScratch,
     revisions: RendererRevisions,
@@ -252,7 +259,9 @@ impl RendererCore {
             page_request: (
                 discriminant(&request),
                 match request {
-                    PageRequest::StartingAt(cursor) | PageRequest::EndingAt(cursor) => cursor as u64,
+                    PageRequest::StartingAt(cursor) | PageRequest::EndingAt(cursor) => {
+                        cursor as u64
+                    }
                     PageRequest::StartingAtOffset(offset) | PageRequest::EndingAtOffset(offset) => {
                         offset.to_bits()
                     }
@@ -289,21 +298,9 @@ impl RendererCore {
         Point::new(position.x * scale, position.y * scale)
     }
 
-    pub fn activate_link_cursor(&mut self) {
-        if !replace(&mut self.page.link_hovered, true) {
-            self.effects.request_restyle();
-        }
-    }
-
-    pub fn deactivate_link_cursor(&mut self) {
-        if replace(&mut self.page.link_hovered, false) {
-            self.effects.request_restyle();
-        }
-    }
-
-    pub(crate) fn emit_operation_failed(&mut self, operation: RendererOperation, message: String) {
+    pub(crate) fn emit_operation_failed(&mut self, operation: RendererOperation, message: impl Into<html::Error>) {
         self.effects
-            .emit(RendererEvent::OperationFailed { operation, message });
+            .emit(RendererEvent::OperationFailed { operation, message: message.into() });
     }
 
     #[cfg(test)]
@@ -335,18 +332,7 @@ impl RendererCore {
         config: RendererInitialConfig,
         image_loader: Option<Arc<dyn ImageLoader>>,
     ) -> Self {
-        let jobs = services.blocking_jobs.clone();
-        let image_service = match image_loader {
-            Some(loader) => {
-                ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET)
-            }
-            None => ImageService::with_job_spawner(
-                provider.clone(),
-                jobs,
-                ImageService::DEFAULT_BYTE_BUDGET,
-            ),
-        };
-        image_service.set_completion_waker(services.resource_waker.clone());
+        let image_service = Self::create_image_service(&services, provider.clone(), image_loader);
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
         let layout = ColumnLayout {
             col_width: column_width,
@@ -390,11 +376,31 @@ impl RendererCore {
         }
     }
 
+    fn create_image_service(
+        services: &RendererServices,
+        provider: Arc<dyn ResourceProvider>,
+        image_loader: Option<Arc<dyn ImageLoader>>,
+    ) -> ImageService {
+        let jobs = services.blocking_jobs.clone();
+        let image_service = match image_loader {
+            Some(loader) => {
+                ImageService::with_loader(loader, jobs, ImageService::DEFAULT_BYTE_BUDGET)
+            }
+            None => ImageService::with_job_spawner(
+                provider,
+                jobs,
+                ImageService::DEFAULT_BYTE_BUDGET,
+            ),
+        };
+        image_service.set_completion_waker(services.resource_waker.clone());
+        image_service
+    }
+
     fn document_update_for_layout(&self, viewport_width: f64) -> DocumentUpdate {
-        let height = self.page.layout.size.height;
+        // Keep document geometry continuous; page breaks belong to viewport composition.
         DocumentUpdate::default()
             .width(viewport_width)
-            .height((height.is_finite() && height >= 0.0).then_some(height))
+            .height(None)
     }
 
     fn document_update_for_typography(&self, root_font_size: f32) -> DocumentUpdate {
@@ -424,18 +430,30 @@ impl RendererCore {
         request_repaint: bool,
     ) -> Result<(), Error> {
         let anchor = self.nav.reflow_anchor(self.nav_view());
+        let previous_font_faces = self.page.session.font_faces();
+        let previously_used_publication_fonts = self
+            .page
+            .configuration()
+            .reader_overrides()
+            .uses_publication_fonts();
         let before = self.page.session.revisions();
         let update = self.page.session.apply(requested_inputs, glyph_shaper)?;
         let after = self.page.session.revisions();
-        self.effects.font_loads.push(FontLoadRequest {
-            faces: self.page.session.font_faces(),
-            use_publication_fonts: self
-                .page
-                .configuration()
-                .reader_overrides()
-                .uses_publication_fonts(),
-            provider: self.provider.clone(),
-        });
+        let faces = self.page.session.font_faces();
+        let use_publication_fonts = self
+            .page
+            .configuration()
+            .reader_overrides()
+            .uses_publication_fonts();
+        if use_publication_fonts != previously_used_publication_fonts
+            || (!Arc::ptr_eq(&faces, &previous_font_faces) && faces != previous_font_faces)
+        {
+            self.effects.font_loads.push(FontLoadRequest {
+                faces,
+                use_publication_fonts,
+                provider: self.provider.clone(),
+            });
+        }
 
         self.page.session.render_view().ok_or_else(|| {
             Error::message("pipeline update completed without a laid-out document")
@@ -591,7 +609,7 @@ impl RendererCore {
                 if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                     self.emit_operation_failed(
                         RendererOperation::UpdateDocument,
-                        error.to_string(),
+                        error,
                     );
                 }
             }
@@ -602,7 +620,7 @@ impl RendererCore {
                     if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
-                            error.to_string(),
+                            error,
                         );
                     }
                 }
@@ -618,7 +636,7 @@ impl RendererCore {
                         }
                         Err(error) => self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
-                            error.to_string(),
+                            error,
                         ),
                     }
                 }
@@ -629,7 +647,7 @@ impl RendererCore {
                     if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
-                            error.to_string(),
+                            error,
                         );
                     }
                 }
@@ -640,7 +658,7 @@ impl RendererCore {
                     if let Err(error) = self.apply_document_update(inputs, glyph_shaper) {
                         self.emit_operation_failed(
                             RendererOperation::UpdateDocument,
-                            error.to_string(),
+                            error,
                         );
                     }
                 }
@@ -649,6 +667,9 @@ impl RendererCore {
                 if self.reader_palette != palette {
                     self.reader_palette = palette;
                     self.request_base_repaint();
+                    if self.page.selection.link_hovered() {
+                        self.request_overlay_repaint();
+                    }
                 }
             }
             RendererCommand::SetScale(scale) => self.set_scale(scale),
@@ -672,6 +693,10 @@ impl RendererCore {
             RendererCommand::SetAnnotations(annotations) => {
                 self.annotations.replace(annotations);
                 self.resolve_visible_annotations();
+                self.request_overlay_repaint();
+            }
+            RendererCommand::SetActiveAnnotation(id) => {
+                self.annotations.set_active(id);
                 self.request_overlay_repaint();
             }
             RendererCommand::UpsertAnnotation(annotation) => {
@@ -863,10 +888,8 @@ impl RendererCore {
     /// Projects search results onto the loaded document without reading another
     /// file or changing the viewport. Navigation uses the same source mapping.
     fn refresh_visible_search_matches(&mut self) {
-        self.highlight.refresh_visible_matches(
-            self.nav.current_document(),
-            self.page.render_view(),
-        );
+        self.highlight
+            .refresh_visible_matches(self.nav.current_document(), self.page.render_view());
         self.focus_current_search_match();
         if self.highlight.options().scope == SearchScope::CurrentDocument {
             self.highlight.emit_results(&mut self.effects);

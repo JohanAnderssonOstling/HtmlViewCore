@@ -14,7 +14,6 @@ pub(crate) struct SpineItem {
     pub(crate) layout: ColumnLayout,
     pub(crate) frame: VisibleFrame,
     pub(crate) selection: SelectionController,
-    pub(crate) link_hovered: bool,
 }
 
 impl SpineItem {
@@ -29,20 +28,17 @@ impl SpineItem {
             layout,
             frame: VisibleFrame::default(),
             selection: SelectionController::default(),
-            link_hovered: false,
         }
     }
 
     pub(crate) fn reset_view_state(&mut self) {
         self.frame.clear();
         self.selection = SelectionController::default();
-        self.link_hovered = false;
     }
 
     pub(crate) fn geometry(&self) -> PageView<'_> {
         PageView::new(self.render_view(), self.frame.page().content())
     }
-
 
     pub(crate) fn interact_selection(&mut self, input: SelectionInput) -> SelectionOutcome {
         let geo = PageView::new(

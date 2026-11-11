@@ -1,7 +1,9 @@
+use html::Error as DocumentError;
 use std::sync::Arc;
 use html::targets::{DocumentTarget, ResolvedDestination};
+use html::{Document, ParsedDocumentSource};
+use html::style::StylesheetCache;
 
-use crate::spine_item::SpineItem;
 use crate::{
     DocAnchor, DocumentUpdate, GlyphShaper, NavigationState, RendererCore, RendererEvent,
     RendererServices, RendererInitialConfig, RendererPreparation, ResourceProvider, ViewportState,
@@ -29,6 +31,56 @@ pub(super) struct ColumnViewportRequest {
 }
 
 impl RendererPreparation {
+    fn document_update(&self) -> DocumentUpdate {
+        let config = &self.config;
+        let mut update = DocumentUpdate::default()
+            .width(config.column_width.clamp(200.0, 1200.0).round())
+            .height(None)
+            .font_size(config.font_size.clamp(8.0, 64.0).round())
+            .reader_overrides(config.style_overrides.clone())
+            .image_sizing_policy(config.image_sizing_policy)
+            .text_composition_policy(config.text_composition_policy)
+            .note_flow(load::note_flow_for(config.note_display));
+        if self.refresh_fonts {
+            update = update.fonts_changed();
+        }
+        update
+    }
+
+    /// Restore a standalone document with current settings and a new destination.
+    pub fn resume(
+        self,
+        nav_state: Option<&str>,
+        initial_target: Option<&str>,
+        config: RendererInitialConfig,
+    ) -> Result<Self, DocumentError> {
+        if self.document_uris.len() != 1 {
+            return Err("document reuse requires a standalone document".into());
+        }
+        let Self {
+            loaded,
+            provider,
+            document_uris,
+            image_loader,
+            font_revision,
+            refresh_fonts,
+            ..
+        } = self;
+        let mut prepared = Self::prepare_with(
+            provider,
+            document_uris,
+            0,
+            nav_state,
+            initial_target,
+            config,
+            |_, _| Ok(loaded),
+        )?;
+        prepared.image_loader = image_loader;
+        prepared.font_revision = font_revision;
+        prepared.refresh_fonts = refresh_fonts;
+        Ok(prepared)
+    }
+
     /// Supply image I/O separately from the synchronous text provider.
     pub fn with_image_loader(mut self, loader: Arc<dyn ImageLoader>) -> Self {
         self.image_loader = Some(loader);
@@ -41,7 +93,7 @@ impl RendererPreparation {
         start_index: usize,
         nav_state: Option<&str>,
         config: RendererInitialConfig,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DocumentError> {
         Self::from_provider_with_nav_and_target(
             provider,
             document_uris,
@@ -59,9 +111,59 @@ impl RendererPreparation {
         nav_state: Option<&str>,
         initial_target: Option<&str>,
         config: RendererInitialConfig,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DocumentError> {
+        let source_provider = provider.clone();
+        Self::prepare_with(
+            provider,
+            document_uris,
+            start_index,
+            nav_state,
+            initial_target,
+            config,
+            move |uri, settings| {
+                load::prepare_document_with_settings(source_provider, uri, settings)
+            },
+        )
+    }
+
+    /// Prepare a standalone document using its already inspected DOM and shared CSS.
+    pub fn from_parsed_document(
+        provider: Arc<dyn ResourceProvider>,
+        uri: String,
+        source: ParsedDocumentSource,
+        stylesheet_cache: StylesheetCache,
+        nav_state: Option<&str>,
+        initial_target: Option<&str>,
+        config: RendererInitialConfig,
+    ) -> Result<Self, DocumentError> {
+        let source_provider = provider.clone();
+        Self::prepare_with(
+            provider,
+            vec![uri],
+            0,
+            nav_state,
+            initial_target,
+            config,
+            move |uri, settings| {
+                let mut options = settings.into_options()?;
+                options.stylesheet_cache = Some(stylesheet_cache);
+                Document::prepare_parsed(source_provider, uri, source, options)
+
+            },
+        )
+    }
+
+    fn prepare_with(
+        provider: Arc<dyn ResourceProvider>,
+        document_uris: Vec<String>,
+        start_index: usize,
+        nav_state: Option<&str>,
+        initial_target: Option<&str>,
+        config: RendererInitialConfig,
+        prepare: impl FnOnce(&str, load::DocumentLoadSettings) -> Result<html::PreparedDocument, DocumentError>,
+    ) -> Result<Self, DocumentError> {
         if document_uris.is_empty() {
-            return Err("publication contains no HTML documents".to_owned());
+            return Err(html::Error::message("publication contains no HTML documents"));
         }
         let saved_nav_state = nav_state.map(str::to_owned);
         let cfi = crate::cfi::PublicationCfi::new(config.publication_cfi_bases.clone());
@@ -85,8 +187,7 @@ impl RendererPreparation {
         };
         let font_size = config.font_size.clamp(8.0, 64.0).round();
         let column_width = config.column_width.clamp(200.0, 1200.0).round();
-        let loaded = load::prepare_document_with_settings(
-            provider.clone(),
+        let loaded = prepare(
             &document_uris[doc_index],
             load::DocumentLoadSettings {
                 root_font_size: font_size,
@@ -107,6 +208,8 @@ impl RendererPreparation {
             nav_state,
             initial_anchor,
             config,
+            font_revision: None,
+            refresh_fonts: false,
         })
     }
 
@@ -262,7 +365,7 @@ impl RendererCore {
         start_index: usize,
         nav_state: Option<&str>,
         config: RendererInitialConfig,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DocumentError> {
         let prepared = RendererPreparation::from_provider_with_nav(
             provider,
             document_uris,
@@ -277,7 +380,8 @@ impl RendererCore {
         services: RendererServices,
         glyph_shaper: &mut impl GlyphShaper,
         prepared: RendererPreparation,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DocumentError> {
+        let update = prepared.document_update();
         let RendererPreparation {
             loaded,
             provider,
@@ -288,12 +392,12 @@ impl RendererCore {
             nav_state,
             initial_anchor,
             config,
+            font_revision: _,
+            refresh_fonts: _,
         } = prepared;
-        let restoring_position = nav_state.is_some();
-
         let loaded = loaded
-            .finish(DocumentUpdate::default(), glyph_shaper)
-            .map_err(|error| error.to_string())?;
+            .finish(update, glyph_shaper)
+            ?;
         let mut renderer = Self::new_with_image_loader(
             services,
             loaded,
@@ -314,24 +418,39 @@ impl RendererCore {
             provider: renderer.provider.clone(),
         });
 
+        renderer.restore_initial_position(
+            glyph_shaper,
+            initial_anchor.as_deref(),
+            nav_state.as_deref(),
+            glyph_index,
+        );
+        Ok(renderer)
+    }
+
+    fn restore_initial_position(
+        &mut self,
+        glyph_shaper: &mut impl GlyphShaper,
+        initial_anchor: Option<&str>,
+        nav_state: Option<&str>,
+        glyph_index: u32,
+    ) {
         if let Some(anchor) = initial_anchor {
-            renderer.navigate_to_href(glyph_shaper, &format!("#{anchor}"));
-            return Ok(renderer);
+            self.navigate_to_href(glyph_shaper, &format!("#{anchor}"));
+            return;
         }
 
-        if nav_state.as_deref().is_some_and(|state| {
-            state.trim().starts_with("epubcfi(") && renderer.restore_position_from_cfi(state.trim())
+        if nav_state.is_some_and(|state| {
+            state.trim().starts_with("epubcfi(") && self.restore_position_from_cfi(state.trim())
         }) {
-            return Ok(renderer);
+            return;
         }
         if glyph_index > 0 {
-            renderer.restore_glyph_position(glyph_index);
+            self.restore_glyph_position(glyph_index);
         }
-        if restoring_position && renderer.nav.anchor_glyph_here().is_none() {
-            let glyph = renderer.nav.current_glyph_position(renderer.nav_view());
-            renderer.nav.anchor_at(glyph);
+        if nav_state.is_some() && self.nav.anchor_glyph_here().is_none() {
+            let glyph = self.nav.current_glyph_position(self.nav_view());
+            self.nav.anchor_at(glyph);
         }
-        Ok(renderer)
     }
 
     /// Builds a spine item out of a freshly loaded document, at the column
@@ -436,7 +555,7 @@ impl RendererCore {
         &mut self,
         glyph_shaper: &mut impl GlyphShaper,
         column_width: f64,
-    ) -> Result<(), html::Error> {
+    ) -> Result<(), DocumentError> {
         let next = self.document_update_for_layout(column_width);
         self.apply_document_update(next, glyph_shaper)
     }
@@ -453,7 +572,7 @@ impl RendererCore {
                 .effects
                 .emit(RendererEvent::FontSizeChanged(self.page.root_font_size())),
             Err(error) => self
-                .emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string()),
+                .emit_operation_failed(crate::RendererOperation::UpdateDocument, error),
         }
     }
 
@@ -473,7 +592,7 @@ impl RendererCore {
         if effective_changed
             && let Err(error) = self.relayout_for_column_width(glyph_shaper, effective)
         {
-            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
+            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error);
             return;
         }
         let base_width = base_changed.then_some(rounded);
@@ -520,15 +639,15 @@ impl RendererCore {
         if (width - self.page.layout.col_width).abs() >= 0.1
             && let Err(error) = self.relayout_for_column_width(glyph_shaper, width)
         {
-            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
+            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error);
             return;
         }
         self.page.layout.size.width = request.available_width;
         self.page.layout.base_col_width = width;
         self.page.layout.col_width = width;
-        self.page.layout.col_count = f64::from(request.column_count);
-        self.page.layout.col_gap = request.column_gap;
+        self.page.layout.min_col_gap = request.column_gap;
         self.page.layout.max_col_count = Some(request.column_count);
+        self.page.layout.recompute_columns();
         self.column_viewport_request = Some(request);
         self.effects.request_repaint();
     }
@@ -551,7 +670,7 @@ impl RendererCore {
             return false;
         }
         if let Err(error) = self.relayout_for_column_width(glyph_shaper, effective) {
-            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error.to_string());
+            self.emit_operation_failed(crate::RendererOperation::UpdateDocument, error);
             return false;
         }
         self.page.layout.size.width = layout_width;

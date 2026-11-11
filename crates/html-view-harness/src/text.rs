@@ -10,11 +10,11 @@
 //! One registry owns handles across the book, including popup notes from
 //! other spine items. Shaping and painting need no host-selected document.
 
-use html::text::{GlyphRequest, FontMetrics, ShapedGlyph};
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use html::text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError};
+use html::text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper};
 
 /// A rasterized glyph: coverage, and where to put it relative to the baseline
 /// origin the renderer paints at.
@@ -55,8 +55,6 @@ pub struct FontShaper {
     bold: Option<fontdue::Font>,
     italic: Option<fontdue::Font>,
     glyphs: GlyphRegistry,
-    document_checkpoint: Option<usize>,
-    append_checkpoint: Option<usize>,
 }
 
 impl FontShaper {
@@ -67,8 +65,6 @@ impl FontShaper {
             bold: load_face("serif:bold").ok(),
             italic: load_face("serif:italic").ok(),
             glyphs: GlyphRegistry::default(),
-            document_checkpoint: None,
-            append_checkpoint: None,
         })
     }
 
@@ -145,85 +141,46 @@ fn load_face(pattern: &str) -> Result<fontdue::Font, String> {
 }
 
 impl GlyphShaper for FontShaper {
-    fn reset(&mut self) {
-        self.glyphs = GlyphRegistry::default();
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.glyphs.generation
     }
 
-    fn begin_document_shaping(&mut self) {
-        assert!(self.document_checkpoint.is_none());
-        // Handles are book-wide. Keep earlier pages and notes paintable while
-        // retaining only a length checkpoint for resources appended here.
-        self.document_checkpoint = Some(self.glyphs.keys.len());
-    }
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let key = GlyphKey {
+                ch: character,
+                size_bits: style.font_size.to_bits(),
+                bold: style.font_weight >= 600,
+                italic: !matches!(style.font_slant, FontSlant::Normal),
+            };
 
-    fn commit_document_shaping(&mut self) {
-        self.document_checkpoint = None;
-    }
+            let face = self.face(key);
+            let advance = face.metrics(character, style.font_size).advance_width;
+            let line =
+                face.horizontal_line_metrics(style.font_size)
+                    .unwrap_or(fontdue::LineMetrics {
+                        ascent: style.font_size * 0.8,
+                        descent: -style.font_size * 0.2,
+                        line_gap: 0.0,
+                        new_line_size: style.font_size,
+                    });
+            let advance = advance.max(0.0);
+            let metrics = FontMetrics {
+                ascent: line.ascent.max(0.0),
+                descent: (-line.descent).max(0.0),
+            };
 
-    fn rollback_document_shaping(&mut self) {
-        if let Some(len) = self.document_checkpoint.take() {
-            self.glyphs.keys.truncate(len);
-            self.glyphs.ids.retain(|_, glyph| (glyph.0 as usize) < len);
-        }
-    }
-
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some(self.glyphs.keys.len());
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some(len) = self.append_checkpoint.take() {
-            self.glyphs.keys.truncate(len);
-            self.glyphs.ids.retain(|_, glyph| (glyph.0 as usize) < len);
-        }
-    }
-
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        let key = GlyphKey {
-            ch: request.character,
-            size_bits: request.style.font_size.to_bits(),
-            bold: request.style.font_weight >= 600,
-            italic: !matches!(request.style.font_slant, FontSlant::Normal),
-        };
-
-        let face = self.face(key);
-        let advance = face
-            .metrics(request.character, request.style.font_size)
-            .advance_width;
-        let line = face
-            .horizontal_line_metrics(request.style.font_size)
-            .unwrap_or(fontdue::LineMetrics {
-                ascent: request.style.font_size * 0.8,
-                descent: -request.style.font_size * 0.2,
-                line_gap: 0.0,
-                new_line_size: request.style.font_size,
-            });
-        let advance = advance.max(0.0);
-        let metrics = FontMetrics {
-            ascent: line.ascent.max(0.0),
-            descent: (-line.descent).max(0.0),
-        };
-
-        let glyphs = &mut self.glyphs;
-        if let Some(&glyph) = glyphs.ids.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(glyphs.keys.len() as u32);
-        if glyphs.keys.len() <= glyph.0 as usize {
-            glyphs.keys.resize(glyph.0 as usize + 1, key);
-        }
-        glyphs.keys[glyph.0 as usize] = key;
-        glyphs.ids.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+            let glyphs = &mut self.glyphs;
+            if let Some(&glyph) = glyphs.ids.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(glyphs.keys.len() as u32);
+            if glyphs.keys.len() <= glyph.0 as usize {
+                glyphs.keys.resize(glyph.0 as usize + 1, key);
+            }
+            glyphs.keys[glyph.0 as usize] = key;
+            glyphs.ids.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }

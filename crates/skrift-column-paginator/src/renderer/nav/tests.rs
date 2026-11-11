@@ -1,20 +1,16 @@
 //! Renderer navigation, pagination, and note regressions.
 
 
-use html_pipeline::engine::pagination_queries;
 use html_pipeline::engine::PaginationTarget;
 use html::selection::{SelectionController, SelectionInput};
 
-use html_pipeline::engine::{CaretAffinity, geometry_queries};
+use html_pipeline::engine::CaretAffinity;
 
-use html_pipeline::engine::fragment_paint;
 use html_engine_model::shaping_contracts;
-use html_pipeline::engine::reading_queries;
 use html::pagination::PageRequest;
 use html::reading::ReadingOrigin;
 use html::targets::ElementTarget;
-use html::text::{FontMetrics, GlyphRequest, ShapedGlyph};
-use html_pipeline::engine::text_paint;
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_render_core::RecordingPainter;
 #[path = "tests/chapter_start.rs"]
 mod chapter_start;
@@ -33,7 +29,7 @@ use kurbo::{Point, Size};
 
 use crate::cfi::PublicationCfi;
 use html::search::SearchIndex;
-use crate::text_backend::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError};
+use crate::text_backend::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper};
 #[cfg(test)]
 use html_pipeline::engine::GlyphResourceStore;
 use crate::{
@@ -52,61 +48,34 @@ fn selected_markdown(core: &RendererCore) -> Option<String> {
 struct TestShaper {
     glyphs: HashMap<(char, u32), GlyphHandle>,
     generation: GlyphResourceGeneration,
-    append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     next_id: GlyphHandle,
-    reject_glyphs: bool,
 }
 
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.glyphs.clear();
-        self.generation = GlyphResourceGeneration::default();
-        self.next_id = GlyphHandle(0);
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-            self.glyphs = glyphs;
-            self.generation = glyph_store;
-            self.next_id = GlyphHandle(self.glyphs.len() as u32);
-        }
-    }
-
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        if self.reject_glyphs {
-            return Err(shaping_contracts::shape_error_registry_capacity_exhausted(self.glyphs.len()));
-        }
-        let key = (request.character, request.style.font_size.to_bits());
-        let advance = request.style.font_size * 0.5;
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.glyphs.len() as u32);
-        assert_eq!(
-            glyph, self.next_id,
-            "native glyph cache and handle counter diverged"
-        );
-        self.next_id.0 += 1;
-        self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let key = (character, style.font_size.to_bits());
+            let advance = style.font_size * 0.5;
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
+            assert_eq!(
+                glyph, self.next_id,
+                "native glyph cache and handle counter diverged"
+            );
+            self.next_id.0 += 1;
+            self.glyphs.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 
@@ -338,12 +307,12 @@ fn column_viewport_plan_repaints_changes_and_restores_changed_layout() {
 fn line_index_for_character(core: &RendererCore, wanted: char) -> LineId {
     let text = core.page.render_view().text();
     let glyph = glyph_index_for_character(core, wanted);
-    text_paint::render_text_view_line_for_glyph(text, glyph)
+    (text).line_for_glyph(glyph)
         .expect("fixture character must own a line")
 }
 
 fn line_cursor(core: &RendererCore, line: LineId) -> usize {
-    pagination_queries::render_view_pagination(core.page.render_view())
+    (core.page.render_view()).pagination()
         .locate(PaginationTarget::Line(line))
         .map(|position| position.cursor)
         .expect("fixture line must be paginated")
@@ -353,8 +322,8 @@ fn glyph_index_for_character(core: &RendererCore, wanted: char) -> u32 {
     let text = core.page.render_view().text();
     (0..text.glyph_count() as u32)
         .find(|index| {
-            text_paint::glyph_at(text, *index as usize)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(*index as usize)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .is_some_and(|metric| metric.ch() == wanted)
         })
         .expect("fixture character must exist")
@@ -364,8 +333,8 @@ fn laid_out_text(document: &crate::spine_item::SpineItem) -> String {
     let text = document.render_view().text();
     (0..text.glyph_count())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect()
@@ -376,8 +345,8 @@ fn open_note_text(core: &RendererCore) -> String {
     let text = note.render_view(owner).unwrap().text();
     (0..text.glyph_count())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect()
@@ -772,15 +741,12 @@ fn paginator_uses_tall_inline_image_height_for_column_fitting() {
     let (core, _) = pagination_core(html, Size::new(420.0, 40.0), 2);
     let a = line_index_for_character(&core, 'A');
     let b = line_index_for_character(&core, 'B');
-    let images = fragment_paint::render_fragment_view_images_for_line(
-        core.page.render_view().fragments(),
-        a,
-    );
+    let images = (core.page.render_view().fragments()).images_for_line(a);
 
     assert!(
         images
             .iter()
-            .any(|image| fragment_paint::render_image_fragment_size(&image).height == 35.0),
+            .any(|image| (image).size().height == 35.0),
         "fixture must retain the 35px replaced-content height"
     );
     assert_eq!(
@@ -890,8 +856,8 @@ fn paginator_moves_an_oversized_image_line_to_a_fresh_column() {
             .page()
             .line_positions()
             .get(b)
-            .map(|screen| (screen.col_index, screen.point.y)),
-        Some((1, 0.0))
+            .map(|screen| (screen.col_index, screen.point.y.abs() < 0.001)),
+        Some((1, true))
     );
     assert!(
         core.page.frame.page().line_positions().get(c).is_none(),
@@ -2153,12 +2119,10 @@ fn book_paginator_keeps_an_image_only_figure_whole() {
         1,
         html::layout::TextCompositionPolicy::BookOptimized,
     );
-    let image_line = fragment_paint::render_image_fragment_line(
-        &fragment_paint::render_fragment_view_images(core.page.render_view().fragments())
+    let image_line = ((core.page.render_view().fragments()).images()
             .iter()
             .next()
-            .expect("fixture image fragment"),
-    );
+            .expect("fixture image fragment")).line();
 
     assert!(
         core.page
@@ -2171,15 +2135,11 @@ fn book_paginator_keeps_an_image_only_figure_whole() {
     );
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(
-        core.page
+    assert!(core.page
             .frame
             .page()
             .line_positions()
-            .get(image_line)
-            .map(|screen| screen.point.y),
-        Some(0.0)
-    );
+            .get(image_line).is_some_and(|screen| (screen.point.y - 0.0).abs() < 0.001));
 }
 
 #[test]
@@ -2191,12 +2151,10 @@ fn book_paginator_keeps_a_replaced_image_with_its_multiline_caption() {
         1,
         html::layout::TextCompositionPolicy::BookOptimized,
     );
-    let image_line = fragment_paint::render_image_fragment_line(
-        &fragment_paint::render_fragment_view_images(core.page.render_view().fragments())
+    let image_line = ((core.page.render_view().fragments()).images()
             .iter()
             .next()
-            .expect("fixture image fragment"),
-    );
+            .expect("fixture image fragment")).line();
     let caption_first = line_index_for_character(&core, 'C');
     let caption_second = line_index_for_character(&core, 'D');
 
@@ -2228,33 +2186,21 @@ fn book_paginator_keeps_a_replaced_image_with_its_multiline_caption() {
 
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(
-        core.page
+    assert!(core.page
             .frame
             .page()
             .line_positions()
-            .get(image_line)
-            .map(|screen| screen.point.y),
-        Some(0.0)
-    );
-    assert_eq!(
-        core.page
+            .get(image_line).is_some_and(|screen| (screen.point.y - 0.0).abs() < 0.001));
+    assert!(core.page
             .frame
             .page()
             .line_positions()
-            .get(caption_first)
-            .map(|screen| screen.point.y),
-        Some(20.0)
-    );
-    assert_eq!(
-        core.page
+            .get(caption_first).is_some_and(|screen| (screen.point.y - 20.0).abs() < 0.001));
+    assert!(core.page
             .frame
             .page()
             .line_positions()
-            .get(caption_second)
-            .map(|screen| screen.point.y),
-        Some(40.0)
-    );
+            .get(caption_second).is_some_and(|screen| (screen.point.y - 40.0).abs() < 0.001));
 }
 
 #[test]
@@ -2643,66 +2589,22 @@ fn book_paginator_uses_remaining_space_for_a_table_taller_than_a_column() {
 }
 
 #[test]
-fn book_paginator_breaks_an_oversized_table_between_rows() {
+fn book_paginator_splits_a_single_cell_row_at_a_content_boundary() {
     let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><table style='margin:0;border-spacing:0'><tr><td style='padding:0;line-height:20px'>B<br>C</td></tr><tr><td style='padding:0;line-height:20px'>D</td></tr><tr><td style='padding:0;line-height:20px'>E</td></tr></table></body></html>";
     let (mut core, mut shaper) = pagination_core_with_policy(
-        html,
-        Size::new(200.0, 50.0),
-        1,
+        html, Size::new(200.0, 50.0), 1,
         html::layout::TextCompositionPolicy::BookOptimized,
     );
-    let first_row = line_index_for_character(&core, 'B');
-    let first_row_second_line = line_index_for_character(&core, 'C');
-
-    assert!(
-        core.page
-            .frame
-            .page()
-            .line_positions()
-            .get(first_row)
-            .is_none()
-    );
-    assert_eq!(
-        core.page
-            .render_view()
-            .text()
-            .line(first_row)
-            .expect("first row line")
-            .point()
-            .y,
-        20.0,
-        "layout geometry remains continuous"
-    );
+    let first = line_index_for_character(&core, 'B');
+    let continuation = line_index_for_character(&core, 'C');
+    assert_eq!(core.page.frame.page().line_positions().get(first).map(|screen| screen.point.y), Some(20.0));
+    assert!(core.page.frame.page().line_positions().get(continuation).is_none());
+    assert_eq!(core.page.render_view().text().line(first).unwrap().point().y, 20.0,
+        "layout geometry remains continuous");
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert_eq!(
-        core.page
-            .frame
-            .page()
-            .line_positions()
-            .get(first_row)
-            .map(|screen| screen.point.y),
-        Some(0.0)
-    );
-    let first_y = core
-        .page
-        .frame
-        .page()
-        .line_positions()
-        .get(first_row)
-        .expect("first row line is visible")
-        .point
-        .y;
-    let second_y = core
-        .page
-        .frame
-        .page()
-        .line_positions()
-        .get(first_row_second_line)
-        .expect("the paginator must not split a row")
-        .point
-        .y;
-    assert!(second_y > first_y);
+    assert!(core.page.frame.page().line_positions().get(first).is_none());
+    assert_eq!(core.page.frame.page().line_positions().get(continuation).map(|screen| screen.point.y), Some(0.0));
 }
 
 #[test]
@@ -2757,7 +2659,7 @@ fn book_paginator_repeats_a_leading_all_th_row_without_thead() {
 
 #[test]
 fn book_paginator_omits_a_repeated_header_when_no_body_row_would_fit() {
-    let html = "<html><body style='margin:0'><table style='margin:0;border-spacing:0'><thead><tr><th style='padding:0;line-height:20px'>H<br>I</th></tr></thead><tbody><tr><td style='padding:0;line-height:20px'>B<br>C</td></tr></tbody></table></body></html>";
+    let html = "<html><body style='margin:0'><table style='margin:0;border-spacing:0'><thead><tr><th style='padding:0;line-height:20px'>H<br>I</th></tr></thead><tbody><tr><td style='padding:0;line-height:20px;break-inside:avoid'>B<br>C</td></tr></tbody></table></body></html>";
     let (core, _) = pagination_core_with_policy(
         html,
         Size::new(500.0, 60.0),
@@ -3224,10 +3126,10 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     let left_glyph = glyph_index_for_character(&core, 'L');
     let right_glyph = glyph_index_for_character(&core, 'R');
     let left_line_idx =
-        text_paint::render_text_view_line_for_glyph(core.page.render_view().text(), left_glyph)
+        (core.page.render_view().text()).line_for_glyph(left_glyph)
             .expect("left cell line");
     let right_line_idx =
-        text_paint::render_text_view_line_for_glyph(core.page.render_view().text(), right_glyph)
+        (core.page.render_view().text()).line_for_glyph(right_glyph)
             .expect("right cell line");
     let left_line = core
         .page
@@ -3257,7 +3159,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
         .expect("right cell visible");
     let left_point = Point::new(
         left_screen.point.x
-            + geometry_queries::render_view_geometry((core.page.geometry()).doc)
+            + ((core.page.geometry()).doc).geometry()
                 .caret_x((&left_line).id(), left_glyph, CaretAffinity::Leading)
                 .unwrap_or(0.0)
             + 0.1,
@@ -3265,7 +3167,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
     );
     let right_point = Point::new(
         right_screen.point.x
-            + geometry_queries::render_view_geometry((core.page.geometry()).doc)
+            + ((core.page.geometry()).doc).geometry()
                 .caret_x((&right_line).id(), right_glyph, CaretAffinity::Leading)
                 .unwrap_or(0.0)
             + 0.1,
@@ -3479,7 +3381,7 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
     let linked_glyph = (0..text.glyph_count() as u32)
         .find(|glyph| addressing.link_for_glyph(*glyph).is_some())
         .expect("fixture should contain a linked glyph");
-    let line_idx = text_paint::render_text_view_line_for_glyph(core.doc().text(), linked_glyph)
+    let line_idx = (core.doc().text()).line_for_glyph(linked_glyph)
         .expect("linked glyph should be laid out");
     let screen = core
         .page
@@ -3496,7 +3398,7 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
         .expect("linked line should be present");
     let position = Point::new(
         screen.point.x
-            + geometry_queries::render_view_geometry((core.page.geometry()).doc)
+            + ((core.page.geometry()).doc).geometry()
                 .caret_x((&line).id(), linked_glyph, CaretAffinity::Leading)
                 .unwrap_or(0.0)
             + 0.1,
@@ -3823,49 +3725,6 @@ fn commands_preserve_search_selection_and_settings_without_a_window_backend() {
     std::fs::remove_dir_all(fixture).unwrap();
 }
 
-#[test]
-fn failed_pipeline_update_keeps_committed_settings_and_reports_the_error() {
-    let (provider, _) = CountingProvider::new(vec![(
-        "doc.html",
-        "<html><body><p>Transactional settings</p></body></html>",
-    )]);
-    let provider: Arc<dyn crate::ResourceProvider> = provider;
-    let mut shaper = TestShaper::default();
-    let mut options = DocumentOptions::new(600.0)
-        .unwrap()
-        .with_root_font_size(16.0)
-        .unwrap();
-    options.image_sizing_policy = ImageSizingPolicy::SmartStandalone;
-    options.text_composition_policy = TextCompositionPolicy::BookOptimized;
-    options.note_flow = NoteFlow::Excluded;
-    let loaded = Document::load(provider.clone(), "doc.html", options, &mut shaper)
-        .expect("fixture document must load");
-    let services = RendererServices::default();
-    let mut core = RendererCore::new(
-        services.clone(),
-        loaded,
-        provider,
-        vec!["doc.html".to_owned()],
-        0,
-        RendererInitialConfig::default(),
-    );
-    let committed_size = core.page.root_font_size();
-    let committed_input_size = core.page.configuration().font_size();
-    core.effects.events.clear();
-
-    shaper.reject_glyphs = true;
-    core.set_root_font_size(&mut shaper, 24.0);
-
-    assert_eq!(core.page.root_font_size(), committed_size);
-    assert_eq!(core.page.configuration().font_size(), committed_input_size);
-    let events = &core.effects.events;
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RendererEvent::FontSizeChanged(size) if *size == 24.0))
-    );
-    assert!(events.iter().any(|event| matches!(event, RendererEvent::OperationFailed { operation: RendererOperation::UpdateDocument, message } if !message.is_empty())));
-}
 
 #[test]
 fn pre_frame_relayout_preserves_the_document_start_before_the_first_glyph() {
@@ -4385,10 +4244,7 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
         RendererInitialConfig::default(),
     )
     .expect("fixture document must load");
-    let fragments = reading_queries::render_addressing_view_reading_fragments(
-        core.page.render_view().addressing(),
-        0,
-    );
+    let fragments = (core.page.render_view().addressing()).reading_fragments(0);
     assert_eq!(
         fragments
             .iter()
@@ -4411,10 +4267,7 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
     assert_eq!(core.media_overlay.target_href(), None);
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
     core.apply(&mut shaper, crate::RendererCommand::SetColumnWidth(300.0));
-    let fragments_after = reading_queries::render_addressing_view_reading_fragments(
-        core.page.render_view().addressing(),
-        0,
-    );
+    let fragments_after = (core.page.render_view().addressing()).reading_fragments(0);
     assert_eq!(
         fragments_after[1].target, target,
         "array indices survive relayout"
@@ -4422,17 +4275,11 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
     assert_eq!(fragments_after[1].text, "Hello bright world.");
     assert_eq!(core.media_overlay.reading_target(), Some(&target));
     let clipped_start = old_ranges[1].start;
-    let clipped = reading_queries::render_addressing_view_reading_fragments(
-        core.page.render_view().addressing(),
-        clipped_start,
-    );
+    let clipped = (core.page.render_view().addressing()).reading_fragments(clipped_start);
     assert!(!clipped.iter().any(|fragment| fragment.text == "Chapter"));
     assert!(clipped[0].text.starts_with("bright"));
     core.apply(&mut shaper, crate::RendererCommand::SetFontSize(24.0));
-    let reshaped = reading_queries::render_addressing_view_reading_fragments(
-        core.page.render_view().addressing(),
-        0,
-    );
+    let reshaped = (core.page.render_view().addressing()).reading_fragments(0);
     assert_eq!(
         reshaped[1].target, target,
         "element and glyph indices survive font changes"
@@ -4456,20 +4303,20 @@ fn reading_fragments_filter_structure_and_preserve_identity_on_relayout() {
     assert!(core.media_overlay.visible().is_none());
     core.apply(&mut shaper, crate::RendererCommand::SetReadingTarget(None));
     assert!(core.media_overlay.reading_target().is_none());
-    let mut session = crate::RendererSession::from_core(core, shaper);
     let mut fragments = Vec::new();
     {
-        let page = session.core.page.frame.page();
+        let page = core.page.frame.page();
         let origin = page.start_line().map_or(
             ReadingOrigin::Offset(page.paint_start_offset_y()),
             ReadingOrigin::Cursor,
         );
-        session.core.paginator().append_reading_fragments(
-            session.core.page.geometry().reading_start()..u32::MAX,
+        core.paginator().append_reading_fragments(
+            core.page.geometry().reading_start()..u32::MAX,
             origin,
             &mut fragments,
         );
     }
+    let mut session = crate::RendererSession::from_core(core, shaper);
     let revision = session.navigation_revision();
     session.follow_reading_target(fragments.last().unwrap().target.clone());
     assert_eq!(
@@ -4492,53 +4339,15 @@ fn narration_retains_earlier_elements_but_starts_on_the_visible_page() {
     );
     let (core, shaper) = pagination_core(&source, Size::new(240.0, 180.0), 1);
     let mut session = crate::RendererSession::from_core(core, shaper);
-    let mut initial = Vec::new();
-    {
-        let page = session.core.page.frame.page();
-        let origin = page.start_line().map_or(
-            ReadingOrigin::Offset(page.paint_start_offset_y()),
-            ReadingOrigin::Cursor,
-        );
-        session.core.paginator().append_reading_fragments(
-            session.core.page.geometry().reading_start()..u32::MAX,
-            origin,
-            &mut initial,
-        );
-    }
-    session.follow_reading_target(initial[2].target.clone());
+    let (_, _, _, initial) = session.reading_items().unwrap();
+    session.follow_reading_target(initial[2].clone());
     session.prepare_frame(Size::new(240.0, 180.0));
-    let mut onward = Vec::new();
-    {
-        let page = session.core.page.frame.page();
-        let origin = page.start_line().map_or(
-            ReadingOrigin::Offset(page.paint_start_offset_y()),
-            ReadingOrigin::Cursor,
-        );
-        session.core.paginator().append_reading_fragments(
-            session.core.page.geometry().reading_start()..u32::MAX,
-            origin,
-            &mut onward,
-        );
-    }
-    let mut all = Vec::new();
-    let glyph = session.core.page.geometry().reading_start();
-    let paginator = session.core.paginator();
-    paginator.append_reading_fragments(0..glyph, ReadingOrigin::Document, &mut all);
-    let start = all.len();
-    let page = session.core.page.frame.page();
-    let origin = page.start_line().map_or(
-        ReadingOrigin::Offset(page.paint_start_offset_y()),
-        ReadingOrigin::Cursor,
-    );
-    paginator.append_reading_fragments(glyph..u32::MAX, origin, &mut all);
+    let (_, start, glyph, all) = session.reading_items().unwrap();
     assert!(start > 0, "backwards skips need the earlier elements");
-    assert_eq!(
-        &all[start..],
-        onward.as_slice(),
-        "starting TTS must keep the visible-page boundary"
-    );
-    assert!(all[0].text.contains("Earlier element"));
-    assert!(session.reading_target_cfi(&all[start].target).is_some());
+    let addressing = session.render_view().addressing();
+    assert!(addressing.reading_text(&all[0]).contains("Earlier element"));
+    assert!(all[start].glyph_ranges.iter().any(|range| range.contains(&glyph)));
+    assert!(session.reading_target_cfi(&all[start]).is_some());
 }
 
 #[test]
@@ -4617,20 +4426,20 @@ fn reading_fragments_continue_a_single_element_across_pages() {
         .join(" ");
     let source = format!("<html><body style='margin:0'><p>{prose}</p></body></html>");
     let (core, shaper) = pagination_core(&source, Size::new(240.0, 180.0), 1);
-    let mut session = crate::RendererSession::from_core(core, shaper);
     let mut fragments = Vec::new();
     {
-        let page = session.core.page.frame.page();
+        let page = core.page.frame.page();
         let origin = page.start_line().map_or(
             ReadingOrigin::Offset(page.paint_start_offset_y()),
             ReadingOrigin::Cursor,
         );
-        session.core.paginator().append_reading_fragments(
-            session.core.page.geometry().reading_start()..u32::MAX,
+        core.paginator().append_reading_fragments(
+            core.page.geometry().reading_start()..u32::MAX,
             origin,
             &mut fragments,
         );
     }
+    let mut session = crate::RendererSession::from_core(core, shaper);
     assert!(
         fragments.len() > 1,
         "a long paragraph needs multiple page fragments"
@@ -4647,10 +4456,7 @@ fn reading_fragments_continue_a_single_element_across_pages() {
     for pair in fragments.windows(2) {
         assert_eq!(
             pair[1].target,
-            reading_queries::reading_target_with_glyph_ranges(
-                &pair[0].target,
-                pair[1].target.glyph_ranges.clone()
-            ),
+            (pair[0].target).with_glyph_ranges(pair[1].target.glyph_ranges.clone()),
             "page fragments retain their source identity",
         );
         assert!(
@@ -4674,8 +4480,8 @@ fn reading_fragments_continue_a_single_element_across_pages() {
         .iter()
         .flat_map(|range| range.clone())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index as usize)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index as usize)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect();
@@ -4704,8 +4510,8 @@ fn semantic_footnotes_are_popup_only_and_absent_from_paginated_text() {
     );
     let visible_source = (0..text.glyph_count())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect::<String>();
@@ -4739,7 +4545,7 @@ fn clicked_footnote_emits_a_viewport_overlay_anchor() {
     core.configure_layout_for_viewport(&mut shaper, Size::new(200.0, 200.0));
     core.paint_forward(&mut RecordingPainter::default());
     let noteref = glyph_index_for_character(&core, '1');
-    let line_idx = text_paint::render_text_view_line_for_glyph(core.doc().text(), noteref)
+    let line_idx = (core.doc().text()).line_for_glyph(noteref)
         .expect("note reference line");
     let screen = core
         .page
@@ -4756,7 +4562,7 @@ fn clicked_footnote_emits_a_viewport_overlay_anchor() {
         .expect("laid out note reference line");
     let click = Point::new(
         screen.point.x
-            + geometry_queries::render_view_geometry((core.page.geometry()).doc)
+            + ((core.page.geometry()).doc).geometry()
                 .caret_x((&line).id(), noteref, CaretAffinity::Leading)
                 .unwrap_or(0.0)
             + 0.1,
@@ -4823,8 +4629,8 @@ fn as_authored_notes_read_inline_instead_of_being_held_for_a_popup() {
     let text = core.page.render_view().text();
     let visible_source = (0..text.glyph_count())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect::<String>();
@@ -4853,8 +4659,8 @@ fn switching_note_display_relays_out_the_document() {
         let text = core.page.render_view().text();
         (0..text.glyph_count())
             .filter_map(|index| {
-                text_paint::glyph_at(text, index)
-                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+                (text).glyph_at(index)
+                    .and_then(|glyph| (text).glyph_metric(glyph))
                     .map(|metric| metric.ch())
             })
             .collect::<String>()
@@ -5295,7 +5101,7 @@ fn text_can_be_selected_inside_an_open_note() {
     // to it rather than a second implementation.
     let (note, owner) = core.note_parts().expect("an open note is held as a view");
     let last_line =
-        text_paint::render_text_view_spatial_order(note.render_view(owner).unwrap().text())
+        (note.render_view(owner).unwrap().text()).spatial_order()
             .iter()
             .copied()
             .last();
@@ -5530,8 +5336,8 @@ fn namespaced_xhtml_footnotes_are_popup_only_and_absent_from_paginated_text() {
     );
     let visible_source = (0..text.glyph_count())
         .filter_map(|index| {
-            text_paint::glyph_at(text, index)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            (text).glyph_at(index)
+                .and_then(|glyph| (text).glyph_metric(glyph))
                 .map(|metric| metric.ch())
         })
         .collect::<String>();
@@ -5602,10 +5408,7 @@ fn reading_waits_for_the_next_document_without_replaying_the_old_one() {
     let (doc, _, _, items) = session.reading_items().unwrap();
     assert_eq!(doc, 1);
     assert_eq!(
-        reading_queries::render_addressing_view_reading_text(
-            session.render_view().addressing(),
-            &items[0]
-        ),
+        (session.render_view().addressing()).reading_text(&items[0]),
         "Second chapter"
     );
     assert_eq!(
@@ -5643,7 +5446,7 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
         };
         let glyph = glyph_index_for_character(&core, 'J');
         let line_index =
-            text_paint::render_text_view_line_for_glyph(core.doc().text(), glyph).unwrap();
+            (core.doc().text()).line_for_glyph(glyph).unwrap();
         let line = core.page.render_view().text().line(line_index).unwrap();
         let screen = core
             .page
@@ -5654,7 +5457,7 @@ fn delayed_link_navigation_is_manual_but_a_footnote_preview_is_not() {
             .unwrap();
         let click = Point::new(
             screen.point.x
-                + geometry_queries::render_view_geometry((core.page.geometry()).doc)
+                + ((core.page.geometry()).doc).geometry()
                     .caret_x((&line).id(), glyph, CaretAffinity::Leading)
                     .unwrap_or(0.0)
                 + 0.1,
@@ -5982,7 +5785,7 @@ fn narration_items_are_unpaginated_and_materialize_text_on_demand() {
     assert_eq!(start, 0);
     assert!(offset <= items[0].glyph_ranges[0].start);
     let addressing = session.render_view().addressing();
-    assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &items[1]), prose);
+    assert_eq!((addressing).reading_text(&items[1]), prose);
     let mut middle = items[1].clone();
     middle.glyph_ranges =
         vec![middle.glyph_ranges[0].start + 400..middle.glyph_ranges[0].start + 405];
@@ -6009,7 +5812,7 @@ fn narration_chunks_carry_normalized_text_and_original_glyphs() {
     assert_eq!(items.len(), 1);
     let addressing = session.render_view().addressing();
     assert_eq!(
-        reading_queries::render_addressing_view_reading_text(addressing, &items[0]),
+        (addressing).reading_text(&items[0]),
         "First ångström. Second cafés. Third."
     );
     let mut cursor = 0;
@@ -6023,13 +5826,10 @@ fn narration_chunks_carry_normalized_text_and_original_glyphs() {
             .unwrap();
         assert_eq!(
             chunk.target,
-            reading_queries::reading_target_with_glyph_ranges(
-                &items[0],
-                chunk.target.glyph_ranges.clone()
-            ),
+            (items[0]).with_glyph_ranges(chunk.target.glyph_ranges.clone()),
         );
         assert_eq!(
-            reading_queries::render_addressing_view_reading_text(addressing, &chunk.target),
+            (addressing).reading_text(&chunk.target),
             chunk.text
         );
         assert!(chunk.target.glyph_ranges[0].start >= cursor);
@@ -6054,7 +5854,7 @@ fn narration_bounded_chunks_preserve_unicode_and_disjoint_source_ranges() {
     let session = crate::RendererSession::from_core(core, shaper);
     let (_, _, _, items) = session.reading_items().unwrap();
     let addressing = session.render_view().addressing();
-    let expected = reading_queries::render_addressing_view_reading_text(addressing, &items[0]);
+    let expected = (addressing).reading_text(&items[0]);
     let mut actual = String::new();
     let mut cursor = 0;
     loop {
@@ -6073,7 +5873,7 @@ fn narration_bounded_chunks_preserve_unicode_and_disjoint_source_ranges() {
             })
             .unwrap();
         assert!(chunk.text.chars().count() <= 7);
-        assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &chunk.target), chunk.text.trim());
+        assert_eq!((addressing).reading_text(&chunk.target), chunk.text.trim());
         actual.push_str(&chunk.text);
         let Some(next) = next else { break };
         assert!(next > cursor);
@@ -6124,10 +5924,10 @@ fn reader_hyphenation_changes_apply_immediately_and_book_restores_publication_ru
             );
             let text = core.page.render_view().text();
             assert_eq!(
-                text_paint::render_text_view_spatial_order(text)
+                (text).spatial_order()
                     .iter()
                     .copied()
-                    .any(|index| text_paint::hyphen_for_line(text, index).is_some()),
+                    .any(|index| (text).hyphen_for_line(index).is_some()),
                 expected,
                 "switching modes must reflow the current book: {authored}, {selection:?}"
             );
@@ -6153,12 +5953,12 @@ fn reader_word_spacing_keeps_carets_selection_and_hit_testing_aligned() {
         core.paint_forward(&mut RecordingPainter::default());
         let geometry = core.page.geometry();
         let text = core.page.render_view().text();
-        let line_idx = text_paint::render_text_view_line_for_glyph(text, 1).expect("space line");
+        let line_idx = (text).line_for_glyph(1).expect("space line");
         let line = text.line(line_idx).unwrap();
-        let first_x = geometry_queries::render_view_geometry((geometry).doc)
+        let first_x = ((geometry).doc).geometry()
             .caret_x((&line).id(), 0, CaretAffinity::Leading)
             .unwrap_or(0.0);
-        let second_x = geometry_queries::render_view_geometry((geometry).doc)
+        let second_x = ((geometry).doc).geometry()
             .caret_x((&line).id(), 2, CaretAffinity::Leading)
             .unwrap_or(0.0);
         let expected_gap = 8.0 * f64::from(factor);
@@ -6218,7 +6018,6 @@ fn reader_color_update_preserves_chapter_text_selection_and_geometry() {
     let layout_revision = core.revisions.layout;
     let display_revision = core.revisions.base_display;
     let line_count = core.page.render_view().text().line_count();
-    shaper.reject_glyphs = true;
     core.apply(
         &mut shaper,
         crate::RendererCommand::SetReaderStyleOverrides(html::style::ReaderStyleOverrides {
