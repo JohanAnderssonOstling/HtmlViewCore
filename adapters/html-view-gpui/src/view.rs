@@ -367,6 +367,7 @@ pub struct HtmlView {
     prepared_paint: Option<(FrameDisplayCacheKeys, PreparedPaint)>,
     display_dirty: bool,
     pointer_active: bool,
+    touch_selection_only: bool,
     pointer_tap_start: Option<(GpuiPoint<Pixels>, Instant, bool)>,
     wheel_scroll_enabled: bool,
     ruler: ruler::ReadingRuler,
@@ -811,6 +812,7 @@ impl HtmlView {
             prepared_paint: None,
             display_dirty: true,
             pointer_active: false,
+            touch_selection_only: false,
             pointer_tap_start: None,
             wheel_scroll_enabled: true,
             ruler: ruler::ReadingRuler::default(),
@@ -1042,7 +1044,14 @@ impl HtmlView {
             .selection_contains_point(self.document_point(position))
     }
 
+    /// Let the embedding touch reader own selection through long presses.
+    pub fn set_touch_selection_only(&mut self, enabled: bool) {
+        self.touch_selection_only = enabled;
+    }
+
     pub fn select_word_at(&mut self, position: GpuiPoint<Pixels>, cx: &mut Context<Self>) -> bool {
+        self.pointer_active = false;
+        self.pointer_tap_start = None;
         let selected = self.renderer.select_word_at(self.document_point(position));
         if selected {
             cx.notify();
@@ -1116,7 +1125,7 @@ impl HtmlView {
         result
     }
 
-    fn copy_selection_as_plain_text(&mut self, cx: &mut Context<Self>) -> bool {
+    pub fn copy_selection_as_plain_text(&mut self, cx: &mut Context<Self>) -> bool {
         let text = self
             .renderer
             .note_selection_text()
@@ -1553,12 +1562,18 @@ impl HtmlView {
         // GPUI's own `track_focus` tells parents that focus is already spoken
         // for, so the keyboard keeps working after a click on a margin.
         window.prevent_default();
+        if self.touch_selection_only {
+            self.pointer_active = true;
+            self.pointer_tap_start = Some((event.position, Instant::now(), false));
+            Self::stop_event(cx);
+            return;
+        }
         let position = self.document_point(event.position);
         let options = PointerDownOptions {
             selection_mode: selection_mode(event.modifiers.control),
             copy_image: false,
         };
-        let outcome = self.renderer.pointer_down(position, options);
+        let outcome = self.renderer.pointer_down_with_clicks(position, options, event.click_count);
         self.pointer_active = outcome.handled;
         self.pointer_tap_start =
             self.pointer_active
@@ -1570,6 +1585,15 @@ impl HtmlView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.touch_selection_only {
+            if self.pointer_tap_start.is_some_and(|(start, _, _)| {
+                f32::from(event.position.x - start.x).abs() > 8.0
+                    || f32::from(event.position.y - start.y).abs() > 8.0
+            }) {
+                self.pointer_tap_start = None;
+            }
+            return;
+        }
         let pressed = event.pressed_button == Some(MouseButton::Left);
         if !pressed {
             self.pointer_active = false;
@@ -1593,7 +1617,7 @@ impl HtmlView {
             return;
         }
         self.pointer_active = false;
-        let handled = self.renderer.pointer_up(
+        let handled = !self.touch_selection_only && self.renderer.pointer_up(
             self.document_point(event.position),
             selection_mode(event.modifiers.control),
         );
@@ -1603,10 +1627,14 @@ impl HtmlView {
             if !handled
                 && !image_hit
                 && !moved
-                && event.click_count == 1
+                && (self.touch_selection_only || event.click_count == 1)
                 && started_at.elapsed() < Duration::from_millis(600)
             {
-                cx.emit(DocumentTap);
+                let activated = self.touch_selection_only
+                    && self.renderer.activate_tap(self.document_point(event.position));
+                if !activated {
+                    cx.emit(DocumentTap);
+                }
             }
         }
         Self::stop_event(cx);

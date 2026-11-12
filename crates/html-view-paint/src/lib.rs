@@ -361,8 +361,12 @@ impl AnnotationOverlayState {
             .map(|entry| entry.range.clone())
     }
 
-    /// Reports the topmost annotation covering `glyph`. Later annotations win,
-    /// matching paint order.
+    /// Whether a resolved annotation covers the clicked glyph.
+    pub fn contains_glyph(&self, glyph: u32) -> bool {
+        self.resolved.iter().any(|entry| entry.range.contains(&glyph))
+    }
+
+    /// Activate the topmost annotation, matching paint order.
     pub fn activate_at_glyph(&self, glyph: u32, effects: &mut RendererEffects) -> bool {
         let Some(entry) = self
             .resolved

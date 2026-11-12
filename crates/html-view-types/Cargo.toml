@@ -7,9 +7,9 @@ publish = false
 repository.workspace = true
 
 [dependencies]
-html.workspace = true
+html-dom = { package = "skrift-dom", path = "../../../HtmlEngine/crates/html-dom" }
+html-engine-model = { package = "skrift-engine-model", path = "../../../HtmlEngine/crates/html-engine-model" }
+html-resources = { package = "skrift-resources", path = "../../../HtmlEngine/crates/html-resources" }
+html-style-model = { package = "skrift-style-model", path = "../../../HtmlEngine/crates/html-style-model" }
 kurbo.workspace = true
 peniko.workspace = true
-
-[dev-dependencies]
-html-engine-model = { package = "skrift-engine-model", path = "../../../HtmlEngine/crates/html-engine-model" }

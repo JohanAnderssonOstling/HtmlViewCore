@@ -298,9 +298,10 @@ impl RendererCore {
         Point::new(position.x * scale, position.y * scale)
     }
 
-    pub(crate) fn emit_operation_failed(&mut self, operation: RendererOperation, message: impl Into<html::Error>) {
+    pub(crate) fn emit_operation_failed(&mut self, operation: RendererOperation, message: impl Into<Error>) {
+        let message: Error = message.into();
         self.effects
-            .emit(RendererEvent::OperationFailed { operation, message: message.into() });
+            .emit(RendererEvent::OperationFailed { operation, message: Arc::new(message) });
     }
 
     #[cfg(test)]

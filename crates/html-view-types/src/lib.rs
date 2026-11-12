@@ -9,21 +9,24 @@
 #[cfg(test)]
 use html_engine_model::page_placements;
 use std::fmt;
+use std::error::Error;
 use std::mem::{Discriminant, take};
 use std::sync::Arc;
 
 use kurbo::{Point, Size};
 pub use peniko::Color;
 
-use html::document::ImageId;
+use html_dom::ImageId;
+use html_engine_model::{ImageSizingPolicy, ReadingTarget, TextCompositionPolicy, TextSearchOptions};
+use html_style_model::ReaderStyleOverrides;
 #[cfg(test)]
-use html::layout::LineId;
-use html::pagination::{PageAnchor, PageRequest};
-use html::resources::{BlockingJobSpawner, InlineJobSpawner, ResourceProvider};
-use html::revisions::DocumentRevisions;
-use html::text::FontFace;
+use html_engine_model::LineId;
+use html_engine_model::{PageAnchor, PageRequest};
+use html_resources::{BlockingJobSpawner, InlineJobSpawner, ResourceProvider};
+use html_engine_model::DocumentRevisions;
+use html_style_model::FontFace;
 
-pub use html::render::OverlayStyle as AnnotationStyle;
+pub use html_engine_model::OverlayStyle as AnnotationStyle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RendererAnnotation {
@@ -115,9 +118,9 @@ pub struct RendererInitialConfig {
     /// Optional presentation cap. `None` lets the viewport determine the
     /// number of columns from the requested column width.
     pub max_column_count: Option<u8>,
-    pub style_overrides: html::style::ReaderStyleOverrides,
-    pub image_sizing_policy: html::layout::ImageSizingPolicy,
-    pub text_composition_policy: html::layout::TextCompositionPolicy,
+    pub style_overrides: ReaderStyleOverrides,
+    pub image_sizing_policy: ImageSizingPolicy,
+    pub text_composition_policy: TextCompositionPolicy,
     pub note_display: NoteDisplay,
     /// Opt-in pagination-only spacing refinement. This never changes DOM/CSS
     /// layout; it only distributes bounded page slack over existing block gaps.
@@ -137,8 +140,8 @@ impl Default for RendererInitialConfig {
             scale: 1.0,
             max_column_count: None,
             style_overrides: Default::default(),
-            image_sizing_policy: html::layout::ImageSizingPolicy::SmartStandalone,
-            text_composition_policy: html::layout::TextCompositionPolicy::BookOptimized,
+            image_sizing_policy: ImageSizingPolicy::SmartStandalone,
+            text_composition_policy: TextCompositionPolicy::BookOptimized,
             note_display: NoteDisplay::default(),
             vertical_rhythm: false,
             paint_palette: Default::default(),
@@ -228,12 +231,12 @@ pub enum RendererCommand {
     SetFontSize(f32),
     /// Rebuild text after the host registers newly available publication fonts.
     RefreshFonts,
-    SetReaderStyleOverrides(html::style::ReaderStyleOverrides),
-    SetImageSizingPolicy(html::layout::ImageSizingPolicy),
+    SetReaderStyleOverrides(ReaderStyleOverrides),
+    SetImageSizingPolicy(ImageSizingPolicy),
     /// Switches how notes are presented. This re-lays-out the document, since
     /// whether a note occupies the reading flow decides what boxes exist.
     SetNoteDisplay(NoteDisplay),
-    SetTextCompositionPolicy(html::layout::TextCompositionPolicy),
+    SetTextCompositionPolicy(TextCompositionPolicy),
     SetReaderPaintPalette(ReaderPaintPalette),
     SetScale(f64),
     ActivateSearch,
@@ -262,7 +265,7 @@ pub enum RendererCommand {
     UpsertAnnotation(RendererAnnotation),
     RemoveAnnotation(String),
     SetMediaOverlayTarget(Option<String>),
-    SetReadingTarget(Option<html::reading::ReadingTarget>),
+    SetReadingTarget(Option<ReadingTarget>),
     RequestVisibleText,
     CopySelection,
     CopySelectionCitation {
@@ -339,7 +342,7 @@ pub enum RendererEvent {
     },
     OperationFailed {
         operation: RendererOperation,
-        message: html::Error,
+        message: Arc<dyn Error + Send + Sync>,
     },
 }
 
@@ -554,8 +557,8 @@ pub enum DocAnchor {
     Glyph(u32),
 }
 
-pub use html::pagination::{LineScreen, PagePositions, RepeatedTableHeader, VisibleLinePositions};
-use html::pagination::PageGeometry;
+pub use html_engine_model::{LineScreen, PagePositions, VisibleLinePositions};
+use html_engine_model::PageGeometry;
 
 #[derive(Clone)]
 pub struct ColumnLayout {
@@ -762,9 +765,6 @@ impl VisiblePageGeometry {
     }
     pub fn offset_breaks(&self) -> &[(f64, f64)] {
         &self.content.offset_breaks
-    }
-    pub fn repeated_table_headers(&self) -> &[RepeatedTableHeader] {
-        &self.content.repeated_table_headers
     }
     pub fn block_decoration_indices(&self) -> Option<&[usize]> {
         self.content.block_decoration_indices.as_deref()
@@ -1085,14 +1085,6 @@ mod renderer_revision_tests {
             last_line: Some(7),
             positions,
             offset_breaks: vec![(10.0, 20.0)],
-            repeated_table_headers: vec![RepeatedTableHeader {
-                source_left: 1.0,
-                source_right: 2.0,
-                source_top: 3.0,
-                source_bottom: 4.0,
-                col_index: 1,
-                visible_y: None,
-            }],
             block_decoration_indices: Some(vec![2, 5]),
             reached_end: false,
             next_start_offset_y: 50.0,
@@ -1106,7 +1098,6 @@ mod renderer_revision_tests {
         assert_eq!(frame.page().paint_start_offset_y(), 12.0);
         assert!(page_placements::at_cursor(frame.page().line_positions(), 4).is_some());
         assert_eq!(frame.page().offset_breaks(), vec![(10.0, 20.0)]);
-        assert_eq!(frame.page().repeated_table_headers().len(), 1);
         assert_eq!(frame.page().block_decoration_indices(), Some(&[2, 5][..]));
     }
 
@@ -1132,7 +1123,7 @@ mod renderer_revision_tests {
     }
 }
 
-impl From<SearchOptions> for html::text::TextSearchOptions {
+impl From<SearchOptions> for TextSearchOptions {
     fn from(options: SearchOptions) -> Self {
         Self {
             match_case: options.match_case,

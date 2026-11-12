@@ -146,6 +146,7 @@ impl<S: GlyphShaper> RendererSession<S> {
             position,
             mode,
             select_text: true,
+            click_action: false,
             clicks: 1,
         })
         .handled
@@ -707,9 +708,22 @@ impl<S: GlyphShaper> RendererSession<S> {
         position: Point,
         options: PointerDownOptions,
     ) -> PointerDownOutcome {
+        self.pointer_down_with_clicks(position, options, 1)
+    }
+
+    /// Preserve the host's click count for word and element selection.
+    pub fn pointer_down_with_clicks(
+        &mut self,
+        position: Point,
+        options: PointerDownOptions,
+        clicks: usize,
+    ) -> PointerDownOutcome {
         let position = self.core.to_layout_point(position);
         self.pointer_down_position = Some(position);
         let image = self.core.hit_test_document_image(position);
+        let annotation_click = self.core.page.geometry().content_at(position)
+            .and_then(|hit| hit.text)
+            .is_some_and(|hit| self.core.annotations.contains_glyph(hit.glyph));
         let mut outcome = PointerDownOutcome {
             handled: true,
             image: image.is_some(),
@@ -718,7 +732,8 @@ impl<S: GlyphShaper> RendererSession<S> {
             position,
             mode: options.selection_mode,
             select_text: image.is_none(),
-            clicks: 1,
+            click_action: annotation_click,
+            clicks,
         });
         if selection.handled {
             return outcome;
@@ -743,7 +758,8 @@ impl<S: GlyphShaper> RendererSession<S> {
                     position,
                     mode: options.selection_mode,
                     select_text: true,
-                    clicks: 1,
+                    click_action: annotation_click,
+                    clicks,
                 })
                 .handled
         } else {
@@ -793,6 +809,13 @@ impl<S: GlyphShaper> RendererSession<S> {
         let Some(glyph) = selection.click else {
             return selection.handled;
         };
+        // The caret can sit just after the final glyph of an annotation.
+        // Activate the annotation under the original press, not its trailing caret.
+        let glyph = click_position
+            .and_then(|position| self.core.page.geometry().content_at(position))
+            .and_then(|hit| hit.text)
+            .filter(|hit| self.core.annotations.contains_glyph(hit.glyph))
+            .map_or(glyph, |hit| hit.glyph);
         let hit = crate::DocumentGlyph {
             doc: self.core.nav.current_document(),
             glyph,
@@ -813,6 +836,26 @@ impl<S: GlyphShaper> RendererSession<S> {
             self.navigation_revision = self.navigation_revision.wrapping_add(1);
         }
         handled
+    }
+
+    /// Activate a completed touch tap without beginning text selection.
+    pub fn activate_tap(&mut self, position: Point) -> bool {
+        let position = self.core.to_layout_point(position);
+        let glyph = self.core.page.geometry().content_at(position)
+            .and_then(|hit| hit.text).map(|hit| hit.glyph);
+        if let Some(glyph) = glyph {
+            let hit = crate::DocumentGlyph { doc: self.core.nav.current_document(), glyph };
+            let before = (self.core.nav.current_document(), self.core.nav.anchor_glyph_here());
+            let handled = self.core.handle_document_click(&mut self.glyph_shaper, hit, Some(position));
+            if before != (self.core.nav.current_document(), self.core.nav.anchor_glyph_here()) {
+                self.navigation_revision = self.navigation_revision.wrapping_add(1);
+            }
+            if handled { return true; }
+        }
+        if let Some(image) = self.core.hit_test_document_image(position) {
+            return self.core.open_image(image);
+        }
+        false
     }
 
     /// Clears hover while preserving a captured selection or click until release.

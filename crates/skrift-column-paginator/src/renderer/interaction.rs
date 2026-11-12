@@ -2,6 +2,8 @@ use html::selection::{SelectionExport, SelectionInput, SelectionOutcome};
 use html::export::{ExportPayload, ExportRequest, ImagePayload};
 use kurbo::{Point, Size};
 use std::sync::mpsc::{TryRecvError, channel};
+use std::sync::Arc;
+use std::io;
 
 use crate::{
     ClipboardWrite, DocumentImage, DocumentUpdate, FrameGeometryCacheKey, GlyphShaper, OpenedImage,
@@ -87,7 +89,7 @@ impl RendererCore {
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => effects.emit(RendererEvent::OperationFailed {
                     operation: RendererOperation::UpdateDocument,
-                    message: "file worker stopped".into(),
+                    message: Arc::new(io::Error::other("file worker stopped")),
                 }),
             }
             false
@@ -291,6 +293,6 @@ fn can_reproject_width_only(
 fn file_event(result: Result<RendererEvent, html::Error>) -> RendererEvent {
     result.unwrap_or_else(|message| RendererEvent::OperationFailed {
         operation: RendererOperation::UpdateDocument,
-        message,
+        message: Arc::new(message),
     })
 }

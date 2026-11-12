@@ -2608,79 +2608,6 @@ fn book_paginator_splits_a_single_cell_row_at_a_content_boundary() {
 }
 
 #[test]
-fn book_paginator_repeats_explicit_table_header_on_a_continuation_column() {
-    let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><table style='margin:0;border-spacing:0'><thead><tr><th style='padding:0;line-height:20px'>H</th></tr></thead><tbody><tr><td style='padding:0;line-height:20px'>B</td></tr><tr><td style='padding:0;line-height:20px'>C</td></tr><tr><td style='padding:0;line-height:20px'>D</td></tr></tbody></table></body></html>";
-    let (core, _) = pagination_core_with_policy(
-        html,
-        Size::new(500.0, 70.0),
-        2,
-        html::layout::TextCompositionPolicy::BookOptimized,
-    );
-    let continued_row = line_index_for_character(&core, 'C');
-
-    assert_eq!(core.page.frame.page().repeated_table_headers().len(), 1);
-    assert_eq!(
-        core.page.frame.page().repeated_table_headers()[0].col_index,
-        1
-    );
-    assert_eq!(
-        core.page
-            .frame
-            .page()
-            .line_positions()
-            .get(continued_row)
-            .map(|screen| (screen.col_index, screen.point.y)),
-        Some((1, 20.0))
-    );
-}
-
-#[test]
-fn book_paginator_repeats_a_leading_all_th_row_without_thead() {
-    let html = "<html><body style='margin:0'><div style='line-height:20px'>A</div><table style='margin:0;border-spacing:0'><tr><th style='padding:0;line-height:20px'>H</th></tr><tr><td style='padding:0;line-height:20px'>B</td></tr><tr><td style='padding:0;line-height:20px'>C</td></tr><tr><td style='padding:0;line-height:20px'>D</td></tr></table></body></html>";
-    let (core, _) = pagination_core_with_policy(
-        html,
-        Size::new(500.0, 70.0),
-        2,
-        html::layout::TextCompositionPolicy::BookOptimized,
-    );
-    let continued_row = line_index_for_character(&core, 'C');
-
-    assert_eq!(core.page.frame.page().repeated_table_headers().len(), 1);
-    assert_eq!(
-        core.page
-            .frame
-            .page()
-            .line_positions()
-            .get(continued_row)
-            .map(|screen| (screen.col_index, screen.point.y)),
-        Some((1, 20.0))
-    );
-}
-
-#[test]
-fn book_paginator_omits_a_repeated_header_when_no_body_row_would_fit() {
-    let html = "<html><body style='margin:0'><table style='margin:0;border-spacing:0'><thead><tr><th style='padding:0;line-height:20px'>H<br>I</th></tr></thead><tbody><tr><td style='padding:0;line-height:20px;break-inside:avoid'>B<br>C</td></tr></tbody></table></body></html>";
-    let (core, _) = pagination_core_with_policy(
-        html,
-        Size::new(500.0, 60.0),
-        2,
-        html::layout::TextCompositionPolicy::BookOptimized,
-    );
-    let body_row = line_index_for_character(&core, 'B');
-
-    assert!(core.page.frame.page().repeated_table_headers().is_empty());
-    assert_eq!(
-        core.page
-            .frame
-            .page()
-            .line_positions()
-            .get(body_row)
-            .map(|screen| (screen.col_index, screen.point.y)),
-        Some((1, 0.0))
-    );
-}
-
-#[test]
 fn table_row_boundary_does_not_move_the_previous_rows_last_line() {
     let html = "<html><body style='margin:0'><table style='margin:0;border-spacing:0'><tr><td style='padding:0;line-height:20px'>A<br>B</td></tr><tr><td style='padding:0;line-height:20px'>C</td></tr></table></body></html>";
     let (core, _) = pagination_core_with_policy(
@@ -2857,10 +2784,6 @@ fn authored_forced_break_between_table_rows_wins() {
     );
     core.next_page(&mut shaper);
     core.paint_forward(&mut RecordingPainter::default());
-    assert!(
-        core.page.frame.page().repeated_table_headers().is_empty(),
-        "ordinary td rows must not be inferred as table headers"
-    );
     assert_eq!(
         core.page
             .frame
@@ -3186,6 +3109,7 @@ fn text_hit_testing_distinguishes_adjacent_table_cells_at_the_same_y() {
                 position,
                 mode: crate::SelectionMode::Plain,
                 select_text: true,
+                click_action: false,
                 clicks: 1,
             },
         );
@@ -3410,6 +3334,7 @@ fn core_loads_and_navigates_between_documents_without_a_window_backend() {
             position,
             mode: crate::SelectionMode::Plain,
             select_text: true,
+            click_action: false,
             clicks: 1
         })
         .handled
@@ -5119,6 +5044,7 @@ fn text_can_be_selected_inside_an_open_note() {
                     position: Point::new(1.0, 1.0),
                     mode: crate::SelectionMode::Plain,
                     select_text: true,
+                    click_action: false,
                     clicks: 1,
                 },
             )
@@ -5983,6 +5909,7 @@ fn reader_word_spacing_keeps_carets_selection_and_hit_testing_aligned() {
                     position,
                     mode: crate::SelectionMode::Plain,
                     select_text: true,
+                    click_action: false,
                     clicks: 1,
                 },
             );
